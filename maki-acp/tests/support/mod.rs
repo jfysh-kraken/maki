@@ -166,6 +166,14 @@ pub struct MakiChild {
 impl MakiChild {
     /// Spawn the child in blocking mode under an isolated fixture home.
     pub async fn spawn() -> io::Result<Self> {
+        Self::spawn_with_env(&[]).await
+    }
+
+    /// Spawn like [`MakiChild::spawn`], plus extra env vars. The 02.11 live
+    /// stub proof points `OPENAI_BASE_URL` at a loopback stub (and keeps the
+    /// dummy `OPENAI_API_KEY`); everything else matches `spawn` exactly, so
+    /// no real credentials or network can enter through the harness.
+    pub async fn spawn_with_env(extra: &[(&str, &str)]) -> io::Result<Self> {
         let fixture = ChildFixture::create("maki-acp-child-")?;
         let argv: Vec<OsString> = ["--background-timeout", "0", "acp", "--model", MODEL_SPEC]
             .iter()
@@ -197,6 +205,9 @@ impl MakiChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         let mut child = command.spawn()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -227,6 +238,12 @@ impl MakiChild {
     /// argv the child was spawned with. The blocking-mode check asserts on this.
     pub fn args(&self) -> &[OsString] {
         &self.argv
+    }
+
+    /// OS pid of the child. The 02.11 live proof records it once and asserts
+    /// it never changes across interleaved prompts, cancel, retry and close.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     /// Next fresh numeric request id.
