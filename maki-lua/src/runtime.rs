@@ -829,10 +829,11 @@ pub(crate) struct Lineage {
     /// The session whose tool call this task serves. Its windows go to that
     /// session's tab, which is not always the one on screen.
     pub(crate) session: Option<MakiId>,
-    /// That session's cwd (02.5a carries it; 02.5b/c own the resolution
-    /// behavior). `None` when no session owns the task: `maki.async.spawn`
-    /// clears it with the session, and session-less runs never set it, so
-    /// those keep the process-cwd fallback.
+    /// That session's cwd (02.5a carries it; 02.5b resolves against it, 02.5c
+    /// owns subprocess/instruction behavior). `None` when no session owns
+    /// the task: `maki.async.spawn` clears it with the session, and
+    /// session-less runs never set it, so those keep the process-cwd
+    /// fallback.
     pub(crate) cwd: Option<PathBuf>,
 }
 
@@ -846,8 +847,7 @@ impl Lineage {
 
 /// The lineage a task started from `ctx` runs under: the owning session and
 /// its cwd travel together, so a later call site can resolve against its own
-/// session instead of the process cwd. Carrying only: resolution against the
-/// cwd is 02.5b/c's, and `None` keeps today's process-cwd fallback.
+/// session instead of the process cwd. `None` keeps the process-cwd fallback.
 fn lineage_for(ctx: &LuaCtx) -> Lineage {
     Lineage {
         session: ctx.session(),
@@ -5265,9 +5265,8 @@ async fn run_tool_call(
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     cell.lineage.session = session;
-    // 02.5a carries the owning session's cwd on the task lineage (next to
-    // the session above) so later call sites can resolve against it.
-    // Resolution behavior is 02.5b/c's; `None` keeps the process-cwd fallback.
+    // 02.5b resolves later call sites against the owning session's carried
+    // cwd (next to the session above). `None` keeps the process-cwd fallback.
     cell.lineage.cwd = cwd;
     cell.call = call;
     let scope = TaskScope::new(&lua, cell);

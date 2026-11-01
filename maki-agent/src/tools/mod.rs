@@ -363,9 +363,9 @@ pub struct ToolContext {
     pub mode: AgentMode,
     /// The owning session's cwd, fixed at session start. Carried everywhere
     /// the context clones (nested calls, local tools, attached agents), so a
-    /// tool can always tell which project it serves. Resolution behavior is
-    /// unchanged in 02.4: making tools consult this instead of the process
-    /// cwd is 02.5b/c.
+    /// tool can always tell which project it serves. 02.5b resolves the
+    /// filesystem surface against this; subprocess/instruction defaults are
+    /// 02.5c's.
     pub cwd: PathBuf,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
@@ -461,19 +461,9 @@ impl BackgroundFor {
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.join(rest).to_string_lossy().into_owned()
-    } else if path == "~" {
-        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
-        home.to_string_lossy().into_owned()
-    } else {
-        path.to_string()
-    };
+    let expanded = expand_user(path)?;
 
     if Path::new(&expanded).is_relative() {
-        // 02.5a inventory: session-scoped fallback to the process cwd.
-        // 02.5b resolves against the owning session's carried cwd instead.
         let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
         Ok(cwd.join(&expanded).to_string_lossy().into_owned())
     } else {
@@ -481,15 +471,62 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     }
 }
 
+fn expand_user(path: &str) -> Result<String, String> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
+        Ok(home.join(rest).to_string_lossy().into_owned())
+    } else if path == "~" {
+        let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
+        Ok(home.to_string_lossy().into_owned())
+    } else {
+        Ok(path.to_string())
+    }
+}
+
+/// Resolve {path} against the owning session's {cwd}, like [`resolve_path`].
+/// `~/` still expands against the home directory and absolute paths pass
+/// through. `None` keeps the process-cwd fallback for contexts no session
+/// owns (CLI one-shots, detached spawns).
+pub fn resolve_path_with_cwd(path: &str, cwd: Option<&Path>) -> Result<String, String> {
+    let expanded = expand_user(path)?;
+
+    if Path::new(&expanded).is_relative() {
+        match cwd {
+            // 02.5b: relative paths serve the owning session's directory,
+            // never the process cwd. Never `set_current_dir`, not even
+            // temporarily.
+            Some(dir) => Ok(dir.join(&expanded).to_string_lossy().into_owned()),
+            // No owning session (CLI one-shots, detached spawns): the
+            // process-cwd fallback.
+            None => resolve_path(path),
+        }
+    } else {
+        Ok(expanded)
+    }
+}
+
 pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
+    resolve_search_path_with_cwd(path, None)
+}
+
+/// Default search root for the owning session's {cwd}: an omitted path is
+/// that session's directory (grep tool, `maki.fs.glob`/`grep`), an explicit
+/// one resolves against it. `None` keeps the process-cwd fallback for
+/// contexts no session owns.
+pub fn resolve_search_path_with_cwd(
+    path: Option<&str>,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
     match path {
-        Some(p) => resolve_path(p),
-        // 02.5a inventory: an omitted search root defaults to the process
-        // cwd (grep tool, `maki.fs.glob`/`grep`). 02.5b defaults to the
-        // owning session's carried cwd instead.
-        None => env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .map_err(|e| format!("cwd error: {e}")),
+        Some(p) => resolve_path_with_cwd(p, cwd),
+        None => match cwd {
+            // 02.5b: the default root is the owning session, never the
+            // process cwd.
+            Some(dir) => Ok(dir.to_string_lossy().into_owned()),
+            None => env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| format!("cwd error: {e}")),
+        },
     }
 }
 
@@ -498,12 +535,10 @@ static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home
 
 /// Display-only shortening of absolute paths, against the process launch
 /// directory first.
-// 02.5a inventory: 02.5b may shorten against the owning session instead;
-// the shortened text never resolves anything.
 pub(crate) fn relative_path(path: &str) -> String {
     let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
-        && let Ok(rel) = p.strip_prefix(cwd)
+    if let Some(launch) = CWD.as_deref()
+        && let Ok(rel) = p.strip_prefix(launch)
     {
         return format_rel("", ".", rel);
     }
@@ -513,6 +548,21 @@ pub(crate) fn relative_path(path: &str) -> String {
         return format_rel("~/", "~", rel);
     }
     path.to_string()
+}
+
+/// Display-only shortening against the owning session's {cwd} first, then
+/// home, then the process launch directory. `None` keeps the launch-dir
+/// fallback for contexts no session owns. The shortened text never resolves
+/// anything (02.5b site #6); Lua plugin views shorten through `maki.uv.cwd`
+/// instead, which is session-scoped too.
+pub(crate) fn relative_path_with_cwd(path: &str, cwd: Option<&Path>) -> String {
+    let p = Path::new(path);
+    if let Some(session) = cwd
+        && let Ok(rel) = p.strip_prefix(session)
+    {
+        return format_rel("", ".", rel);
+    }
+    relative_path(path)
 }
 
 fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
@@ -1268,6 +1318,64 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
+    }
+
+    #[test]
+    fn resolve_with_cwd_serves_the_owning_session() {
+        let session = TempDir::new().unwrap();
+        let session_cwd = session.path();
+        // A session directory distinct from the process cwd, or the test
+        // proves nothing about which directory resolved the path.
+        assert_ne!(
+            session_cwd.canonicalize().unwrap(),
+            env::current_dir().unwrap().canonicalize().unwrap()
+        );
+
+        assert_eq!(
+            resolve_path_with_cwd("src/main.rs", Some(session_cwd)).unwrap(),
+            session_cwd.join("src/main.rs").to_string_lossy()
+        );
+        assert_eq!(
+            resolve_search_path_with_cwd(None, Some(session_cwd)).unwrap(),
+            session_cwd.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_search_path_with_cwd(Some("sub"), Some(session_cwd)).unwrap(),
+            session_cwd.join("sub").to_string_lossy()
+        );
+        // Absolute paths pass through untouched, `~` still expands home.
+        assert_eq!(
+            resolve_path_with_cwd("/etc/hosts", Some(session_cwd)).unwrap(),
+            "/etc/hosts"
+        );
+        // No owning session keeps the process-cwd fallback (CLI one-shots,
+        // detached spawns).
+        assert_eq!(
+            resolve_search_path_with_cwd(None, None).unwrap(),
+            env::current_dir().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn relative_path_with_cwd_prefers_the_session() {
+        let session = TempDir::new().unwrap();
+        let session_cwd = session.path();
+        let under_session = session_cwd.join("src/main.rs");
+        let under_session = under_session.to_string_lossy().into_owned();
+
+        assert_eq!(
+            relative_path_with_cwd(&under_session, Some(session_cwd)),
+            "src/main.rs"
+        );
+        assert_eq!(
+            relative_path_with_cwd(&session_cwd.to_string_lossy(), Some(session_cwd)),
+            "."
+        );
+        // Display only: unknown paths come back unchanged.
+        assert_eq!(
+            relative_path_with_cwd("/etc/hosts", Some(session_cwd)),
+            "/etc/hosts"
+        );
     }
 
     #[test]

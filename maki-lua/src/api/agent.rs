@@ -2295,6 +2295,81 @@ mod tests {
         session.unwrap()
     }
 
+    /// 02.5b site #11: an attached session's tool calls retain the parent
+    /// session's cwd. The open path clones the parent's permissions (hence
+    /// its cwd) into the child's params, and the child's agent builds every
+    /// tool context from those permissions — so resolution serves the parent
+    /// project. Proved through the real `maki.agent.session` open plus a
+    /// real `maki.fs.read` of a relative path under the child's lineage,
+    /// with the process cwd unchanged throughout.
+    #[tokio::test]
+    async fn attached_session_tools_retain_the_parent_cwd() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(project.path().join("marker.txt"), "parent-project").unwrap();
+        let dir = project.path().canonicalize().unwrap();
+        assert_ne!(
+            dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        let permissions = Arc::new(maki_agent::permissions::PermissionManager::new(
+            maki_config::PermissionsConfig {
+                default: maki_config::DefaultEffect::Allow,
+                rules: vec![],
+                ..Default::default()
+            },
+            dir.clone(),
+            maki_config::ProjectConfig::discover(&dir),
+            Arc::default(),
+        ));
+        // `stub_ctx_with` pins `/tmp` permissions: swap in the fixture
+        // project's, the way a real activation builds session permissions
+        // from the session's own directory (02.4).
+        let mut ctx = stub_ctx_with(&maki_agent::AgentMode::Build, None, None);
+        ctx.cwd = dir.clone();
+        ctx.permissions = permissions;
+        assert_eq!(ctx.cwd, dir, "the parent serves its own project");
+
+        let lua = mlua::Lua::new();
+        let sess = native_session(&lua, &ctx).await;
+        let child_cwd = session_state(&sess, |state| state.params.permissions.cwd());
+        assert_eq!(
+            child_cwd, dir,
+            "the attached session inherits the parent's cwd"
+        );
+
+        // The child's tool calls resolve through the same lineage the
+        // runtime stamps on every real dispatch: a relative read lands in
+        // the parent project, never the process cwd.
+        let child = crate::api::fs::create_fs_table(
+            &lua,
+            &PluginPermissions::trusted(),
+            Arc::from("test-attached"),
+        )
+        .unwrap();
+        let mut cell = TaskCell::new(maki_agent::cancel::CancelToken::none(), None, None);
+        cell.lineage.session = ctx.session_id.as_ref().map(|id| id.id());
+        cell.lineage.cwd = Some(child_cwd);
+        let scope = TaskScope::new(&lua, cell);
+        scope
+            .scope_future(async {
+                let read: mlua::Function = child.get("read").unwrap();
+                let (text, err): (Option<String>, Option<String>) =
+                    read.call_async("marker.txt".to_owned()).await.unwrap();
+                assert_eq!(err, None, "attached tools resolve relatively");
+                assert_eq!(text.as_deref(), Some("parent-project"));
+            })
+            .await;
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "attached resolution never moves the Maki process cwd"
+        );
+    }
+
     #[test_case(false ; "close")]
     #[test_case(true ; "dispose")]
     #[tokio::test]

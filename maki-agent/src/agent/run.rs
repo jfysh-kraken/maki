@@ -1018,7 +1018,8 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             // The owning session's cwd, so tools and attached agents serve
             // their own project. Cloned verbatim into every nested context;
-            // resolution behavior is 02.5b/c's, not this slice's.
+            // the filesystem surface resolves against it (02.5b), while
+            // subprocess/instruction defaults are 02.5c's.
             cwd: self.permissions.cwd(),
             session_id: self.session_id.clone(),
             background_for: self.background_for.clone(),

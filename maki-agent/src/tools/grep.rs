@@ -10,7 +10,7 @@ use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
 use ignore::WalkState;
 use tracing::debug;
 
-use super::{mtime, resolve_search_path, truncate_bytes, walk_builder};
+use super::{mtime, resolve_search_path_with_cwd, truncate_bytes, walk_builder};
 
 pub(super) const INVALID_REGEX: &str = "invalid regex pattern";
 const MULTILINE_HEAP_LIMIT: usize = 64 * 1024 * 1024;
@@ -46,8 +46,18 @@ impl GrepParams {
 
 /// Core grep logic. Blocking — caller must run on a thread pool.
 /// Returns `(base_path, entries)` where entries have paths relative to base.
+/// `cwd` is the owning session's directory (02.5b); `None` keeps the
+/// process-cwd fallback for contexts no session owns.
 pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), String> {
-    let search_path = resolve_search_path(params.path.as_deref())?;
+    grep_search_with_cwd(params, None)
+}
+
+/// [`grep_search`] against the owning session's {cwd}.
+pub fn grep_search_with_cwd(
+    params: GrepParams,
+    cwd: Option<&Path>,
+) -> Result<(PathBuf, Vec<GrepFileEntry>), String> {
+    let search_path = resolve_search_path_with_cwd(params.path.as_deref(), cwd)?;
     let is_multiline = needs_multiline(&params.pattern);
     debug!(
         pattern = %params.pattern,

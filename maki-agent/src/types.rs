@@ -381,10 +381,18 @@ impl ToolOutput {
     }
 
     pub fn as_text(&self) -> String {
+        self.as_text_with_cwd(None)
+    }
+
+    /// [`as_text`](Self::as_text) with display shortening against the owning
+    /// session's {cwd} (02.5b site #6). `None` keeps the process launch-dir
+    /// fallback for contexts no session owns. Display only: the shortened
+    /// text never resolves anything.
+    pub fn as_text_with_cwd(&self, cwd: Option<&Path>) -> String {
         let mut out = match self {
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
-            _ => self.as_display_text(),
+            _ => self.as_display_text_with_cwd(cwd),
         };
         if let Some(blocks) = self.instructions() {
             append_instructions(&mut out, blocks);
@@ -402,6 +410,13 @@ impl ToolOutput {
     }
 
     pub fn as_display_text(&self) -> String {
+        self.as_display_text_with_cwd(None)
+    }
+
+    /// [`as_display_text`](Self::as_display_text) with display shortening
+    /// against the owning session's {cwd} (02.5b site #6). `None` keeps the
+    /// process launch-dir fallback for contexts no session owns.
+    pub fn as_display_text_with_cwd(&self, cwd: Option<&Path>) -> String {
         match self {
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.clone(),
             Self::ReadCode {
@@ -436,7 +451,7 @@ impl ToolOutput {
                 before,
                 after,
                 summary,
-                &crate::tools::relative_path(path),
+                &crate::tools::relative_path_with_cwd(path, cwd),
             ),
             Self::TodoList(items) => {
                 if items.is_empty() {
@@ -451,7 +466,7 @@ impl ToolOutput {
             Self::WriteCode {
                 path, byte_count, ..
             } => {
-                let display = crate::tools::relative_path(path);
+                let display = crate::tools::relative_path_with_cwd(path, cwd);
                 format!("wrote {byte_count} bytes to {display}")
             }
             Self::GrepResult { entries } => {
@@ -1638,6 +1653,35 @@ mod tests {
     #[test_case(ToolOutput::Plain("ok".into()), None ; "non_write_variant")]
     fn output_written_path(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.written_path(), expected);
+    }
+
+    /// 02.5b site #6: display shortening serves the owning session, while the
+    /// no-session render keeps the process launch-dir fallback. Display only:
+    /// the shortened text never resolves anything.
+    #[test]
+    fn display_text_shortens_against_the_owning_session() {
+        let session = tempfile::TempDir::new().unwrap();
+        let path = session
+            .path()
+            .join("src/main.rs")
+            .to_string_lossy()
+            .into_owned();
+        let output = ToolOutput::WriteCode {
+            path: path.clone(),
+            byte_count: 10,
+            lines: vec![],
+        };
+        assert_eq!(
+            output.as_text_with_cwd(Some(session.path())),
+            "wrote 10 bytes to src/main.rs"
+        );
+        // Outside the session the path stays whole (unless the launch
+        // directory happens to contain it, which the fixture guarantees it
+        // does not).
+        assert!(
+            output.as_text_with_cwd(None).contains(path.as_str()),
+            "no-session display keeps the absolute path"
+        );
     }
 
     #[test]

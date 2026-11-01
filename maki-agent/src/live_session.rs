@@ -607,8 +607,9 @@ impl AgentSeed {
         ToolContext {
             provider: Arc::clone(&slot.provider),
             model: Arc::new(slot.model.clone()),
-            // The owning session's cwd (02.4 carries it; 02.5b/c own the
-            // resolution behavior).
+            // The owning session's cwd (02.4 carries it; 02.5b resolves the
+            // filesystem surface against it, 02.5c owns subprocess/instruction
+            // behavior).
             cwd: self.permissions.cwd(),
             session_id: Some(self.session_id.clone()),
             background_for: BackgroundFor::Chat(self.session_id.id()),

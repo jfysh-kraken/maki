@@ -39,12 +39,43 @@ fn make_absolute(path: &str) -> Result<PathBuf, String> {
     if p.is_absolute() {
         Ok(p)
     } else {
-        // 02.5a inventory: session-scoped fallback to the process cwd.
-        // 02.5b resolves relative paths against the owning session's carried
-        // cwd instead. Never `set_current_dir` around async work.
+        // No owning session (one-shots, detached spawns, restores): the
+        // process cwd stands in. Session-owned calls use `make_absolute_in`.
         std::env::current_dir()
             .map(|cwd| cwd.join(&p))
             .map_err(|e| format!("cannot resolve cwd: {e}"))
+    }
+}
+
+/// The owning session's cwd for the task running {lua}, so a call site can
+/// resolve against its own project instead of the process cwd. `None` when
+/// no session owns the task: one-shots, restores and `maki.async.spawn`
+/// children keep the process-cwd fallback. Never `set_current_dir` around
+/// async work: the value travels per task, so independent sessions stay
+/// concurrent even under blocking (`--background-timeout 0`) execution.
+fn session_cwd(lua: &Lua) -> Option<PathBuf> {
+    crate::runtime::Lineage::current(lua).cwd
+}
+
+/// [`make_absolute`] against the owning session's directory (02.5b): relative
+/// paths serve the session that called, never the Maki process cwd.
+fn make_absolute_in(lua: &Lua, path: &str) -> Result<PathBuf, String> {
+    make_absolute_with(session_cwd(lua).as_deref(), path)
+}
+
+/// [`make_absolute`] against an already-captured session directory, for code
+/// running off the executor (a `spawn_blocking` closure) where the lineage
+/// is unreachable. `None` is the process-cwd fallback for contexts no
+/// session owns.
+fn make_absolute_with(session: Option<&Path>, path: &str) -> Result<PathBuf, String> {
+    let p = expand_tilde(path);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        match session {
+            Some(cwd) => Ok(cwd.join(&p)),
+            None => make_absolute(path),
+        }
     }
 }
 
@@ -428,8 +459,8 @@ fn read_line_window(
 /// end
 /// local tail = maki.fs.read("server.log", { offset = -50 })
 #[lua_fn(guard = FsRead)]
-async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn read(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let Some(opts) = opts.as_ref() else {
         let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
         return Ok(pair(
@@ -459,7 +490,7 @@ async fn read(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<St
 /// local header = maki.fs.read_bytes("image.png", { len = 8 })
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Buffer>> {
-    let abs = try_pair!(make_absolute(&path));
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let bytes = match opts.as_ref() {
         Some(opts) => {
             let offset: i64 = opts.opt::<i64>("offset")?.unwrap_or(0);
@@ -492,7 +523,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// print(("lines 101-%d of %d"):format(100 + #page.lines, page.total))
 #[lua_fn(guard = FsRead)]
 async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let abs = try_pair!(make_absolute(&path));
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let query = PageQuery::from_opts(opts.as_ref())?;
     let (lines, total) = try_pair!(
         spawn_blocking(move || {
@@ -523,7 +554,7 @@ async fn read_lines(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// end
 #[lua_fn(guard = FsRead)]
 async fn metadata(lua: Lua, path: String) -> LuaResult<Pair<Table>> {
-    let abs = try_pair!(make_absolute(&path));
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     match tokio::fs::metadata(&abs).await {
         Ok(meta) => {
             let tbl = lua.create_table()?;
@@ -593,8 +624,8 @@ fn joinpath(_lua: &Lua, parts: mlua::Variadic<String>) -> LuaResult<String> {
 /// @example
 /// maki.fs.normalize("src/../src/api") -- "/home/user/project/src/api"
 #[lua_fn]
-fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
-    let abs = make_absolute(&path).map_err(mlua::Error::runtime)?;
+fn normalize(lua: &Lua, path: String) -> LuaResult<String> {
+    let abs = make_absolute_in(lua, &path).map_err(mlua::Error::runtime)?;
     let mut components = Vec::new();
     for comp in abs.components() {
         match comp {
@@ -617,8 +648,8 @@ fn normalize(_lua: &Lua, path: String) -> LuaResult<String> {
 /// @example
 /// maki.fs.abspath("src/main.rs") -- "/home/user/project/src/main.rs"
 #[lua_fn]
-fn abspath(_lua: &Lua, path: String) -> LuaResult<String> {
-    path_to_string(&make_absolute(&path).map_err(mlua::Error::runtime)?)
+fn abspath(lua: &Lua, path: String) -> LuaResult<String> {
+    path_to_string(&make_absolute_in(lua, &path).map_err(mlua::Error::runtime)?)
 }
 
 /// Return all ancestor directories of {path}, from the immediate parent up to the root.
@@ -656,7 +687,7 @@ fn parents(lua: &Lua, path: String) -> LuaResult<Table> {
 /// local root = maki.fs.root("src/main.rs", { ".git", "Cargo.toml" })
 /// if root then print("project root: " .. root) end
 #[lua_fn(guard = FsRead)]
-async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<String>> {
+async fn root(lua: Lua, source: String, marker: Value) -> LuaResult<Option<String>> {
     let markers: Vec<String> = match marker {
         Value::String(s) => vec![s.to_str()?.to_owned()],
         Value::Table(t) => {
@@ -672,6 +703,9 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
             ));
         }
     };
+    // The lineage stays on the executor: capture the owning session before
+    // the blocking thread takes over.
+    let session = session_cwd(&lua);
 
     spawn_blocking(move || {
         let start = Path::new(&source);
@@ -681,8 +715,9 @@ async fn root(_lua: Lua, source: String, marker: Value) -> LuaResult<Option<Stri
             start
         };
 
-        let mut dir =
-            make_absolute(start.to_str().unwrap_or_default()).map_err(mlua::Error::runtime)?;
+        // 02.5b: upward search starts in the owning session.
+        let mut dir = make_absolute_with(session.as_deref(), start.to_str().unwrap_or_default())
+            .map_err(mlua::Error::runtime)?;
 
         loop {
             for m in &markers {
@@ -757,7 +792,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// end
 #[lua_fn(guard = FsRead)]
 async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let abs = try_pair!(make_absolute(&path));
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let max_depth: u32 = match &opts {
         Some(t) => t.get::<u32>("depth").unwrap_or(1),
         None => 1,
@@ -799,8 +834,8 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let result = tokio::fs::write(&abs, content).await;
     Ok(pair(touched(abs, result).await.map(|()| true)))
 }
@@ -815,8 +850,8 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn append(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let appended = abs.clone();
     let result = spawn_blocking(move || {
         use std::io::Write;
@@ -842,8 +877,8 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn atomic_write(lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let written = abs.clone();
     let result = spawn_blocking(move || maki_storage::atomic_write(&abs, content.as_bytes()))
         .await
@@ -864,8 +899,8 @@ async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pai
 /// if err then print("rm failed: " .. err) end
 /// maki.fs.rm("stale_dir", { recursive = true, force = true })
 #[lua_fn(guard = FsWrite)]
-async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let recursive = opts
         .as_ref()
         .and_then(|t| t.opt_bool("recursive"))
@@ -911,9 +946,9 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
 /// local ok, err = maki.fs.rename("out.log", "out.log.1")
 /// if err then print("rename failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
-    let from = try_pair!(make_absolute(&from));
-    let to = try_pair!(make_absolute(&to));
+async fn rename(lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
+    let from = try_pair!(make_absolute_in(&lua, &from));
+    let to = try_pair!(make_absolute_in(&lua, &to));
     let result = tokio::fs::rename(&from, &to).await;
     let result = touched(from, result).await;
     Ok(pair(touched(to, result).await.map(|()| true)))
@@ -928,8 +963,8 @@ async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
 /// @example
 /// maki.fs.mkdir("a/b/c", { parents = true })
 #[lua_fn(guard = FsWrite)]
-async fn mkdir(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
-    let abs = try_pair!(make_absolute(&path));
+async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let abs = try_pair!(make_absolute_in(&lua, &path));
     let parents = opts
         .as_ref()
         .and_then(|t| t.opt_bool("parents"))
@@ -1061,9 +1096,14 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
         .unwrap_or(true);
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
+    // The lineage stays on the executor: capture the owning session before
+    // the blocking thread takes over.
+    let session = session_cwd(&lua);
 
     let result: Result<Vec<String>, String> = spawn_blocking(move || {
-        let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
+        // 02.5b: the default root is the owning session, never the process cwd.
+        let root =
+            maki_agent::tools::resolve_search_path_with_cwd(path.as_deref(), session.as_deref())?;
         let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
 
         let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
@@ -1151,9 +1191,16 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
     }
 
-    let result = spawn_blocking(move || maki_agent::tools::grep::grep_search(params))
-        .await
-        .map_err(mlua::Error::external)?;
+    // The lineage stays on the executor: capture the owning session before
+    // the blocking thread takes over.
+    let session = session_cwd(&lua);
+
+    // 02.5b: the default root is the owning session, never the process cwd.
+    let result = spawn_blocking(move || {
+        maki_agent::tools::grep::grep_search_with_cwd(params, session.as_deref())
+    })
+    .await
+    .map_err(mlua::Error::external)?;
 
     let (base, entries) = try_pair!(result);
     let arr = lua.create_table()?;
@@ -1245,11 +1292,12 @@ fn retire(plugin: &Arc<str>, token: &Arc<AtomicBool>) {
 /// also makes every spelling of one directory reach one index instead of one
 /// walk per spelling, and what it returns is what the index is keyed on, so
 /// the directory that was cleared is the directory that is walked.
-fn search_root(path: Option<&str>, base: &Path) -> Result<PathBuf, String> {
+fn search_root(path: Option<&str>, base: &Path, session: Option<&Path>) -> Result<PathBuf, String> {
     let Some(path) = path else {
         return Ok(base.to_path_buf());
     };
-    let resolved = maki_agent::tools::resolve_search_path(Some(path))?;
+    // 02.5b: an explicit root resolves against the owning session.
+    let resolved = maki_agent::tools::resolve_search_path_with_cwd(Some(path), session)?;
     let root = Path::new(&resolved)
         .canonicalize()
         .map_err(|e| format!("{path}: {e}"))?;
@@ -1259,11 +1307,22 @@ fn search_root(path: Option<&str>, base: &Path) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// The process launch directory, canonicalised. Only the no-session fallback
+/// (one-shots, detached spawns, restores) and fixture scaffolding use this:
+/// session-owned calls confine to [`session_root`] instead.
 fn cwd_root() -> Result<PathBuf, String> {
-    // 02.5a inventory: `fuzzy_files` confines its default root to the
-    // process cwd. 02.5b confines it to the owning session's carried cwd.
     let cwd = std::env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
     Ok(cwd.canonicalize().unwrap_or(cwd))
+}
+
+/// The directory a `fuzzy_files` call is confined to (02.5b site #2): the
+/// owning session's directory, canonicalised like [`cwd_root`]. `None` keeps
+/// the process-cwd fallback for contexts no session owns.
+fn session_root(lua: &Lua) -> Result<PathBuf, String> {
+    match session_cwd(lua) {
+        Some(cwd) => Ok(cwd.canonicalize().unwrap_or(cwd)),
+        None => cwd_root(),
+    }
 }
 
 /// Records that {plugin} is reading {root} and keeps it to
@@ -1364,7 +1423,7 @@ type RankedRoot = Result<(PathBuf, FileReader, Option<Ranked>), String>;
 /// @param opts table? Options:
 ///   `query` (string) what the user typed. Empty returns the first `limit` paths in walk order.
 ///   `limit` (integer) how many items to return, at most 500. Default 20.
-///   `path` (string) the root to search, the cwd or below it. Default is the current working directory.
+///   `path` (string) the root to search, the session directory or below it. Default is the owning session's working directory.
 ///   `highlights` (boolean) also return where the query matched each path. Default false.
 /// @return (table?, string?) `{ root = string, complete = boolean, crashed = boolean, truncated = boolean, items = { { path = string, highlights = integer[][]? } } }`, or nil plus an error message. `root` is the resolved absolute directory the paths are relative to, spelled the way `"FileIndexReady"` spells it, so an event can be matched to the call that caused it. It is absent for a directory with no UTF-8 spelling, as it is on the event, so a plugin that gets no `root` treats every event as a reason to ask again rather than matching the wrong tree. `items` is a 1-based array, best first. `highlights` is only present when asked for, and holds `{ from, to }` byte ranges of `path`, ascending, 1-based and inclusive, so `path:sub(from, to)` is the matched text.
 /// @example
@@ -1398,6 +1457,11 @@ async fn fuzzy_files(
 
     let cancel = supersede(&plugin);
     let token = Arc::clone(&cancel);
+    // The lineage stays on the executor: capture the owning session (both
+    // the confinement base and explicit-root resolution) before the blocking
+    // thread takes over.
+    let session = session_cwd(&lua);
+    let base = session_root(&lua).map_err(mlua::Error::runtime)?;
     // Resolving the root stats the filesystem twice, so it waits for the
     // blocking thread with the ranking: on a network filesystem those two
     // syscalls per keystroke stall every other plugin on the Lua executor.
@@ -1406,7 +1470,8 @@ async fn fuzzy_files(
         // keyed on that very path: resolving it again would be a second
         // answer, and a component swapped for a symlink between the two would
         // put the walk outside the directory the check cleared.
-        let root = search_root(path.as_deref(), &cwd_root()?)?;
+        // 02.5b: confinement and resolution serve the owning session.
+        let root = search_root(path.as_deref(), &base, session.as_deref())?;
         // The reader comes first so the walk cannot be cancelled out from
         // under the ranking by another reader letting go mid-query.
         let reader = maki_agent::resolved_index(root.clone()).reader();
@@ -1469,7 +1534,8 @@ lua_table! {
     /// File-system utilities, modelled after `vim.fs` and `vim.uv`.
     ///
     /// Fallible operations return `(value, err)` pairs and never throw.
-    /// Paths support `~/` expansion. Relative paths resolve from the current working directory.
+    /// Paths support `~/` expansion. Relative paths resolve from the owning
+    /// session's working directory (the process directory outside a session).
     ///
     /// ```lua
     /// local text, err = maki.fs.read("init.lua")
@@ -1492,8 +1558,11 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
+    use crate::api::uv::create_uv_table;
     use crate::plugin_permissions::PluginPermissions;
+    use crate::runtime::{TaskCell, TaskScope};
     use futures::FutureExt;
+    use maki_agent::cancel::CancelToken;
     use mlua::Lua;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -3193,13 +3262,16 @@ mod tests {
     #[test_case(ESCAPE_PATH  ; "a_walk_out_of_the_project")]
     fn files_refuses_a_root_outside_the_project(path: &str) {
         let base = cwd_root().unwrap();
-        assert_eq!(search_root(Some(path), &base).unwrap_err(), OUTSIDE_CWD_ERR);
+        assert_eq!(
+            search_root(Some(path), &base, None).unwrap_err(),
+            OUTSIDE_CWD_ERR
+        );
     }
 
     #[test]
     fn files_defaults_to_the_project_root() {
         let base = cwd_root().unwrap();
-        assert_eq!(search_root(None, &base).unwrap(), base);
+        assert_eq!(search_root(None, &base, None).unwrap(), base);
     }
 
     /// Every spelling of one directory has to reach one index, or a plugin
@@ -3215,7 +3287,7 @@ mod tests {
             format!("{}/.", root.display()),
         ];
         for spelling in &spellings {
-            assert_eq!(search_root(Some(spelling), &base).unwrap(), root);
+            assert_eq!(search_root(Some(spelling), &base, None).unwrap(), root);
         }
     }
 
@@ -3622,6 +3694,229 @@ mod tests {
                 .iter()
                 .any(|p| p == NEW_FILE),
             "the plugin's own call finds it too"
+        );
+    }
+
+    /// One fixture project per session, each with a file the other lacks.
+    struct SessionProject {
+        _tmp: TempDir,
+        dir: std::path::PathBuf,
+        marker: &'static str,
+        content: &'static str,
+    }
+
+    impl SessionProject {
+        fn new(marker: &'static str, content: &'static str) -> Self {
+            let tmp = TempDir::new().unwrap();
+            std::fs::write(tmp.path().join(marker), content).unwrap();
+            std::fs::create_dir(tmp.path().join("sub")).unwrap();
+            std::fs::write(tmp.path().join("sub").join("notes.txt"), content).unwrap();
+            // A relative search must not escape into this: it lives outside
+            // both projects and must never appear in an answer.
+            let dir = tmp.path().canonicalize().unwrap();
+            Self {
+                _tmp: tmp,
+                dir,
+                marker,
+                content,
+            }
+        }
+    }
+
+    /// The task scope a session-owned tool call runs under: the lineage the
+    /// runtime stamps on every real dispatch (`run_tool_call`), carrying the
+    /// owning session's cwd.
+    fn session_scope(lua: &Lua, session: &std::path::Path) -> TaskScope {
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.lineage.session = Some(maki_storage::id::MakiId::generate());
+        cell.lineage.cwd = Some(session.to_path_buf());
+        TaskScope::new(lua, cell)
+    }
+
+    /// One session's pass over the converted surface, through the real Lua
+    /// functions: `maki.uv.cwd`, a relative read, `glob` with an omitted and
+    /// a relative root, `grep` with an omitted root, and `fuzzy_files`
+    /// confined to the session. Yields between steps so the two sessions
+    /// interleave on the shared executor exactly like concurrent tool calls.
+    async fn session_pass(
+        lua: &Lua,
+        fs: &Table,
+        uv: &Table,
+        project: &SessionProject,
+        plugin: &str,
+    ) {
+        let cwd_fn: mlua::Function = uv.get("cwd").unwrap();
+        let read: mlua::Function = fs.get("read").unwrap();
+        let glob: mlua::Function = fs.get("glob").unwrap();
+        let grep: mlua::Function = fs.get("grep").unwrap();
+        let fuzzy: mlua::Function = fs.get("fuzzy_files").unwrap();
+
+        let cwd: Option<String> = cwd_fn.call_async(()).await.unwrap();
+        assert_eq!(
+            cwd.as_deref().map(std::path::Path::new),
+            Some(project.dir.as_path()),
+            "{plugin}: maki.uv.cwd serves the owning session"
+        );
+        tokio::task::yield_now().await;
+
+        let (text, err): (Option<String>, Option<String>) =
+            read.call_async(project.marker.to_owned()).await.unwrap();
+        assert_eq!(err, None, "{plugin}: relative read resolves");
+        assert_eq!(text.as_deref(), Some(project.content));
+        tokio::task::yield_now().await;
+
+        let opts = lua.create_table().unwrap();
+        let found: Table = glob.call_async(("*.txt", opts)).await.unwrap();
+        let default_root: Vec<String> = found.sequence_values().map(Result::unwrap).collect();
+        assert!(
+            default_root.iter().any(|p| p.ends_with(project.marker)),
+            "{plugin}: glob defaults to the owning session, got {default_root:?}"
+        );
+        assert!(
+            default_root
+                .iter()
+                .all(|p| p.starts_with(project.dir.to_str().unwrap())),
+            "{plugin}: glob never escapes the session, got {default_root:?}"
+        );
+        tokio::task::yield_now().await;
+
+        let sub_opts = lua.create_table().unwrap();
+        sub_opts.set("path", "sub").unwrap();
+        let found: Table = glob.call_async(("*.txt", sub_opts)).await.unwrap();
+        let sub_root: Vec<String> = found.sequence_values().map(Result::unwrap).collect();
+        assert!(
+            sub_root.iter().any(|p| p.ends_with("notes.txt")),
+            "{plugin}: a relative glob root resolves in the session, got {sub_root:?}"
+        );
+        tokio::task::yield_now().await;
+
+        let grep_opts = lua.create_table().unwrap();
+        let entries: Table = grep.call_async((project.content, grep_opts)).await.unwrap();
+        let entry_path: String = entries.get::<Table>(1).unwrap().get("path").unwrap();
+        assert!(
+            entry_path.starts_with(project.dir.to_str().unwrap()),
+            "{plugin}: grep defaults to the owning session, got {entry_path:?}"
+        );
+        tokio::task::yield_now().await;
+
+        walked(&project.dir);
+        let fuzzy_opts = lua.create_table().unwrap();
+        fuzzy_opts.set("query", project.marker).unwrap();
+        fuzzy_opts.set("limit", 20).unwrap();
+        let (found, err): (Option<Table>, Option<String>) =
+            fuzzy.call_async(fuzzy_opts).await.unwrap();
+        assert_eq!(err, None, "{plugin}: fuzzy_files answers");
+        let found = found.unwrap();
+        let root: Option<String> = found.get("root").unwrap();
+        assert_eq!(
+            root.as_deref(),
+            project.dir.to_str(),
+            "{plugin}: fuzzy_files is confined to the owning session"
+        );
+    }
+
+    /// 02.5b acceptance: interleaved filesystem search (`glob` and relative
+    /// reads) and `maki.uv` queries in separate A/B fixture projects resolve
+    /// in the correct session, through the real Lua/tool paths and never a
+    /// global chdir. The process cwd stays unchanged throughout.
+    #[tokio::test]
+    async fn interleaved_sessions_resolve_in_their_own_project() {
+        async fn run_session(project: &SessionProject, plugin: &'static str) {
+            let lua = Lua::new();
+            let fs =
+                create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(plugin)).unwrap();
+            let uv = create_uv_table(&lua, &PluginPermissions::trusted()).unwrap();
+            let scope = session_scope(&lua, &project.dir);
+            scope
+                .scope_future(session_pass(&lua, &fs, &uv, project, plugin))
+                .await;
+        }
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = SessionProject::new("marker-a.txt", "session-a-marker");
+        let project_b = SessionProject::new("marker-b.txt", "session-b-marker");
+        assert_ne!(project_a.dir, project_b.dir);
+
+        // Two Lua states interleaved on this thread's executor, like two
+        // concurrent tool calls from independent sessions.
+        let ((), ()) = tokio::join!(
+            run_session(&project_a, "test-interleaved-a"),
+            run_session(&project_b, "test-interleaved-b"),
+        );
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "session resolution never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.5b blocking proof: while session A sits blocked inside a real
+    /// `maki.fs.read` (a FIFO with no writer, the way a slow blocking tool
+    /// parks on its thread), session B completes a full pass of real tool
+    /// calls and only then releases A. Blocking execution alone serializes
+    /// nothing: B never waits for A. Deterministic, no timing involved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blocked_session_does_not_serialize_another() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = SessionProject::new("marker-a.txt", "session-a-marker");
+        let project_b = SessionProject::new("marker-b.txt", "session-b-marker");
+
+        let pipe = project_a.dir.join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success(),
+            "the fixture needs a fifo"
+        );
+
+        let lua_a = Lua::new();
+        let fs_a = create_fs_table(
+            &lua_a,
+            &PluginPermissions::trusted(),
+            Arc::from("test-blocked-a"),
+        )
+        .unwrap();
+        let scope_a = session_scope(&lua_a, &project_a.dir);
+        let read_a: mlua::Function = fs_a.get("read").unwrap();
+        let blocked = scope_a.scope_future(async {
+            let (text, err): (Option<String>, Option<String>) =
+                read_a.call_async("pipe".to_owned()).await.unwrap();
+            assert_eq!(err, None, "session A reads once released");
+            assert_eq!(text.as_deref(), Some("hello-from-b"));
+        });
+
+        let lua_b = Lua::new();
+        let fs_b = create_fs_table(
+            &lua_b,
+            &PluginPermissions::trusted(),
+            Arc::from("test-blocked-b"),
+        )
+        .unwrap();
+        let uv_b = create_uv_table(&lua_b, &PluginPermissions::trusted()).unwrap();
+        let scope_b = session_scope(&lua_b, &project_b.dir);
+        let releasing = scope_b.scope_future(async {
+            // B's whole pass lands while A is still parked in its read.
+            session_pass(&lua_b, &fs_b, &uv_b, &project_b, "test-blocked-b").await;
+            // Only now does anyone open the write end: A's read could not
+            // have finished before this, so B provably did not wait for A.
+            let pipe = project_a.dir.join("pipe");
+            tokio::task::spawn_blocking(move || {
+                std::fs::write(pipe, "hello-from-b").expect("releasing session A")
+            })
+            .await
+            .unwrap();
+        });
+
+        let ((), ()) = tokio::join!(blocked, releasing);
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "session resolution never moves the Maki process cwd"
         );
     }
 }

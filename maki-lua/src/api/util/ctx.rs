@@ -170,10 +170,10 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
-    /// The owning session's cwd (02.5a carries it; 02.5b/c own the resolution
-    /// behavior). `None` when no session owns this context: one-shots,
-    /// restores (whose item names no cwd), and session-detached spawns keep
-    /// the process-cwd fallback.
+    /// The owning session's cwd (02.5a carries it; 02.5b resolves against
+    /// it, 02.5c owns subprocess/instruction behavior). `None` when no
+    /// session owns this context: one-shots, restores (whose item names no
+    /// cwd), and session-detached spawns keep the process-cwd fallback.
     cwd: Option<PathBuf>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
@@ -254,10 +254,11 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id,
             task_id: ctx.task_id,
-            // 02.5a inventory: a restore names its session but carries no
-            // cwd (`RestoreItem` records none), and its task runs without a
-            // session lineage. 02.5b decides whether restore callbacks keep
-            // the process-cwd fallback or gain the owning session's cwd.
+            // 02.5b decision: a restore names its session but carries no cwd
+            // (`RestoreItem` records none), and its task runs without a
+            // session lineage, so restore callbacks keep the process-cwd
+            // fallback. Re-rendering a saved transcript must not resolve
+            // fresh paths against a possibly-moved session directory.
             cwd: None,
             finish_tx: None,
         }
@@ -268,8 +269,8 @@ impl LuaCtx {
     }
 
     /// The owning session's cwd, so a call site can resolve against its own
-    /// project instead of the process cwd. Carrying only: resolution against
-    /// this is 02.5b/c's, and `None` keeps today's process-cwd fallback.
+    /// project instead of the process cwd. `None` keeps the process-cwd
+    /// fallback (one-shots, restores, detached spawns).
     pub(crate) fn cwd(&self) -> Option<PathBuf> {
         self.cwd.clone()
     }

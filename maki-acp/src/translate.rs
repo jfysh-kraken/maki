@@ -330,7 +330,8 @@ pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Sess
             vec![ToolCallContent::Diff(diff)]
         }
         _ => {
-            let text = event.output.as_text();
+            // 02.5b: display shortening serves the owning session (site #6).
+            let text = event.output.as_text_with_cwd(Some(cwd));
             if text.is_empty() {
                 vec![]
             } else {
@@ -341,7 +342,7 @@ pub fn tool_done(event: &ToolDoneEvent, cwd: &Path, home: Option<&Path>) -> Sess
         }
     };
 
-    let raw_text = event.output.as_text();
+    let raw_text = event.output.as_text_with_cwd(Some(cwd));
     let mut fields = ToolCallUpdateFields::new().status(status).content(content);
     if !raw_text.is_empty() {
         fields = fields.raw_output(serde_json::Value::String(raw_text));

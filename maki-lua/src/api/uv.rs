@@ -5,14 +5,21 @@ use crate::plugin_permissions::PluginPermissions;
 
 /// Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 ///
+/// The owning session's directory: every session in its own project reports
+/// its own cwd. Outside a session (one-shots, detached spawns) this is the
+/// Maki process cwd.
+///
 /// @return (string?) Current working directory, or nil if it cannot be determined.
 /// @example
 /// local cwd = maki.uv.cwd()
 /// if cwd then print("working in: " .. cwd) end
 #[lua_fn(guard = FsRead)]
-fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
-    // 02.5a inventory: answers the process cwd. 02.5b answers the owning
-    // session's carried cwd (falling back here with no owning session).
+fn cwd(lua: &Lua) -> LuaResult<Option<String>> {
+    // 02.5b: answer the owning session's carried cwd, falling back to the
+    // process cwd with no owning session. Never `set_current_dir`.
+    if let Some(session) = crate::runtime::Lineage::current(lua).cwd {
+        return Ok(session.to_str().map(String::from));
+    }
     Ok(std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from)))
