@@ -39,6 +39,9 @@ fn make_absolute(path: &str) -> Result<PathBuf, String> {
     if p.is_absolute() {
         Ok(p)
     } else {
+        // 02.5a inventory: session-scoped fallback to the process cwd.
+        // 02.5b resolves relative paths against the owning session's carried
+        // cwd instead. Never `set_current_dir` around async work.
         std::env::current_dir()
             .map(|cwd| cwd.join(&p))
             .map_err(|e| format!("cannot resolve cwd: {e}"))
@@ -1257,6 +1260,8 @@ fn search_root(path: Option<&str>, base: &Path) -> Result<PathBuf, String> {
 }
 
 fn cwd_root() -> Result<PathBuf, String> {
+    // 02.5a inventory: `fuzzy_files` confines its default root to the
+    // process cwd. 02.5b confines it to the owning session's carried cwd.
     let cwd = std::env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
     Ok(cwd.canonicalize().unwrap_or(cwd))
 }

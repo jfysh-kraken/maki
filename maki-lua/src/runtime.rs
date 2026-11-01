@@ -829,6 +829,11 @@ pub(crate) struct Lineage {
     /// The session whose tool call this task serves. Its windows go to that
     /// session's tab, which is not always the one on screen.
     pub(crate) session: Option<MakiId>,
+    /// That session's cwd (02.5a carries it; 02.5b/c own the resolution
+    /// behavior). `None` when no session owns the task: `maki.async.spawn`
+    /// clears it with the session, and session-less runs never set it, so
+    /// those keep the process-cwd fallback.
+    pub(crate) cwd: Option<PathBuf>,
 }
 
 impl Lineage {
@@ -836,6 +841,18 @@ impl Lineage {
         lua.app_data_ref::<TaskHandle>()
             .map(|handle| lock_cell(&handle).lineage.clone())
             .unwrap_or_default()
+    }
+}
+
+/// The lineage a task started from `ctx` runs under: the owning session and
+/// its cwd travel together, so a later call site can resolve against its own
+/// session instead of the process cwd. Carrying only: resolution against the
+/// cwd is 02.5b/c's, and `None` keeps today's process-cwd fallback.
+fn lineage_for(ctx: &LuaCtx) -> Lineage {
+    Lineage {
+        session: ctx.session(),
+        cwd: ctx.cwd(),
+        ..Lineage::default()
     }
 }
 
@@ -2643,6 +2660,9 @@ pub(crate) fn enqueue_spawned_task(
             owner: None,
             lineage: Lineage {
                 session: None,
+                // 02.5a: a spawn is session-detached, so no owning cwd
+                // travels with it either; it keeps the process-cwd fallback.
+                cwd: None,
                 ..Lineage::current(lua)
             },
             ceiling,
@@ -5171,7 +5191,7 @@ async fn run_tool_start(
     ctx: Box<LuaCtx>,
 ) {
     let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
-    cell.lineage.session = ctx.session();
+    cell.lineage = lineage_for(&ctx);
     let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
@@ -5227,6 +5247,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let session = ctx.session();
+    let cwd = ctx.cwd();
     let agent = ctx.agent();
     let live_sink = agent.and_then(|a| a.live_sink.clone());
     let call = agent.and_then(|a| a.call.clone());
@@ -5244,6 +5265,10 @@ async fn run_tool_call(
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
     cell.lineage.session = session;
+    // 02.5a carries the owning session's cwd on the task lineage (next to
+    // the session above) so later call sites can resolve against it.
+    // Resolution behavior is 02.5b/c's; `None` keeps the process-cwd fallback.
+    cell.lineage.cwd = cwd;
     cell.call = call;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
@@ -6632,6 +6657,7 @@ mod tests {
         let lineage = Lineage {
             command_depth: 3,
             session: Some(MakiId::generate()),
+            cwd: Some(PathBuf::from("/session/project-a")),
         };
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
         cell.lineage = lineage.clone();
@@ -6641,6 +6667,59 @@ mod tests {
 
         let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
         assert_eq!(queue.rx.try_recv().unwrap().lineage, lineage);
+    }
+
+    /// 02.5a: the lineage a task starts from carries its owning session's
+    /// cwd, distinct per session, while the Maki process cwd stays unchanged.
+    /// Resolution behavior is 02.5b/c's; this only proves the value is
+    /// carried. Queued async tasks inherit it through the lineage clone
+    /// above; spawns clear it with the session (see
+    /// `spawned_task_lives_with_its_plugin_not_its_caller`).
+    #[test]
+    fn lineage_for_carries_each_sessions_cwd() {
+        use maki_agent::tools::test_support::stub_ctx_with;
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = tempfile::TempDir::new().unwrap();
+        let project_b = tempfile::TempDir::new().unwrap();
+        assert_ne!(project_a.path(), project_b.path());
+
+        // Distinct owning sessions in distinct fixture projects, like the
+        // interleaved A/B activation proof in 02.4.
+        let session_a: MakiId = "01965087-4c71-7f00-8000-000000000001".parse().unwrap();
+        let session_b: MakiId = "01965087-4c71-7f00-8000-000000000002".parse().unwrap();
+        let mut ctx_a = stub_ctx_with(&maki_agent::AgentMode::Build, None, Some("tu-a"));
+        ctx_a.session_id = Some(maki_storage::id::SessionRef::from(session_a));
+        ctx_a.cwd = project_a.path().to_path_buf();
+        let mut ctx_b = stub_ctx_with(&maki_agent::AgentMode::Build, None, Some("tu-b"));
+        ctx_b.session_id = Some(maki_storage::id::SessionRef::from(session_b));
+        ctx_b.cwd = project_b.path().to_path_buf();
+
+        let lineage_a = lineage_for(&LuaCtx::handler(&ctx_a));
+        let lineage_b = lineage_for(&LuaCtx::handler(&ctx_b));
+        assert_eq!(lineage_a.session, Some(session_a));
+        assert_eq!(lineage_b.session, Some(session_b));
+        assert_eq!(lineage_a.cwd.as_deref(), Some(project_a.path()));
+        assert_eq!(lineage_b.cwd.as_deref(), Some(project_b.path()));
+
+        // No owning session, no carried cwd: the one-shot keeps the
+        // process-cwd fallback.
+        let mut lone = stub_ctx_with(&maki_agent::AgentMode::Build, None, None);
+        lone.session_id = None;
+        let lineage_lone = lineage_for(&LuaCtx::handler(&lone));
+        assert_eq!(lineage_lone.session, None);
+        assert_eq!(lineage_lone.cwd, None);
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "carrying session cwds never moves the Maki process cwd"
+        );
+        assert!(
+            !process_cwd.starts_with(project_a.path())
+                && !process_cwd.starts_with(project_b.path()),
+            "neither session inherits the launch directory: {process_cwd:?}"
+        );
     }
 
     /// A task the owner queues while its action holds only the price runs
@@ -6833,6 +6912,7 @@ mod tests {
         cell.lineage = Lineage {
             command_depth: SPAWN_COMMAND_DEPTH,
             session: Some(MakiId::generate()),
+            cwd: Some(PathBuf::from("/session/project-a")),
         };
         cell.inline_spawn = Some(Vec::new());
         let scope = TaskScope::new(&lua, cell);
@@ -6852,6 +6932,9 @@ mod tests {
             Lineage {
                 command_depth: SPAWN_COMMAND_DEPTH,
                 session: None,
+                // 02.5a: a spawn leaves the session behind, and its cwd with
+                // it; only the command depth carries over.
+                cwd: None,
             }
         );
         assert!(matches!(&task.lifetime, TaskLifetime::Spawned(s) if &*s.plugin == SPAWN_PLUGIN));

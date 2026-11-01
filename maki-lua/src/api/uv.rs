@@ -11,6 +11,8 @@ use crate::plugin_permissions::PluginPermissions;
 /// if cwd then print("working in: " .. cwd) end
 #[lua_fn(guard = FsRead)]
 fn cwd(_lua: &Lua) -> LuaResult<Option<String>> {
+    // 02.5a inventory: answers the process cwd. 02.5b answers the owning
+    // session's carried cwd (falling back here with no owning session).
     Ok(std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from)))

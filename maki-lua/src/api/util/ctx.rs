@@ -170,6 +170,11 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// The owning session's cwd (02.5a carries it; 02.5b/c own the resolution
+    /// behavior). `None` when no session owns this context: one-shots,
+    /// restores (whose item names no cwd), and session-detached spawns keep
+    /// the process-cwd fallback.
+    cwd: Option<PathBuf>,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
@@ -210,6 +215,10 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
+            // A session-less context (the `maki index` one-shot, a detached
+            // spawn) owns no project: its cwd is the process stand-in
+            // `interpreter_ctx` records, never an owning session's.
+            cwd: ctx.session_id.is_some().then(|| ctx.cwd.clone()),
             finish_tx: None,
         }
     }
@@ -245,12 +254,24 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id,
             task_id: ctx.task_id,
+            // 02.5a inventory: a restore names its session but carries no
+            // cwd (`RestoreItem` records none), and its task runs without a
+            // session lineage. 02.5b decides whether restore callbacks keep
+            // the process-cwd fallback or gain the owning session's cwd.
+            cwd: None,
             finish_tx: None,
         }
     }
 
     pub(crate) fn session(&self) -> Option<MakiId> {
         self.session_id.as_ref().map(SessionRef::id)
+    }
+
+    /// The owning session's cwd, so a call site can resolve against its own
+    /// project instead of the process cwd. Carrying only: resolution against
+    /// this is 02.5b/c's, and `None` keeps today's process-cwd fallback.
+    pub(crate) fn cwd(&self) -> Option<PathBuf> {
+        self.cwd.clone()
     }
 
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
@@ -585,6 +606,10 @@ impl UserData for LuaCtx {
                 // mutably.
                 drop(this);
                 let blocks = spawn_blocking(move || {
+                    // 02.5a inventory: later subdirectory-instruction
+                    // discovery walks from the process cwd. 02.5c walks from
+                    // the owning session's carried cwd (`agent.cwd` above)
+                    // instead, via the lineage in 02.5b.
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
                     maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded, &files)
@@ -636,6 +661,7 @@ mod tests {
     use maki_agent::tools::{LocalTool, ToolAudience};
     use maki_agent::{AgentMode, InstructionBlock};
     use mlua::Lua;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
@@ -744,6 +770,52 @@ mod tests {
         assert_eq!(
             inner.cwd, ctx.cwd,
             "a dispatched child serves the same session cwd"
+        );
+    }
+
+    /// 02.5a: every Lua ctx kind carries its owning session's cwd (`None`
+    /// with no owning session), while the Maki process cwd stays unchanged.
+    /// Resolution behavior is 02.5b/c's; this only proves the value is
+    /// carried.
+    #[test]
+    fn lua_ctx_carries_each_sessions_cwd() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        assert_ne!(project_a.path(), project_b.path());
+
+        let mut ctx_a = populated_ctx();
+        ctx_a.cwd = project_a.path().to_path_buf();
+        let mut ctx_b = populated_ctx();
+        ctx_b.cwd = project_b.path().to_path_buf();
+
+        for (ctx, project) in [(&ctx_a, &project_a), (&ctx_b, &project_b)] {
+            assert_eq!(
+                LuaCtx::handler(ctx).cwd().as_deref(),
+                Some(project.path()),
+                "the handler keeps its session"
+            );
+            assert_eq!(
+                LuaCtx::start(ctx).cwd().as_deref(),
+                Some(project.path()),
+                "start previews keep the session"
+            );
+        }
+
+        // No owning session: the one-shot stand-in is the process cwd, but
+        // it is not an owning session's, so the ctx carries `None` and 02.5b
+        // keeps the process-cwd fallback there.
+        let mut lone = populated_ctx();
+        lone.session_id = None;
+        assert_eq!(LuaCtx::handler(&lone).cwd(), None);
+        assert_eq!(LuaCtx::start(&lone).cwd(), None);
+        // A restore names its session but carries no cwd (02.5b decides).
+        assert_eq!(LuaCtx::restore(restore_ctx(&ctx_a)).cwd(), None);
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "carrying session cwds never moves the Maki process cwd"
         );
     }
 

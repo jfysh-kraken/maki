@@ -134,6 +134,9 @@ impl Redirect {
         match self {
             Self::Capture => Ok(Stdio::piped()),
             Self::Discard => Ok(Stdio::null()),
+            // 02.5a inventory: a relative redirect path opens against the
+            // process cwd. 02.5c resolves it against the owning session's
+            // carried cwd.
             Self::File(path) => File::options()
                 .create(true)
                 .append(true)
@@ -344,6 +347,9 @@ impl JobStore {
             }
             command.current_dir(dir);
         }
+        // 02.5a inventory: with no explicit `cwd` the child inherits the
+        // Maki process cwd. 02.5c defaults to the owning session's carried
+        // cwd instead. Never `set_current_dir`, not even temporarily.
         if let Some(ref env_map) = env {
             for (k, v) in env_map {
                 command.env(k, v);

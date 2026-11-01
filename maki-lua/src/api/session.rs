@@ -572,6 +572,8 @@ async fn document_json(lua: &Lua, opts: &Table) -> LuaResult<Result<JsonValue, S
 /// `maki -r` find it there, else where maki runs. ACP holds many sessions, so
 /// it gets the process's directory too, never one of its sessions picked by
 /// how many happen to be open.
+/// 02.5a inventory: intentional process-cwd default, no owning session picks
+/// an import landing; 02.5b/c leave this path alone.
 fn headless_cwd(lua: &Lua) -> Result<String, String> {
     let driver = lua
         .app_data_ref::<SessionSnapshotSlot>()

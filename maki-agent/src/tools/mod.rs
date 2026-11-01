@@ -472,6 +472,8 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     };
 
     if Path::new(&expanded).is_relative() {
+        // 02.5a inventory: session-scoped fallback to the process cwd.
+        // 02.5b resolves against the owning session's carried cwd instead.
         let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
         Ok(cwd.join(&expanded).to_string_lossy().into_owned())
     } else {
@@ -482,6 +484,9 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
 pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
     match path {
         Some(p) => resolve_path(p),
+        // 02.5a inventory: an omitted search root defaults to the process
+        // cwd (grep tool, `maki.fs.glob`/`grep`). 02.5b defaults to the
+        // owning session's carried cwd instead.
         None => env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .map_err(|e| format!("cwd error: {e}")),
@@ -491,6 +496,10 @@ pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
 static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
+/// Display-only shortening of absolute paths, against the process launch
+/// directory first.
+// 02.5a inventory: 02.5b may shorten against the owning session instead;
+// the shortened text never resolves anything.
 pub(crate) fn relative_path(path: &str) -> String {
     let p = Path::new(path);
     if let Some(cwd) = CWD.as_deref()
@@ -692,6 +701,8 @@ pub fn interpreter_ctx(
 
 /// Minimal ToolContext for CLI one-shot tool execution (e.g. `maki index`).
 /// Allows everything, sends events to a dummy channel, uses no model.
+/// 02.5a inventory: intentional process-cwd default, no owning session
+/// exists here, so 02.5b/c leave this path on the process-cwd fallback.
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
