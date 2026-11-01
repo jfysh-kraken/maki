@@ -115,6 +115,15 @@ struct Pending {
     /// held cleanup, reported as uncertain, still non-resumable. `None`
     /// while no cleanup is awaited.
     awaiting_since: Option<Instant>,
+    /// 02.10a: supervised loss observed post-activation (task/pump death,
+    /// stream end, dead input channel, provider-init failure). Non-resumable,
+    /// reusing the 02.9b non-resumable mechanics, not infinite work. The typed
+    /// reason is always `task_lost`; `loss_raw` carries the verbatim cause.
+    /// 02.10b's release reports this prior loss; a dropped handle here is
+    /// explicitly not cleanup proof and no teardown runs on this path.
+    lost: bool,
+    loss_reason: Option<String>,
+    loss_raw: Option<String>,
 }
 
 impl Default for Pending {
@@ -130,6 +139,9 @@ impl Default for Pending {
             awaiting_cleanup: false,
             cleanup_uncertain: false,
             awaiting_since: None,
+            lost: false,
+            loss_reason: None,
+            loss_raw: None,
         }
     }
 }
@@ -184,9 +196,17 @@ struct CancelSettlement {
 
 impl Pending {
     /// Whether the session accepts another prompt. False after an addressed
-    /// cancel settles a live turn, until 02.9b confirms tool cleanup.
+    /// cancel settles a live turn, until 02.9b confirms tool cleanup, and
+    /// false once 02.10a marks supervised loss: a lost handle never reopens.
     fn is_resumable(&self) -> bool {
-        !self.awaiting_cleanup
+        !self.awaiting_cleanup && !self.lost
+    }
+
+    /// 02.10a: whether supervised loss was already recorded. A lost handle is
+    /// unusable afterwards; the client must release it (02.10b) and any
+    /// further prompt or addressed call answers `resource_not_found`.
+    fn is_lost(&self) -> bool {
+        self.lost
     }
 
     /// 02.9b: whether a `cleanup_unconfirmed` rejection must report the
@@ -300,6 +320,58 @@ impl Pending {
             }
         }
     }
+
+    /// 02.10a supervised-loss settlement through the 02.2b turn-epoch
+    /// primitive: the first observer of a post-activation task/pump death,
+    /// stream end, dead input channel, or provider-init failure wins; every
+    /// later observer finds `lost` set and settles nothing. The epoch always
+    /// bumps once on first loss (even idle), so a racing terminal lands
+    /// stale. A live outstanding prompt is taken exactly once; asks retire in
+    /// both modes (the handle is dead, nothing can outlive it); the session
+    /// stays failed/non-resumable. No teardown runs here: a dropped handle is
+    /// explicitly not cleanup proof, and 02.10b's release reports this prior
+    /// loss plus its own cleanup result.
+    fn settle_loss(&mut self, reason: &str, raw: &str) -> LossSettlement {
+        if self.lost {
+            return LossSettlement {
+                first: false,
+                prompt: None,
+                epoch: self.epoch.current(),
+            };
+        }
+        let live = match (&self.prompt, self.turn) {
+            (Some(_), Some(parked)) => self.epoch.check(parked).is_ok(),
+            _ => false,
+        };
+        let epoch = self.epoch.bump();
+        self.turn = None;
+        self.asks.clear();
+        self.lost = true;
+        self.loss_reason = Some(reason.to_owned());
+        self.loss_raw = Some(raw.to_owned());
+        if live {
+            LossSettlement {
+                first: true,
+                prompt: self.prompt.take(),
+                epoch,
+            }
+        } else {
+            LossSettlement {
+                first: true,
+                prompt: None,
+                epoch,
+            }
+        }
+    }
+}
+
+/// What one supervised-loss observation did, decided under the control lock.
+/// The first observer takes the outstanding prompt (if live) and the bumped
+/// epoch; every later observer finds `first == false` and sends nothing.
+struct LossSettlement {
+    first: bool,
+    prompt: Option<RequestId>,
+    epoch: u64,
 }
 /// The per-session control lock. Answer (client response), Stop (addressed
 /// cancel), and — in 02.10b — Close all serialize through this one mutex,
@@ -338,6 +410,13 @@ struct SessionRuntime {
     /// The runtime owns its pump task; closing the session aborts and reaps it
     /// (bounded teardown of the release path itself is 02.10b).
     pump: JoinHandle<()>,
+    /// 02.10a pump-death supervisor, off the shared routing loop. It holds no
+    /// pump handle: the pump holds a done-sender and this task awaits its
+    /// disconnect, so a panicked or silently-exited pump still reports `lost`
+    /// exactly once while idle, without polling the loop. Aborted with the
+    /// pump on close, so shutdown never reports loss. No teardown runs here;
+    /// 02.10b owns bounded release.
+    supervisor: JoinHandle<()>,
 }
 
 /// An allocated-but-unactivated lease (02.3). The id is reserved and the
@@ -800,6 +879,66 @@ fn cleanup_unconfirmed(session_id: &str, uncertain: bool) -> AcpError {
     }))
 }
 
+/// 02.10a supervised loss: typed reason plus verbatim cause plus usability,
+/// reusing the 02.1 lost-handle fields, not redefining them. The typed reason
+/// is always `task_lost`; the raw cause names what the supervisor observed
+/// (`stream_ended`, `pump_dead`, `input_channel_dead`, or the provider error
+/// text). `usable` is always false: a lost handle never accepts another
+/// prompt. The outstanding prompt (if live) answers with this error exactly
+/// once; the lifecycle `lost` frame carries the same raw/usable pair.
+const LOSS_TYPED_REASON: &str = "task_lost";
+
+fn loss_error(session_id: &str, raw: &str) -> AcpError {
+    AcpError::internal_error().data(serde_json::json!({
+        "reason": LOSS_TYPED_REASON,
+        "rawReason": raw,
+        "usable": false,
+        "sessionId": session_id,
+    }))
+}
+
+/// 02.10a loss settlement shared by the pump (stream end, dead-handle Error),
+/// the loop (dead input channel on prompt), and the pump-death supervisor.
+/// Non-blocking and peer-free: one control-lock settlement plus at most two
+/// wire sends for the addressed session only, so supervision never blocks the
+/// shared routing loop. Returns true on the first observation; every later
+/// observer for the same session finds `lost` set and sends nothing (exactly
+/// once, including the activation-handoff window: the activation result
+/// already settled, and task death plus stream end collapse to one `lost`).
+/// No teardown runs here: the claim stays held and the dead task/pump handles
+/// stay filed for 02.10b's bounded release, which reports this prior loss
+/// plus its own cleanup result. A dropped handle is explicitly not cleanup
+/// proof.
+fn report_loss(
+    pending: &PendingState,
+    out_tx: &Sender<Value>,
+    session_id: &str,
+    raw: &str,
+) -> bool {
+    let settlement = pending.lock().unwrap().settle_loss(LOSS_TYPED_REASON, raw);
+    if !settlement.first {
+        return false;
+    }
+    send(
+        out_tx,
+        Notification {
+            method: Arc::from(extension::LIFECYCLE_NOTIFICATION),
+            params: Some(methods::lifecycle_lost_params(
+                session_id,
+                settlement.epoch,
+                raw,
+            )),
+        },
+    );
+    if let Some(id) = settlement.prompt {
+        send(
+            out_tx,
+            Response::<AgentResponse>::new(id, Err(loss_error(session_id, raw))),
+        );
+    }
+    true
+}
+
 /// Binds an allocated id to the requested model, fixed mode/cwd/absolute
 /// output, and starts its task. Returns `None` when the activation left on a
 /// dedicated task: the loop stays responsive and the task's completion
@@ -1042,6 +1181,11 @@ fn handle_cancel(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
         return Err(activation_in_progress(&req.session_id));
     }
     let session = srv.session(&SessionId::from(req.session_id.clone()))?;
+    // 02.10a: a supervised-dead handle answers `resource_not_found`, like an
+    // unknown id. The `lost` lifecycle frame already carried reason/raw/usable.
+    if session.pending.lock().unwrap().is_lost() {
+        return Err(unknown_session(&req.session_id));
+    }
     // The pin is checked before anything moves: a stale cancel changes
     // nothing — no signal, no bump, no settlement.
     let current = session.pending.lock().unwrap().epoch.current();
@@ -1363,20 +1507,36 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
     // The run's blocking mode decides ask lifetime at settlement: a blocking
     // turn cannot outlive its calls, so its terminal retires every ask, while
     // a detached turn may still have moved calls parked on theirs.
+    // 02.10a supervision, from activation onward and including while idle:
+    // the pump proves the handle live through the input channel (a dead run
+    // drops its receiver), reports stream end as `lost`, and takes the loss
+    // path on an `Error` the dead handle cannot survive. The supervisor
+    // reports a silently-exited or panicked pump as `pump_dead`. Both run off
+    // the shared routing loop and touch only this session, so peers stay
+    // usable through a sibling's loss.
     let pending = Arc::new(Mutex::new(Pending {
         blocking: !ctx.background,
         ..Pending::default()
     }));
+    let live_tx = handle.input_tx.clone();
+    let is_live: Liveness = Arc::new(move || !live_tx.is_disconnected());
+    let (pump_done_tx, pump_done_rx) = flume::bounded::<()>(1);
+    let session_key = session_ref.to_string();
     let pump = start_event_pump(
         events,
         session_ref.clone(),
-        ctx.out_tx,
+        ctx.out_tx.clone(),
         Arc::clone(&pending),
         ctx.cwd.clone(),
         maki_storage::paths::home(),
         project_trusted,
         ctx.initial_cost,
+        is_live,
+        true,
+        Some(pump_done_tx),
     );
+    let supervisor =
+        start_loss_supervisor(Arc::clone(&pending), ctx.out_tx, session_key, pump_done_rx);
     let runtime = SessionRuntime {
         handle,
         mcp: ctx.mcp,
@@ -1387,6 +1547,7 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
         pending,
         claim: ctx.claim,
         pump,
+        supervisor,
     };
     (session_ref, runtime)
 }
@@ -1601,7 +1762,11 @@ async fn close_all_sessions(srv: &mut Server, reason: SessionEndReason) {
 
 /// Reaps a runtime the table no longer names. The end hook runs first so the
 /// bill it saves is complete; the owed prompt is answered so the client never
-/// hangs; then the run, its pump, and its MCP servers come down.
+/// hangs; then the run, its pump, its supervisor, and its MCP servers come
+/// down. 02.10a records the incomplete-teardown boundary explicitly: aborting
+/// a dead task/pump handle reaps it but proves no tool cleanup — a dropped
+/// handle is not cleanup proof. Bounded per-session release with visible
+/// cleanup results is 02.10b's.
 async fn close_runtime(srv: &Server, state: SessionRuntime, reason: SessionEndReason) {
     if let Some(cb) = &srv.on_session_end {
         cb(state.handle.session_id.id(), reason).await;
@@ -1623,6 +1788,9 @@ async fn close_runtime(srv: &Server, state: SessionRuntime, reason: SessionEndRe
     let _ = state.handle.task.await;
     // Aborted before the await: an orphaned pump would keep writing frames for
     // a dropped id. Queued updates for a closing session are dropped with it.
+    // The supervisor aborts first so a closing pump never reports `lost`.
+    state.supervisor.abort();
+    let _ = state.supervisor.await;
     state.pump.abort();
     let _ = state.pump.await;
     if let Some(mcp) = state.mcp {
@@ -1696,12 +1864,17 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // Addressed to the request's own session; no current-session fallback. An
     // unknown id rejects here, before anything is queued or any peer is
     // touched; duplicate and cross-session rejection keep the same shape.
+    // A supervised-dead handle answers the same `resource_not_found`: the
+    // 02.1 contract says a `lost` handle is unusable and the client must
+    // release it (02.10b drops the routing entry then).
     let session = srv.session(&req.session_id)?;
+    if session.pending.lock().unwrap().is_lost() {
+        return Err(unknown_session(&req.session_id.0));
+    }
     // 02.9a: a cancelled-awaiting-cleanup session accepts nothing until the
     // pump confirms its tool cleanup (02.9b: the cancelled run's terminal).
     // Settlement alone never reopens it; the peer's slot is untouched by
-    // this rejection. Runtime usability is the send below: a dead run
-    // reports "session ended" instead of queueing onto it.
+    // this rejection.
     let resumable = session.pending.lock().unwrap().is_resumable();
     if !resumable {
         let uncertain = session.pending.lock().unwrap().is_uncertain();
@@ -1727,15 +1900,28 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // and overwrite the first id, leaving that request unanswered forever.
     // The turn snapshots the live epoch, so the terminal that settles this
     // prompt can only settle this turn, never the next one.
+    // 02.10a: a dead input channel means the supervised task is gone. Report
+    // loss exactly once (lifecycle `lost` plus the discovering prompt's loss
+    // error, or nothing on a repeat) instead of queueing onto a dead run.
+    // Non-blocking and peer-free: one lock plus at most two wire sends for
+    // this session only. The claim stays held for 02.10b's bounded release.
     let mut pending = session.pending.lock().unwrap();
     if pending.prompt.is_some() {
         return Err(AcpError::new(-32603, "a prompt is already running"));
     }
-    session
-        .handle
-        .input_tx
-        .send(input)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
+    if session.handle.input_tx.send(input).is_err() {
+        drop(pending);
+        let first = report_loss(
+            &session.pending,
+            &srv.out_tx,
+            &req.session_id.0,
+            "input_channel_dead",
+        );
+        return Err(match first {
+            true => loss_error(&req.session_id.0, "input_channel_dead"),
+            false => unknown_session(&req.session_id.0),
+        });
+    }
     pending.turn = Some(pending.epoch.current());
     pending.prompt = Some(id.clone());
     Ok(())
@@ -1765,6 +1951,10 @@ fn handle_set_mode(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError>
         return Err(not_activated(&req.session_id.0));
     }
     let session = srv.session(&req.session_id)?;
+    // 02.10a: a lost handle answers `resource_not_found`, like an unknown id.
+    if session.pending.lock().unwrap().is_lost() {
+        return Err(unknown_session(&req.session_id.0));
+    }
     debug!(
         session = %req.session_id.0,
         mode = ?session.current_mode,
@@ -1784,6 +1974,10 @@ fn handle_set_config(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpErro
         return Err(not_activated(&req.session_id.0));
     }
     let session = srv.session(&req.session_id)?;
+    // 02.10a: a lost handle answers `resource_not_found`, like an unknown id.
+    if session.pending.lock().unwrap().is_lost() {
+        return Err(unknown_session(&req.session_id.0));
+    }
     debug!(
         session = %req.session_id.0,
         model = %session.current_model,
@@ -1949,6 +2143,12 @@ fn image_media_type(mime: &str) -> ImageMediaType {
     }
 }
 
+/// Liveness probe the pump consults before trusting an `Error` terminal.
+/// Production proves the handle live through its input channel (a dead run
+/// drops its receiver); fixtures inject liveness directly, so no test needs a
+/// provider, keys, or network.
+type Liveness = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[allow(clippy::too_many_arguments)]
 fn start_event_pump(
     mut events: SessionEvents,
@@ -1959,9 +2159,17 @@ fn start_event_pump(
     home: Option<PathBuf>,
     project_trusted: bool,
     initial_cost: Option<f64>,
+    is_live: Liveness,
+    report_stream_end: bool,
+    done: Option<Sender<()>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Held until the pump exits (return, panic unwind, or abort drop):
+        // the loss supervisor awaits its disconnect, so a silently-exited or
+        // panicked pump still reports `pump_dead` exactly once while idle.
+        let _done = done;
         let sid = SessionId::from(session_id.to_string());
+        let session_key = sid.to_string();
         let mut cost = CostTally::starting_at(initial_cost);
         // A permission request only carries scopes, which are matching keys and
         // not always paths, so the file context a client needs has to come from
@@ -2117,6 +2325,18 @@ fn start_event_pump(
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
                     cost.settle(totals.cost);
+                    // 02.10a: an `Error` alone is neither normal completion nor
+                    // proof the handle accepts another prompt. When the
+                    // supervised task/pump proves the handle live (input
+                    // channel still connected), settle as a failed turn as
+                    // before; otherwise take the loss path (settle once via
+                    // the turn epoch, retire asks in both modes, notify
+                    // `lost` with reason/raw/usability). Peers are untouched:
+                    // only this session's pending/out-tx move, off-loop.
+                    if !is_live() {
+                        report_loss(&pending, &out_tx, &session_key, &message);
+                        continue;
+                    }
                     if let Some((id, _turn)) = settle_prompt(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
@@ -2131,7 +2351,8 @@ fn start_event_pump(
                         // end proves nothing, so the session records the
                         // uncertainty and stays non-resumable; the retry
                         // rejection reports it. (Task/pump loss itself is
-                        // 02.10a's; this arm only records the failed cleanup.)
+                        // 02.10a's; this arm only records the failed cleanup
+                        // when the handle is still proved live.)
                         pending.lock().unwrap().note_run_ended(true);
                     }
                     continue;
@@ -2141,6 +2362,42 @@ fn start_event_pump(
             let epoch = pending.lock().unwrap().epoch.current();
             session_update(&out_tx, &sid, epoch, update);
         }
+        // 02.10a: the event stream ends only when the task drops its guard
+        // (return, panic, or provider-init failure that already sent its
+        // `Error`): no normal turn ends the stream, since the task outlives
+        // every prompt. Report supervised loss exactly once (first observer
+        // wins; a racing `Error`-loss or supervisor `pump_dead` collapses to
+        // the same single `lost`). Aborted pumps never reach here (abort
+        // drops the future), so shutdown/close reports no loss. Throwaway
+        // test pumps opt out via `report_stream_end == false`.
+        if report_stream_end {
+            report_loss(&pending, &out_tx, &session_key, "stream_ended");
+        }
+    })
+}
+
+/// 02.10a pump-death supervisor, off the shared routing loop. The pump holds
+/// the done-sender until exit; this task awaits its disconnect, so a pump
+/// that panics or silently exits still notifies `lost` exactly once while
+/// idle, without polling the loop. The first observer (pump stream-end vs.
+/// this supervisor) wins via `report_loss`; the loser sends nothing. Aborted
+/// with the pump on close/shutdown, so teardown reports no loss. No teardown
+/// runs here; 02.10b owns bounded release.
+fn start_loss_supervisor(
+    pending: PendingState,
+    out_tx: Sender<Value>,
+    session_id: String,
+    pump_done: flume::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = pump_done.recv_async().await;
+        // A normal return already reported stream-end loss (or never needed
+        // to: `Done` turns keep the stream open); only a pump that died
+        // without reporting reaches here un-lost.
+        if pending.lock().unwrap().is_lost() {
+            return;
+        }
+        report_loss(&pending, &out_tx, &session_id, "pump_dead");
     })
 }
 
@@ -2157,7 +2414,8 @@ fn start_event_pump(
 /// a call moved to the background can still be parked on one. Ask retirement
 /// on the addressed-cancel path is 02.9a's (`settle_cancel`, both modes: the
 /// run is stopped, so nothing outlives a cancelled turn); retirement on the
-/// handle-loss path (02.10a) is downstream debt, not built here.
+/// handle-loss path is 02.10a's (`settle_loss`, both modes: the handle is
+/// dead, so nothing can outlive it).
 fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let mut guard = pending.lock().unwrap();
     let live = match (&guard.prompt, guard.turn) {
@@ -2485,6 +2743,10 @@ mod tests {
             pending: Arc::default(),
             claim,
             pump: tokio::spawn(async {}),
+            // Owned pump never runs in these fixtures (throwaway pumps via
+            // `run_pump`/`drive_runtime` do the work with stream-end reporting
+            // off), so the supervisor is a no-op handle, never a loss source.
+            supervisor: tokio::spawn(async {}),
         };
         (key, runtime)
     }
@@ -2623,6 +2885,9 @@ mod tests {
             PathBuf::from(PUMP_CWD),
             None,
             PUMP_TRUSTED,
+            None,
+            live_handle(),
+            false,
             None,
         );
         let sender = guard.sender(0);
@@ -2868,11 +3133,56 @@ mod tests {
             None,
             PUMP_TRUSTED,
             initial_cost,
+            live_handle(),
+            false,
+            None,
         );
         let sender = guard.sender(0);
         feed(&sender);
         drop(guard);
         pump.await.unwrap();
+    }
+
+    /// 02.10a supervised pump: the throwaway pump reports stream end as `lost`
+    /// and consults `is_live` on `Error`, like production. Fixtures inject
+    /// liveness directly (dead handle vs. live handle); no provider, keys, or
+    /// network are involved.
+    async fn run_supervised_pump(
+        srv: &Server,
+        key: &str,
+        is_live: Liveness,
+        feed: impl FnOnce(&EventSender),
+    ) {
+        let runtime = srv
+            .sessions
+            .get(key)
+            .expect("the addressed runtime is live");
+        let (guard, events) = maki_agent::event_stream();
+        let pump = start_event_pump(
+            events,
+            runtime.handle.session_id.clone(),
+            srv.out_tx.clone(),
+            Arc::clone(&runtime.pending),
+            PathBuf::from(PUMP_CWD),
+            None,
+            PUMP_TRUSTED,
+            None,
+            is_live,
+            true,
+            None,
+        );
+        let sender = guard.sender(0);
+        feed(&sender);
+        drop(guard);
+        pump.await.unwrap();
+    }
+
+    fn dead_handle() -> Liveness {
+        Arc::new(|| false)
+    }
+
+    fn live_handle() -> Liveness {
+        Arc::new(|| true)
     }
 
     fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
@@ -4712,6 +5022,473 @@ mod tests {
         assert!(!pending.is_uncertain());
     }
 
+    /// 02.10a loss gate matrix on `Pending` itself: first loss wins, bumps
+    /// once, retires asks in both modes, and marks the handle failed; a
+    /// second loss settles nothing and moves no epoch. No teardown runs here:
+    /// the claim stays held for 02.10b, and a dropped handle is explicitly
+    /// not cleanup proof.
+    #[test]
+    fn loss_settlement_marks_non_resumable_retires_asks_and_bumps_once() {
+        let mut pending = Pending::default();
+        pending.turn = Some(pending.epoch.current());
+        pending.prompt = Some(RequestId::Number(PROMPT_ID));
+        pending.asks.insert(
+            ANSWERED_ID,
+            Ask::Elicitation {
+                session: "s".to_owned(),
+                epoch: 0,
+            },
+        );
+        assert!(!pending.is_lost());
+
+        let first = pending.settle_loss("task_lost", "task_dead");
+        assert!(first.first);
+        assert_eq!(first.prompt, Some(RequestId::Number(PROMPT_ID)));
+        assert_eq!(first.epoch, 1);
+        assert!(pending.is_lost());
+        assert!(!pending.is_resumable(), "loss never reopens the session");
+        assert!(pending.prompt.is_none());
+        assert!(pending.turn.is_none());
+        assert!(pending.asks.is_empty(), "loss retires asks in both modes");
+        assert_eq!(pending.loss_reason.as_deref(), Some("task_lost"));
+        assert_eq!(pending.loss_raw.as_deref(), Some("task_dead"));
+
+        let second = pending.settle_loss("task_lost", "stream_ended");
+        assert!(!second.first);
+        assert!(second.prompt.is_none());
+        assert_eq!(second.epoch, 1, "a second loss moves no epoch");
+        assert_eq!(pending.loss_raw.as_deref(), Some("task_dead"));
+    }
+
+    /// 02.10a loss matrix without a parked prompt: an idle loss still bumps
+    /// (so a racing terminal lands stale), notifies `lost`, and stays
+    /// failed/non-resumable with no prompt to answer.
+    #[test]
+    fn idle_loss_bumps_without_a_prompt_to_settle() {
+        let mut pending = Pending::default();
+        let first = pending.settle_loss("task_lost", "stream_ended");
+        assert!(first.first);
+        assert!(first.prompt.is_none());
+        assert_eq!(first.epoch, 1);
+        assert!(pending.is_lost());
+        assert!(!pending.is_resumable());
+        let second = pending.settle_loss("task_lost", "pump_dead");
+        assert!(!second.first);
+        assert_eq!(second.epoch, 1);
+    }
+
+    /// 02.10a headline: task loss during a prompt settles once via the turn
+    /// epoch, retires asks, notifies the 02.1 lost-handle fields
+    /// (reason/rawReason/usable), and leaves the peer usable. A second loss
+    /// observation (stream end racing the task death) sends nothing. No
+    /// prompt reaches a provider and no keys or network are involved.
+    #[tokio::test]
+    async fn task_loss_during_prompt_settles_once_asks_retire_peers_usable() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (_input_a_rx, _cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+        let sid_a = srv
+            .sessions
+            .get(&key_a)
+            .unwrap()
+            .handle
+            .session_id
+            .to_string();
+        {
+            let mut guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            guard.asks.insert(
+                ANSWERED_ID,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: sid_a.clone(),
+                    epoch: 0,
+                },
+            );
+        }
+
+        // Injected task death: the supervisor observes it post-activation.
+        let first = report_loss(
+            &srv.sessions.get(&key_a).unwrap().pending,
+            &srv.out_tx,
+            &key_a,
+            "task_dead",
+        );
+        assert!(first, "the first loss observation reports");
+        let lifecycle = out_rx.try_recv().expect("loss notifies `lost`");
+        assert_eq!(lifecycle["method"], extension::LIFECYCLE_NOTIFICATION);
+        assert_eq!(lifecycle["params"]["sessionId"], key_a);
+        assert_eq!(lifecycle["params"]["state"], "lost");
+        assert_eq!(lifecycle["params"]["turnEpoch"], 1);
+        assert_eq!(lifecycle["params"]["rawReason"], "task_dead");
+        assert_eq!(lifecycle["params"]["usable"], false);
+        let answer = out_rx
+            .try_recv()
+            .expect("the outstanding prompt settles once");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["code"], -32603);
+        assert_eq!(answer["error"]["data"]["reason"], "task_lost");
+        assert_eq!(answer["error"]["data"]["rawReason"], "task_dead");
+        assert_eq!(answer["error"]["data"]["usable"], false);
+        assert_eq!(answer["error"]["data"]["sessionId"], key_a);
+        {
+            let guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            assert!(guard.is_lost());
+            assert!(!guard.is_resumable(), "a lost handle never reopens");
+            assert!(guard.asks.is_empty(), "loss retires asks in both modes");
+            assert_eq!(guard.epoch.current(), 1);
+        }
+
+        // Stream end racing the task death collapses to the same single loss.
+        let second = report_loss(
+            &srv.sessions.get(&key_a).unwrap().pending,
+            &srv.out_tx,
+            &key_a,
+            "stream_ended",
+        );
+        assert!(!second, "a second loss sends nothing");
+        assert!(out_rx.is_empty(), "exactly-once loss: no double-settle");
+
+        // A late answer for the retired ask drops; further prompts and
+        // addressed calls answer `resource_not_found` per the 02.1 contract.
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(out_rx.is_empty());
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "retry"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        let cancel = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_a } }),
+        )
+        .unwrap_err();
+        assert_eq!(cancel.code, AcpError::resource_not_found(None).code);
+
+        // B runs undisturbed and settles under its own epoch (unsupervised
+        // throwaway pump: production keeps the stream open after `Done`, so
+        // no `lost` follows a normal turn).
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("B settles its own prompt");
+        assert_eq!(answer["id"], 8);
+        assert_eq!(answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY], 0);
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays usable through a sibling's loss");
+    }
+
+    /// 02.10a idle loss: pump death between prompts notifies `lost` with no
+    /// prompt to settle; the next prompt rejects as `resource_not_found`
+    /// while the peer continues. Supervision work stays off-loop (one lock
+    /// plus wire sends for the addressed session only).
+    #[tokio::test]
+    async fn pump_loss_between_prompts_notifies_loss_future_prompt_rejects() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (_input_a_rx, _cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        {
+            let mut guard = srv.sessions.get(&key_b).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(8));
+        }
+
+        // Injected pump death while A is idle: no prompt outstanding.
+        let (pump_done_tx, pump_done_rx) = flume::bounded::<()>(1);
+        let supervisor = start_loss_supervisor(
+            Arc::clone(&srv.sessions.get(&key_a).unwrap().pending),
+            srv.out_tx.clone(),
+            key_a.clone(),
+            pump_done_rx,
+        );
+        drop(pump_done_tx);
+        supervisor.await.unwrap();
+        let lifecycle = out_rx.try_recv().expect("idle loss still notifies `lost`");
+        assert_eq!(lifecycle["params"]["state"], "lost");
+        assert_eq!(lifecycle["params"]["sessionId"], key_a);
+        assert_eq!(lifecycle["params"]["turnEpoch"], 1);
+        assert_eq!(lifecycle["params"]["rawReason"], "pump_dead");
+        assert_eq!(lifecycle["params"]["usable"], false);
+        {
+            let guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            assert!(guard.is_lost());
+            assert_eq!(guard.epoch.current(), 1, "idle loss still bumps");
+        }
+
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "next"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::resource_not_found(None).code);
+
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("B settles under its own epoch");
+        assert_eq!(answer["id"], 8);
+    }
+
+    /// 02.10a stream-end honesty: a stream that ends with an outstanding
+    /// prompt settles it once as `lost`; an idle stream end notifies `lost`
+    /// with no answer. Both retire asks and bump once.
+    #[tokio::test]
+    async fn stream_end_settles_honestly_with_and_without_a_prompt() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        run_supervised_pump(&srv, &key_a, dead_handle(), |_| {}).await;
+        let lifecycle = out_rx.try_recv().expect("stream end notifies `lost`");
+        assert_eq!(lifecycle["params"]["state"], "lost");
+        assert_eq!(lifecycle["params"]["rawReason"], "stream_ended");
+        assert_eq!(lifecycle["params"]["usable"], false);
+        let answer = out_rx
+            .try_recv()
+            .expect("the outstanding prompt settles once");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["data"]["reason"], "task_lost");
+        assert!(out_rx.is_empty(), "no double-settle");
+
+        // Idle stream end: lifecycle only, still bumps.
+        let (srv, .., out_rx) = test_server();
+        let key = session_key(&srv);
+        run_supervised_pump(&srv, &key, dead_handle(), |_| {}).await;
+        let lifecycle = out_rx.try_recv().expect("idle stream end notifies `lost`");
+        assert_eq!(lifecycle["params"]["state"], "lost");
+        assert_eq!(
+            srv.sessions
+                .get(&key)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1
+        );
+        assert!(out_rx.try_recv().is_err(), "idle loss answers no prompt");
+    }
+
+    /// 02.10a dead-channel honesty: a prompt sent on a dead input channel
+    /// reports loss once (lifecycle plus the discovering prompt's loss
+    /// error); the next prompt answers `resource_not_found`. Peers are
+    /// untouched.
+    #[tokio::test]
+    async fn dead_channel_on_prompt_settles_honestly() {
+        let (mut srv, key, input_rx, out_rx) = server_with_live_input();
+        let (other_key, other) = fixture_runtime();
+        srv.sessions.insert(other_key.clone(), other);
+        drop(input_rx);
+
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "hello"),
+            &RequestId::Number(PROMPT_ID),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::internal_error().code);
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!({
+                "reason": "task_lost",
+                "rawReason": "input_channel_dead",
+                "usable": false,
+                "sessionId": key,
+            }))
+        );
+        let lifecycle = out_rx.try_recv().expect("dead channel notifies `lost`");
+        assert_eq!(lifecycle["params"]["state"], "lost");
+        assert_eq!(lifecycle["params"]["rawReason"], "input_channel_dead");
+        let repeat = handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "again"),
+            &RequestId::Number(8),
+        )
+        .unwrap_err();
+        assert_eq!(repeat.code, AcpError::resource_not_found(None).code);
+        assert!(
+            srv.sessions.contains_key(&key),
+            "the claim stays held for 02.10b"
+        );
+        assert!(srv.sessions.contains_key(&other_key));
+    }
+
+    /// 02.10a `Error`-alone rule: an `Error` on a proved-live handle settles
+    /// as a failed turn (session stays resumable); an `Error` on a dead
+    /// handle takes the loss path (settles once as `lost`, retires asks,
+    /// non-resumable). Neither disturbs the peer.
+    #[tokio::test]
+    async fn error_takes_loss_path_only_when_the_handle_is_dead() {
+        // Live handle: normal failed-turn settlement, still resumable.
+        let (srv, .., out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        run_supervised_pump(&srv, &session_key(&srv), live_handle(), |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth: false,
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+        // The `Error` settles as a failed turn plus the trailing stream-end
+        // loss: exactly one prompt answer (the failure), then one `lost`
+        // lifecycle. The failure itself proves nothing about the next prompt;
+        // the stream end proves the handle dead.
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0]["id"], PROMPT_ID);
+        assert_eq!(frames[0]["error"]["data"], TURN_ERROR);
+        assert_eq!(frames[1]["params"]["state"], "lost");
+        assert_eq!(frames[1]["params"]["rawReason"], "stream_ended");
+
+        // Dead handle: the `Error` itself takes the loss path.
+        let (srv, .., out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        run_supervised_pump(&srv, &session_key(&srv), dead_handle(), |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth: false,
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0]["params"]["state"], "lost");
+        assert_eq!(frames[0]["params"]["rawReason"], TURN_ERROR);
+        assert_eq!(frames[1]["id"], PROMPT_ID);
+        assert_eq!(frames[1]["error"]["data"]["reason"], "task_lost");
+        assert!(
+            srv.sessions
+                .values()
+                .next()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_lost()
+        );
+    }
+
+    /// 02.10a activation-handoff post-half: 02.3 proved the pre-activation
+    /// half (slow-startup failure settles the activation result once). Here
+    /// activation succeeds and files the runtime, then the fresh task dies in
+    /// the handoff window: loss settles exactly once (lifecycle plus no
+    /// prompt, since none exists yet) with no double-settle, and the peer
+    /// stays usable. Failed activation still consumes its lease (02.3), and
+    /// no teardown runs on the loss path (02.10b owns release).
+    #[tokio::test]
+    async fn handoff_window_failure_after_activation_settles_loss_once() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        let (peer_key, mut peer) = fixture_runtime();
+        let (_peer_input, _peer_cancel) = rewire_live(&mut peer);
+        srv.sessions.insert(peer_key.clone(), peer);
+
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let output = project
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = project.path().to_string_lossy().into_owned();
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(2),
+            &activate_request(&session, "openai/gpt-5", "build", &cwd, &output),
+            &params,
+        )
+        .await;
+        let (key, id, outcome) = next_completion(&completion_rx).await;
+        settle_activation(&mut srv, key.clone(), id, outcome);
+        let reply = out_rx
+            .try_recv()
+            .expect("activation settles its result once");
+        assert_eq!(reply["result"]["sessionId"], session);
+        let lifecycle = out_rx.try_recv().expect("activation announces active");
+        assert_eq!(lifecycle["params"]["state"], "active");
+
+        // The fresh task dies in the handoff window with no prompt yet.
+        let pending = Arc::clone(&srv.sessions.get(&session).unwrap().pending);
+        assert!(report_loss(&pending, &srv.out_tx, &session, "task_dead"));
+        assert!(!report_loss(
+            &pending,
+            &srv.out_tx,
+            &session,
+            "stream_ended"
+        ));
+        let lost = out_rx
+            .try_recv()
+            .expect("handoff loss notifies `lost` once");
+        assert_eq!(lost["params"]["state"], "lost");
+        assert_eq!(lost["params"]["rawReason"], "task_dead");
+        assert!(
+            out_rx.is_empty(),
+            "no prompt exists, so no answer; no double-settle"
+        );
+        {
+            let guard = srv.sessions.get(&session).unwrap().pending.lock().unwrap();
+            assert!(guard.is_lost());
+            assert_eq!(guard.epoch.current(), 1);
+        }
+
+        // The peer routes while the handoff loss stands.
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&peer_key, "hello"),
+            &RequestId::Number(3),
+        )
+        .expect("the peer stays usable through handoff loss");
+        let failed_id: MakiId = session.parse().unwrap();
+        assert!(
+            SessionClaim::is_held(failed_id, &storage),
+            "the claim stays held: loss performs no teardown (02.10b owns release)"
+        );
+    }
+
     /// A stale turn pin changes nothing: no signal, no bump, no settlement,
     /// and the parked prompt stays for the live turn. The matching pin
     /// settles; an unknown session rejects without touching the live one.
@@ -5716,6 +6493,10 @@ mod tests {
                         pending: Arc::default(),
                         claim: input.spawn.claim,
                         pump: tokio::spawn(async {}),
+                        // Fixture stubs own no supervised pump (activation
+                        // fixtures settle the result, not the stream); the
+                        // supervisor is a no-op handle, never a loss source.
+                        supervisor: tokio::spawn(async {}),
                     })
                 })
             },

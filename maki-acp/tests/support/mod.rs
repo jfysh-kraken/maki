@@ -183,6 +183,15 @@ impl MakiChild {
             .env("XDG_DATA_HOME", fixture.home.join(".local/share"))
             .env("XDG_STATE_HOME", fixture.home.join(".local/state"))
             .env("XDG_CACHE_HOME", fixture.home.join(".cache"))
+            // 02.10a supervision: the supervised task connects its provider
+            // at startup, so without a key every activation reports `lost`
+            // (honest provider-init failure) and routing fixtures that never
+            // prompt would see `resource_not_found` instead of the routing
+            // rejection they prove. The dummy key keeps construction offline
+            // (no prompt is ever sent from these fixtures, so no network and
+            // no inference occur); supervision itself is proven via injected
+            // fixtures in `server.rs` with no keys and no network.
+            .env("OPENAI_API_KEY", "test-dummy-no-network")
             .current_dir(&fixture.workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

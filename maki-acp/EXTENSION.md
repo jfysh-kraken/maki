@@ -11,12 +11,16 @@ terminal reasons, slice 02.8 wired concurrent permission routing
 blocking-mode terminal retirement), slice 02.9a wired addressed turn
 cancellation (exactly-once settlement through the turn epoch, retirement of
 the cancelled turn's asks in both modes, `cleanup_unconfirmed` retry gating;
-fixtures in `server.rs` tests), and slice 02.9b wires cleanup confirmation
+fixtures in `server.rs` tests), slice 02.9b wires cleanup confirmation
 and retry (the cancelled run's terminal confirms in blocking mode, failure
 or a lapsed bounded wait reports explicitly non-resumable uncertainty;
 fixtures in `server.rs` tests, escaped-child limitations recorded in
-`tests/cleanup_probes.rs`). Ask retirement on the handle-loss (02.10a)
-path is downstream debt, not built here. Active-session release (02.10b)
+`tests/cleanup_probes.rs`), and slice 02.10a wires task/pump supervision
+(post-activation task/pump death, stream end, dead input channels, and
+provider-init failure detected from activation onward including while idle;
+exactly-once loss settlement through the turn epoch, ask retirement in both
+modes, `lost` lifecycle with the 02.1 reason/rawReason/usable fields;
+fixtures in `server.rs` tests). Active-session release (02.10b)
 still answers `-32601`, as do the reserved 04.1 and 05.2 names. This document
 stays normative; the one deliberate delta is the advertised method list: the
 capability only names the methods the binary answers (allocate+activate+cancel
@@ -209,8 +213,10 @@ standard `PromptResponse.stopReason` keeps its standard values; `rawReason`
   outstanding ask of the cancelled turn in both modes — the run is stopped, so
   unlike a terminally-settled detached turn nothing outlives it — and marks
   the session non-resumable until 02.9b confirms tool cleanup (see "Cleanup
- confirmation" below). Detached sessions keep their asks across terminal
- settlement; retirement on handle loss (02.10a) is downstream debt.
+  confirmation" below). Detached sessions keep their asks across terminal
+  settlement; a supervised loss (02.10a) retires every outstanding ask in
+  both modes — the handle is dead, so nothing can outlive it — and marks the
+  session failed/non-resumable.
 
 `TurnEpoch` (`src/extension.rs`) is the single implementation all slices
 share:
@@ -288,6 +294,39 @@ so when the run ends its blocking tools ended with it.
 - `session/load` replaces the runtime wholesale (abort, not confirmation) and
   is not a confirmation path; its teardown bounds belong to 02.10a/02.10b.
 
+## Task supervision (02.10a)
+
+Each task and event pump is supervised from activation onward, including
+while idle: provider-initialisation failure, task/pump death, stream end,
+and dead input channels. Pre-activation startup failures belong to 02.3 (no
+prompt exists yet); this slice owns post-activation failures only.
+
+- The first loss observer wins via the turn epoch (bump on loss, even idle,
+  so a racing terminal lands stale). An outstanding prompt settles exactly
+  once; asks retire in both modes; the session stays failed/non-resumable
+  (reusing the 02.9b non-resumable mechanics, not infinite work).
+- The outstanding prompt (if live) answers `-32603 internal_error` with
+  `data: {"reason": "task_lost", "rawReason": ..., "usable": false,
+  "sessionId": ...}`; the verbatim cause rides in `rawReason`
+  (`stream_ended`, `pump_dead`, `input_channel_dead`, or the provider error
+  text). The `lost` lifecycle frame carries the same pair:
+  `{sessionId, state: "lost", turnEpoch, rawReason, usable: false}`.
+- An `Error` event alone is neither normal completion nor proof the handle
+  accepts another prompt: it takes the loss path unless the supervised
+  task/pump proves the handle live (input channel still connected). A live
+  `Error` settles as a failed turn as before; a dead-handle `Error`
+  settles as `lost`.
+- A lost handle is unusable: further prompts and addressed calls answer
+  `resource_not_found`, like an unknown id; the client must release it.
+  Peers stay usable through a sibling's loss; supervision work runs off-loop
+  (pump, supervisor task) or non-blocking on the loop (one lock plus wire
+  sends for the addressed session only), never blocking shared routing.
+- Incomplete-teardown boundary: loss performs no teardown — the claim stays
+  held and dead handles stay filed. A dropped handle is explicitly not
+  cleanup proof. Individual runtime release, EOF/shutdown bounds, and prior-
+  loss-plus-cleanup reporting belong to 02.10b, which inherits the recorded
+  `loss_reason`/`loss_raw`.
+
 ## Routing-loop rule
 
 Slow setup (provider construction, MCP start, history replay) and slow
@@ -305,12 +344,12 @@ itself only matches ids and epochs.
 
 ## Deferred to later slices
 
-02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
-ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
- 02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
-  cancellation, 02.9b cleanup confirmation and retry, 02.10a–b
- supervision/release bounds, 02.11 engine acceptance. Of the above, slices
- through 02.9b are implemented (active-session release still answers
- `-32601`, as do the reserved 04.1/05.2 names); the harness in `tests/`
+ 02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
+ ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
+  02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
+  cancellation, 02.9b cleanup confirmation and retry, 02.10a task/pump
+ supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance. Of the
+ above, slices through 02.10a are implemented (active-session release still
+ answers `-32601`, as do the reserved 04.1/05.2 names); the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

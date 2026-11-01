@@ -115,3 +115,21 @@ pub fn lifecycle_active_params(session_id: &str) -> serde_json::Value {
         "usable": true,
     })
 }
+
+/// 02.10a supervised-loss params: same 02.1 lifecycle fields, new `lost`
+/// state only. `turnEpoch` is the post-loss bumped epoch, `rawReason` the
+/// verbatim cause, `usable` always false. A lost handle never reopens;
+/// 02.10b's release reports this prior loss plus its own cleanup result.
+pub fn lifecycle_lost_params(
+    session_id: &str,
+    turn_epoch: u64,
+    raw_reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "state": "lost",
+        "turnEpoch": turn_epoch,
+        "rawReason": raw_reason,
+        "usable": false,
+    })
+}
