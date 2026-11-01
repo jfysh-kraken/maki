@@ -35,6 +35,15 @@ pub const FIXED_AT_ACTIVATION_REASON: &str = "fixed_at_activation";
 /// frames (session updates, permission/elicitation asks, prompt responses),
 /// so answers and events correlate by request and turn.
 pub const TURN_EPOCH_META_KEY: &str = "maki.turnEpoch";
+/// `_meta` key carrying the terminal reason verbatim on a prompt response:
+/// the provider's wire code (`"refusal"`, `"content_filter"`, ...) when the
+/// provider named one, else the `Done` reason name. Never remapped, so later
+/// slices keep provider semantics without re-parsing display strings.
+pub const RAW_REASON_META_KEY: &str = "maki.rawReason";
+/// `_meta` key carrying task usability on a prompt response: whether the run
+/// banked output the client may build on. Refusals, cancellations and drops
+/// carry none; normal endings and limits do.
+pub const USABLE_META_KEY: &str = "maki.usable";
 
 /// Advertise the implemented slice of the extension. The contract names four
 /// methods, but the capability only lists what this binary actually answers:
@@ -89,6 +98,28 @@ pub fn turn_epoch_meta(epoch: u64) -> agent_client_protocol_schema::v1::Meta {
         TURN_EPOCH_META_KEY.to_owned(),
         serde_json::Value::from(epoch),
     )])
+}
+
+/// Stamps a prompt response with everything the fork adds to the terminal:
+/// the settling epoch plus the verbatim raw reason and task usability. All
+/// three keys are additive `_meta`, so stock clients ignore them while fork
+/// clients branch on their presence.
+pub fn terminal_meta(
+    epoch: u64,
+    raw_reason: &str,
+    usable: bool,
+) -> agent_client_protocol_schema::v1::Meta {
+    agent_client_protocol_schema::v1::Meta::from_iter([
+        (
+            TURN_EPOCH_META_KEY.to_owned(),
+            serde_json::Value::from(epoch),
+        ),
+        (
+            RAW_REASON_META_KEY.to_owned(),
+            serde_json::Value::from(raw_reason),
+        ),
+        (USABLE_META_KEY.to_owned(), serde_json::Value::from(usable)),
+    ])
 }
 
 impl TurnEpoch {
@@ -181,6 +212,24 @@ mod tests {
             Some(&serde_json::Value::from(3))
         );
         assert_eq!(meta.len(), 1);
+    }
+
+    #[test]
+    fn terminal_meta_carries_epoch_raw_reason_and_usability() {
+        let meta = super::terminal_meta(2, "content_filter", false);
+        assert_eq!(
+            meta.get(super::TURN_EPOCH_META_KEY),
+            Some(&serde_json::Value::from(2))
+        );
+        assert_eq!(
+            meta.get(super::RAW_REASON_META_KEY),
+            Some(&serde_json::Value::from("content_filter"))
+        );
+        assert_eq!(
+            meta.get(super::USABLE_META_KEY),
+            Some(&serde_json::Value::from(false))
+        );
+        assert_eq!(meta.len(), 3);
     }
 
     #[test]

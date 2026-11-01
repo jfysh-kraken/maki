@@ -255,6 +255,7 @@ impl Provider for ParkedProvider {
                 },
                 usage: TokenUsage::default(),
                 stop_reason: Some(stop_reason),
+                raw_stop_reason: None,
                 input_transformations: Vec::new(),
             })
         })

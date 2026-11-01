@@ -67,6 +67,9 @@ const MAX_STOP_CONTINUATIONS: u32 = 3;
 const FIELD_TEXT: &str = "text";
 const STOP_FINISHED: &str = "finished";
 const STOP_MAX_TOKENS: &str = "max_tokens";
+/// A provider refusal ends the run like a finish, but layers tell the two
+/// apart the same way they tell a limit from a finish.
+const STOP_REFUSED: &str = "refused";
 const EMPTIED_MESSAGE: &str = "A plugin emptied the message, so there was nothing to send.";
 const NO_FRAME: &str = "no prompt frame to send the request under";
 /// The reason the API gives when it drops the old model's thinking after a
@@ -201,6 +204,10 @@ pub struct Agent<'h> {
     /// The last tool round moved a call to the background. Its receipt tells
     /// the model to end the turn, so an empty reply after it is no stall.
     moved_last_round: bool,
+    /// Verbatim wire code behind the run's terminal [`DoneReason`], for the
+    /// `Done` event's additive signal. Reset every turn so only the final
+    /// turn's code survives; agent-side endings leave it empty.
+    terminal_raw_stop: Option<String>,
 }
 
 impl<'h> Agent<'h> {
@@ -249,6 +256,7 @@ impl<'h> Agent<'h> {
             model_sync: None,
             stop_continuations: 0,
             moved_last_round: false,
+            terminal_raw_stop: None,
         }
     }
 
@@ -320,6 +328,7 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
         self.stop_continuations = 0;
+        self.terminal_raw_stop = None;
         self.moved_last_round = false;
         self.mode = mode;
         self.workflow = workflow;
@@ -475,6 +484,8 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            // Only the final turn's wire code may survive into `Done`.
+            self.terminal_raw_stop = None;
             self.follow_served_window().await?;
             self.try_auto_compact().await?;
             match self.turn().await? {
@@ -676,6 +687,7 @@ impl<'h> Agent<'h> {
 
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
+        let raw_stop_reason = response.raw_stop_reason.clone();
         info!(
             input_tokens = response.usage.input,
             output_tokens = response.usage.output,
@@ -699,6 +711,10 @@ impl<'h> Agent<'h> {
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
+            } else if stop_reason == Some(StopReason::Refusal) {
+                // The model declined; bank the boundary without nudging it to
+                // try again. A nudge would re-ask what it just refused.
+                self.history.push(Message::empty_marker());
             } else if self.recover_stalled_turn()? {
                 return Ok(TurnOutcome::Continue);
             }
@@ -729,6 +745,7 @@ impl<'h> Agent<'h> {
             return Ok(TurnOutcome::Continue);
         }
         let reason = stop_reason.into();
+        self.terminal_raw_stop = raw_stop_reason;
         if self.keep_going(reason).await? {
             return Ok(TurnOutcome::Continue);
         }
@@ -826,6 +843,7 @@ impl<'h> Agent<'h> {
         }
         let reason = match reason {
             DoneReason::MaxTokens => STOP_MAX_TOKENS,
+            DoneReason::Refusal => STOP_REFUSED,
             _ => STOP_FINISHED,
         };
         let last_message = self
@@ -967,6 +985,7 @@ impl<'h> Agent<'h> {
             context_window: self.model.context_window,
             num_turns: self.num_turns,
             reason,
+            raw_stop_reason: self.terminal_raw_stop.clone(),
         })
     }
 
@@ -4302,6 +4321,114 @@ mod tests {
         assert_eq!(stop["reason"], STOP_FINISHED);
         assert_eq!(stop["last_message"], RESPONSE_TEXT);
         assert_eq!(stop["num_turns"], 1);
+    }
+
+    fn refusal_response(raw: &str) -> StreamResponse {
+        let mut response = text_response(StopReason::Refusal);
+        response.raw_stop_reason = Some(raw.into());
+        response
+    }
+
+    /// A declared provider refusal ends the run as a refusal, distinct from a
+    /// normal ending, and the verbatim wire code rides on the `Done` event.
+    #[tokio::test]
+    async fn provider_refusal_ends_the_run_as_refusal() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![refusal_response("refusal")]),
+            &mut history,
+        );
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::Refusal);
+        let done = drain_events(&event_rx)
+            .into_iter()
+            .find_map(|e| match e.event {
+                AgentEvent::Done {
+                    reason,
+                    raw_stop_reason,
+                    ..
+                } => Some((reason, raw_stop_reason)),
+                _ => None,
+            })
+            .expect("expected Done event");
+        assert_eq!(done, (DoneReason::Refusal, Some("refusal".to_string())));
+    }
+
+    /// An empty refusal banks the boundary instead of nudging: the model
+    /// already declined, so asking again is not its to answer.
+    #[tokio::test]
+    async fn empty_refusal_does_not_nudge() {
+        let response = StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: Vec::new(),
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::Refusal),
+            raw_stop_reason: Some("content_filter".into()),
+            ..Default::default()
+        };
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::Refusal);
+        let events = drain_events(&event_rx);
+        assert!(
+            !has_event(&events, |e| matches!(e, AgentEvent::Nudge)),
+            "a refused turn must not nudge the model to try again"
+        );
+    }
+
+    /// Only the final turn's wire code survives: an earlier limit the run
+    /// continued past must not leak into the terminal `Done`.
+    #[tokio::test]
+    async fn only_the_final_turns_wire_code_survives() {
+        let mut limited = text_response(StopReason::MaxTokens);
+        limited.raw_stop_reason = Some("length".into());
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(
+            MockProvider::new(vec![limited, refusal_response("content_filter")]),
+            &mut history,
+        );
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::Refusal);
+        let raw = drain_events(&event_rx)
+            .into_iter()
+            .find_map(|e| match e.event {
+                AgentEvent::Done {
+                    raw_stop_reason, ..
+                } => Some(raw_stop_reason),
+                _ => None,
+            })
+            .expect("expected Done event");
+        assert_eq!(raw, Some("content_filter".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stop_sees_a_refusal_as_refused() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![refusal_response("refusal")]),
+            &mut history,
+        );
+        let seen = script(&agent.registry, |_, _| Verdict::Unchanged);
+
+        agent.run(default_input()).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let (_, stop) = seen.iter().find(|(s, _)| *s == AgentSlot::Stop).unwrap();
+        assert_eq!(stop["reason"], STOP_REFUSED);
+        assert_eq!(stop["last_message"], RESPONSE_TEXT);
     }
 
     #[test_case(drop_blocked, CompactReason::Auto, false ; "auto_is_skipped")]

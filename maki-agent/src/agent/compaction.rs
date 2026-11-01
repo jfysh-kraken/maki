@@ -342,6 +342,8 @@ pub async fn compact(
         // `Compact` and not `EndTurn`, so a goal loop reading this sees
         // housekeeping and does not treat it as a turn boundary.
         reason: DoneReason::Compact,
+        // Housekeeping banks no provider turn, so there is no wire code.
+        raw_stop_reason: None,
     };
     let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
     else {

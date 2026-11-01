@@ -411,6 +411,7 @@ pub(super) struct EventParser {
     current_block_idx: usize,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    raw_stop_reason: Option<String>,
     input_transformations: Vec<InputTransformation>,
 }
 
@@ -422,6 +423,7 @@ impl EventParser {
             current_block_idx: 0,
             usage: TokenUsage::default(),
             stop_reason: None,
+            raw_stop_reason: None,
             input_transformations: Vec::new(),
         }
     }
@@ -559,6 +561,8 @@ impl EventParser {
                         self.input_transformations = t;
                     }
                     if let Some(d) = ev.delta {
+                        self.raw_stop_reason =
+                            d.stop_reason.clone().or(self.raw_stop_reason.take());
                         self.stop_reason = d
                             .stop_reason
                             .map(|s| StopReason::from_anthropic(&s))
@@ -590,6 +594,7 @@ impl EventParser {
             },
             usage: self.usage,
             stop_reason: self.stop_reason,
+            raw_stop_reason: self.raw_stop_reason,
             input_transformations: self.input_transformations,
         }
     }

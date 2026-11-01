@@ -335,6 +335,7 @@ pub(crate) fn done() -> AgentEvent {
         context_window: 0,
         num_turns: 1,
         reason: DoneReason::EndTurn,
+        raw_stop_reason: None,
     }
 }
 
@@ -737,6 +738,7 @@ fn reset_session_clears_exit_request_source() {
         context_window: 0,
         num_turns: 1,
         reason: DoneReason::EndTurn,
+        raw_stop_reason: None,
     }));
 
     app.reset_session();

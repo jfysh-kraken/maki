@@ -617,6 +617,7 @@ async fn parse_sse(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut raw_stop_reason: Option<String> = None;
     let mut deadline = Instant::now() + stream_timeout;
 
     while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
@@ -650,6 +651,7 @@ async fn parse_sse(
 
         for candidate in candidates {
             if let Some(reason) = candidate.finish_reason {
+                raw_stop_reason = Some(reason.clone());
                 stop_reason = Some(StopReason::from_google(&reason)).or(stop_reason);
             }
 
@@ -706,6 +708,7 @@ async fn parse_sse(
         },
         usage,
         stop_reason,
+        raw_stop_reason,
         ..Default::default()
     })
 }
@@ -883,8 +886,11 @@ mod tests {
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]
     #[test_case("MAX_TOKENS", StopReason::MaxTokens ; "max_tokens")]
-    #[test_case("SAFETY", StopReason::EndTurn ; "safety")]
-    #[test_case("RECITATION", StopReason::EndTurn ; "recitation")]
+    #[test_case("SAFETY", StopReason::Refusal ; "safety")]
+    #[test_case("RECITATION", StopReason::Refusal ; "recitation")]
+    #[test_case("BLOCKLIST", StopReason::Refusal ; "blocklist")]
+    #[test_case("PROHIBITED_CONTENT", StopReason::Refusal ; "prohibited_content")]
+    #[test_case("SPII", StopReason::Refusal ; "spii")]
     #[test_case("unknown", StopReason::EndTurn ; "unknown")]
     fn stop_reason_from_google(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_google(input), expected);
@@ -1158,6 +1164,18 @@ mod tests {
             &result.message.content[0],
             ContentBlock::Text { text } if text == "hello"
         ));
+    }
+
+    /// Recorded shape of a Gemini safety block: the declared `finishReason`
+    /// classifies the turn as a refusal, with the verbatim code preserved.
+    #[tokio::test]
+    async fn parse_sse_safety_finish_reason_is_refusal() {
+        let data = b"data: {\"candidates\":[{\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1}}\n\n";
+        let response = Cursor::new(data);
+        let (tx, _rx) = flume::unbounded();
+        let result = parse_sse(response, &tx, TEST_STREAM_TIMEOUT).await.unwrap();
+        assert_eq!(result.stop_reason, Some(StopReason::Refusal));
+        assert_eq!(result.raw_stop_reason.as_deref(), Some("SAFETY"));
     }
 
     #[tokio::test]

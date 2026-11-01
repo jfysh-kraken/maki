@@ -284,6 +284,7 @@ mod tests {
             context_window: WINDOW,
             num_turns: 1,
             reason: DoneReason::EndTurn,
+            raw_stop_reason: None,
         })
     }
 

@@ -281,6 +281,7 @@ pub(crate) async fn parse_sse(
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut raw_stop_reason: Option<String> = None;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
@@ -511,6 +512,7 @@ pub(crate) async fn parse_sse(
                 }
 
                 let status = resp["status"].as_str().unwrap_or("completed");
+                raw_stop_reason = Some(status.to_owned());
                 stop_reason = Some(match status {
                     "completed" => {
                         if tool_accumulators.is_empty() {
@@ -519,7 +521,7 @@ pub(crate) async fn parse_sse(
                             StopReason::ToolUse
                         }
                     }
-                    "incomplete" => StopReason::MaxTokens,
+                    "incomplete" => incomplete_stop_reason(resp).0,
                     _ => StopReason::EndTurn,
                 });
             }
@@ -534,7 +536,9 @@ pub(crate) async fn parse_sse(
                     usage = parse_usage(u);
                     usage.cost = copilot_usd(&parsed["copilot_usage"]);
                 }
-                stop_reason = Some(StopReason::MaxTokens);
+                let (stop, raw) = incomplete_stop_reason(resp);
+                raw_stop_reason = Some(raw);
+                stop_reason = Some(stop);
             }
 
             "response.failed" => {
@@ -593,8 +597,23 @@ pub(crate) async fn parse_sse(
         },
         usage,
         stop_reason,
+        raw_stop_reason,
         ..Default::default()
     })
+}
+
+/// An `incomplete` response names its cause in `incomplete_details.reason`:
+/// a content filter is a declared refusal, anything else (usually
+/// `max_output_tokens`) is a limit. Never inferred from text.
+fn incomplete_stop_reason(resp: &Value) -> (StopReason, String) {
+    let reason = resp["incomplete_details"]["reason"]
+        .as_str()
+        .unwrap_or("incomplete");
+    if reason == "content_filter" {
+        (StopReason::Refusal, reason.to_owned())
+    } else {
+        (StopReason::MaxTokens, reason.to_owned())
+    }
 }
 
 fn parse_usage(u: &Value) -> TokenUsage {
@@ -835,9 +854,28 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
         let (resp, _) = run_sse(sse).await;
         let resp = resp.unwrap();
         assert_eq!(resp.stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("incomplete"));
         assert!(
             matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "partial")
         );
+    }
+
+    /// An `incomplete` response with a content-filter cause is a declared
+    /// refusal, not a limit; the verbatim cause travels with the typed reason.
+    #[tokio::test]
+    async fn parse_sse_incomplete_content_filter_is_refusal() {
+        let sse = "\
+event: response.output_text.delta\n\
+data: {\"delta\":\"partial\"}\n\
+\n\
+event: response.incomplete\n\
+data: {\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+        let (resp, _) = run_sse(sse).await;
+        let resp = resp.unwrap();
+        assert_eq!(resp.stop_reason, Some(StopReason::Refusal));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("content_filter"));
     }
 
     #[test]

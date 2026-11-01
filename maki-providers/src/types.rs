@@ -780,6 +780,10 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The provider declined to answer: a declared safety/refusal code, never
+    /// a guess from prose. Additive variant: serialize-only like the rest, so
+    /// older readers never meet it on a stored surface.
+    Refusal,
 }
 
 impl StopReason {
@@ -788,6 +792,7 @@ impl StopReason {
             "end_turn" => Self::EndTurn,
             "tool_use" => Self::ToolUse,
             "max_tokens" => Self::MaxTokens,
+            "refusal" => Self::Refusal,
             _ => Self::EndTurn,
         }
     }
@@ -797,6 +802,7 @@ impl StopReason {
             "stop" => Self::EndTurn,
             "tool_calls" => Self::ToolUse,
             "length" => Self::MaxTokens,
+            "content_filter" | "refusal" => Self::Refusal,
             _ => Self::EndTurn,
         }
     }
@@ -805,10 +811,7 @@ impl StopReason {
         match s {
             "STOP" => Self::EndTurn,
             "MAX_TOKENS" => Self::MaxTokens,
-            "SAFETY" | "RECITATION" => {
-                warn!("Gemini stop reason: {s}, treating as end_turn");
-                Self::EndTurn
-            }
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => Self::Refusal,
             _ => Self::EndTurn,
         }
     }
@@ -1574,6 +1577,11 @@ pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    /// The wire code `stop_reason` was classified from, verbatim
+    /// (`"refusal"`, `"content_filter"`, `"SAFETY"`, ...). The typed reason
+    /// merges several codes into one, so this is what survives downstream
+    /// when the distinction matters. `None` when the decoder saw no code.
+    pub raw_stop_reason: Option<String>,
     pub input_transformations: Vec<InputTransformation>,
 }
 
@@ -1701,6 +1709,7 @@ mod tests {
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
     #[test_case("max_tokens", StopReason::MaxTokens ; "max_tokens")]
+    #[test_case("refusal", StopReason::Refusal   ; "refusal_is_declared")]
     #[test_case("unknown", StopReason::EndTurn    ; "unknown_defaults_to_end_turn")]
     fn stop_reason_from_anthropic(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_anthropic(input), expected);
@@ -1709,6 +1718,8 @@ mod tests {
     #[test_case("stop", StopReason::EndTurn       ; "stop_maps_to_end_turn")]
     #[test_case("tool_calls", StopReason::ToolUse ; "tool_calls_maps_to_tool_use")]
     #[test_case("length", StopReason::MaxTokens   ; "length_maps_to_max_tokens")]
+    #[test_case("content_filter", StopReason::Refusal ; "content_filter_is_declared")]
+    #[test_case("refusal", StopReason::Refusal    ; "refusal_is_declared")]
     #[test_case("unknown", StopReason::EndTurn    ; "unknown_defaults_to_end_turn")]
     fn stop_reason_from_openai(input: &str, expected: StopReason) {
         assert_eq!(StopReason::from_openai(input), expected);

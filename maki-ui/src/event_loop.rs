@@ -2264,6 +2264,7 @@ mod tests {
             context_window: 0,
             num_turns: 1,
             reason: DoneReason::EndTurn,
+            raw_stop_reason: None,
         }
     }
 

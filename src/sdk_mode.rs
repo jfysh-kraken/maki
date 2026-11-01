@@ -1229,13 +1229,16 @@ impl EventPump {
                 ..
             } => {
                 // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
+                // never ran, so neither is a success. A refusal completed the
+                // turn with the model's answer, so it reports like a finish
+                // and stays distinguishable by its stop reason, not an error.
                 let is_error = match reason {
                     DoneReason::Cancelled | DoneReason::Dropped => true,
                     DoneReason::EndTurn
                     | DoneReason::MaxTokens
                     | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
+                    | DoneReason::Compact
+                    | DoneReason::Refusal => false,
                 };
                 let result = mem::take(&mut self.result_text);
                 let totals = RunTotals {
@@ -1929,6 +1932,7 @@ mod tests {
             context_window: 0,
             num_turns: 0,
             reason: DoneReason::Dropped,
+            raw_stop_reason: None,
         }))
         .unwrap();
 
@@ -1980,6 +1984,7 @@ mod tests {
             context_window: 0,
             num_turns: 1,
             reason: DoneReason::EndTurn,
+            raw_stop_reason: None,
         }))
         .unwrap();
 
@@ -2007,6 +2012,7 @@ mod tests {
             context_window: 0,
             num_turns: 1,
             reason: DoneReason::EndTurn,
+            raw_stop_reason: None,
         }
     }
 

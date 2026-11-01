@@ -371,6 +371,9 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         // The prompt never reached the model and stays out of the next one,
         // which is what ACP means by a refusal.
         DoneReason::Dropped => StopReason::Refusal,
+        // The provider named the refusal itself; the typed reason already
+        // says refusal, and the verbatim wire code rides in `_meta`.
+        DoneReason::Refusal => StopReason::Refusal,
     }
 }
 
@@ -535,6 +538,9 @@ mod tests {
     /// ran".
     #[test_case(DoneReason::MaxTurns, StopReason::MaxTurnRequests ; "max_turns_maps_to_max_turn_requests")]
     #[test_case(DoneReason::Dropped, StopReason::Refusal ; "dropped_maps_to_refusal")]
+    #[test_case(DoneReason::Refusal, StopReason::Refusal ; "provider_refusal_maps_to_refusal")]
+    #[test_case(DoneReason::EndTurn, StopReason::EndTurn ; "end_turn_stays_end_turn")]
+    #[test_case(DoneReason::Cancelled, StopReason::Cancelled ; "cancelled_stays_cancelled")]
     fn map_done_reason_renames(reason: DoneReason, expected: StopReason) {
         assert_eq!(map_done_reason(reason), expected);
     }

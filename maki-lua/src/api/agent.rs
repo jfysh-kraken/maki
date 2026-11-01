@@ -1688,7 +1688,8 @@ fn messages_since(history: &History, start: usize) -> &[Message] {
 /// subagent can be cancelled on its own, and its caller should hear about that
 /// instead of taking a half-finished answer for a real one, so cancel reads
 /// like an error here even though the run ended normally. A dropped prompt
-/// never reached the model, so an empty answer would be a lie.
+/// never reached the model, so an empty answer would be a lie. A refusal did
+/// answer, with the refusal itself, so the caller reads that text.
 fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool) -> Option<String> {
     match result {
         Err(e) => Some(e.to_string()),
@@ -1699,7 +1700,8 @@ fn cut_short_err(result: &Result<DoneReason, AgentError>, stopped_by_user: bool)
             DoneReason::EndTurn
             | DoneReason::MaxTokens
             | DoneReason::MaxTurns
-            | DoneReason::Compact,
+            | DoneReason::Compact
+            | DoneReason::Refusal,
         ) => None,
     }
 }
@@ -2936,6 +2938,7 @@ mod tests {
                 context_window: 0,
                 num_turns: 2,
                 reason: DoneReason::EndTurn,
+                raw_stop_reason: None,
             },
         ]
     }

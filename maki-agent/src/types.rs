@@ -610,6 +610,8 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
 
 /// Why a run ended. The provider's `StopReason` describes one turn, this
 /// describes the whole run, including the endings only the agent knows about.
+/// Additive-only: new endings arrive as new variants, serialized snake_case,
+/// so older readers never misread one as another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Display)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -624,6 +626,22 @@ pub enum DoneReason {
     /// An `agent.user_message` layer dropped the message before the model saw
     /// it.
     Dropped,
+    /// The provider declared a refusal or content filter for the final turn.
+    /// Classified from the wire code only, never from prose. Like [`Self::Dropped`],
+    /// the prompt stays out of the next one; unlike it, the model did answer.
+    Refusal,
+}
+
+impl DoneReason {
+    /// Whether the run banked output the client may build on. Refusals,
+    /// cancellations and drops carry no usable answer; limits and normal
+    /// endings do, even when truncated.
+    pub fn usable(self) -> bool {
+        matches!(
+            self,
+            Self::EndTurn | Self::MaxTokens | Self::MaxTurns | Self::Compact
+        )
+    }
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -632,6 +650,7 @@ impl From<Option<StopReason>> for DoneReason {
     fn from(reason: Option<StopReason>) -> Self {
         match reason {
             Some(StopReason::MaxTokens) => Self::MaxTokens,
+            Some(StopReason::Refusal) => Self::Refusal,
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
         }
     }
@@ -751,6 +770,12 @@ pub enum AgentEvent {
         context_window: u32,
         num_turns: u32,
         reason: DoneReason,
+        /// The wire code the provider stopped with, verbatim. `None` for
+        /// endings the agent decided itself (drops, cancels, budgets), which
+        /// report the `reason` name instead. Additive: readers that do not
+        /// know it yet still read every older field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_stop_reason: Option<String>,
     },
     AutoCompacting {
         context_size: u32,
@@ -1530,6 +1555,26 @@ mod tests {
     #[test_case(Some(StopReason::ToolUse) ; "tool_use")]
     fn stop_reason_without_its_own_ending_becomes_end_turn(stop: Option<StopReason>) {
         assert_eq!(DoneReason::from(stop), DoneReason::EndTurn);
+    }
+
+    #[test]
+    fn provider_refusal_becomes_its_own_ending() {
+        assert_eq!(
+            DoneReason::from(Some(StopReason::Refusal)),
+            DoneReason::Refusal
+        );
+        assert_eq!(DoneReason::Refusal.to_string(), "refusal");
+    }
+
+    #[test_case(DoneReason::EndTurn, true ; "end_turn")]
+    #[test_case(DoneReason::MaxTokens, true ; "max_tokens")]
+    #[test_case(DoneReason::MaxTurns, true ; "max_turns")]
+    #[test_case(DoneReason::Compact, true ; "compact")]
+    #[test_case(DoneReason::Refusal, false ; "refusal_banks_nothing_usable")]
+    #[test_case(DoneReason::Cancelled, false ; "cancelled")]
+    #[test_case(DoneReason::Dropped, false ; "dropped")]
+    fn done_usability_marks_endings_without_banked_output(reason: DoneReason, usable: bool) {
+        assert_eq!(reason.usable(), usable);
     }
 
     #[test]

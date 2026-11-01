@@ -7954,6 +7954,7 @@ impl Provider for TurnThenPark {
                     ..Default::default()
                 },
                 stop_reason: Some(StopReason::ToolUse),
+                raw_stop_reason: None,
                 input_transformations: Vec::new(),
             })
         })
@@ -8463,6 +8464,7 @@ impl Provider for CallOnce {
                 },
                 usage: TokenUsage::default(),
                 stop_reason: Some(stop),
+                raw_stop_reason: None,
                 input_transformations: Vec::new(),
             })
         })

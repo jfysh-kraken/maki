@@ -611,6 +611,7 @@ pub async fn parse_sse(
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut raw_stop_reason: Option<String> = None;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
@@ -660,6 +661,7 @@ pub async fn parse_sse(
         };
 
         if let Some(reason) = choice.finish_reason {
+            raw_stop_reason = Some(reason.clone());
             stop_reason = Some(StopReason::from_openai(&reason));
         }
 
@@ -816,6 +818,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        raw_stop_reason,
         ..Default::default()
     })
 }
@@ -952,6 +955,48 @@ data: [DONE]\n";
         assert_eq!(resp.usage.input, 20);
         assert_eq!(resp.usage.cache_read, 80);
         assert_eq!(resp.usage.output, 10);
+    }
+
+    /// Recorded shape of an OpenAI-compatible content-filter turn: the filter
+    /// arrives as the terminal `finish_reason` with no usable delta, and the
+    /// verbatim code travels with the typed reason.
+    #[tokio::test]
+    async fn parse_sse_content_filter_stop_reason() {
+        let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"content_filter\",\"delta\":{}}]}\n\
+\n\
+data: [DONE]\n";
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, Some(StopReason::Refusal));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("content_filter"));
+        assert!(resp.message.content.is_empty());
+    }
+
+    /// Refusal-like prose with a normal `stop` code stays a normal ending:
+    /// the decoder never infers classification from text.
+    #[tokio::test]
+    async fn parse_sse_refusal_prose_with_stop_stays_end_turn() {
+        let sse = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"I can't help with that; policy filtered it.\"}}]}\n\
+\n\
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\
+\n\
+data: [DONE]\n";
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("stop"));
     }
 
     /// OpenRouter quotes the bill on the same chunk as the token counts, so the

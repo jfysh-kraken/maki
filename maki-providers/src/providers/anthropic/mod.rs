@@ -917,6 +917,74 @@ data: {\"type\":\"message_stop\"}\n";
         assert_eq!(deltas, vec!["Hello", " world"]);
     }
 
+    /// Recorded shape of an Anthropic refusal turn: the wire code, not the
+    /// prose, is what classifies it, and the verbatim code travels with the
+    /// typed reason.
+    #[tokio::test]
+    async fn parse_sse_refusal_stop_reason() {
+        let sse_data = b"\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8}}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I can't help with that.\"}}\n\
+\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":8}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n";
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, Some(StopReason::Refusal));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("refusal"));
+        assert!(
+            matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "I can't help with that.")
+        );
+    }
+
+    /// Refusal-like prose with a normal stop code stays a normal ending: the
+    /// decoder never infers classification from text.
+    #[tokio::test]
+    async fn parse_sse_refusal_prose_with_end_turn_stays_end_turn() {
+        let sse_data = b"\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42}}}\n\
+\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"I refuse: the request was filtered by policy.\"}}\n\
+\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n";
+
+        let (tx, _rx) = flume::unbounded();
+        let resp = parse_sse(Cursor::new(sse_data), &tx, TEST_STREAM_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(resp.raw_stop_reason.as_deref(), Some("end_turn"));
+    }
+
     #[test_case(
         r#"{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}"# ;
         "zeros_in_message_start"

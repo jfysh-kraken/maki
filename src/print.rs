@@ -576,6 +576,7 @@ mod tests {
             context_window: 0,
             num_turns: RUN_TURNS,
             reason,
+            raw_stop_reason: None,
         }
     }
 

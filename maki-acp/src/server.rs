@@ -1760,13 +1760,19 @@ fn start_event_pump(
                 AgentEvent::Done {
                     reason,
                     cost: ledger,
+                    raw_stop_reason,
                     ..
                 } => {
                     cost.settle(ledger);
                     tool_inputs.clear();
                     if let Some((id, turn)) = settle_prompt(&pending) {
+                        // The standard `stopReason` keeps its standard value;
+                        // the verbatim wire code (or the `Done` name for
+                        // agent-side endings) and task usability ride along as
+                        // additive `_meta`, never remapped.
+                        let raw = raw_stop_reason.unwrap_or_else(|| reason.to_string());
                         let resp = PromptResponse::new(translate::map_done_reason(reason))
-                            .meta(extension::turn_epoch_meta(turn));
+                            .meta(extension::terminal_meta(turn, &raw, reason.usable()));
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(
@@ -2560,6 +2566,7 @@ mod tests {
             context_window: CONTEXT_WINDOW,
             num_turns: 1,
             reason: DoneReason::EndTurn,
+            raw_stop_reason: None,
         }
     }
 
@@ -2845,6 +2852,56 @@ mod tests {
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
     }
 
+    /// A provider refusal settles the prompt once through the turn epoch with
+    /// `refusal`, carrying the verbatim wire code and task usability in
+    /// additive `_meta`; a duplicate terminal for the same epoch is dropped,
+    /// never re-answered, and moves no epoch.
+    #[tokio::test]
+    async fn event_pump_settles_a_refusal_once_with_raw_reason_and_usability() {
+        let (srv, .., out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        let refusal = || AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: CONTEXT_WINDOW,
+            num_turns: 1,
+            reason: DoneReason::Refusal,
+            raw_stop_reason: Some("content_filter".to_owned()),
+        };
+        run_pump(&srv, None, |sender| {
+            sender.send(refusal()).unwrap();
+            sender.send(refusal()).unwrap();
+        })
+        .await;
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "refusal");
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the answer carries the turn it settled: {answer}"
+        );
+        assert_eq!(
+            answer["result"]["_meta"][extension::RAW_REASON_META_KEY],
+            "content_filter",
+            "the verbatim wire code survives: {answer}"
+        );
+        assert_eq!(
+            answer["result"]["_meta"][extension::USABLE_META_KEY],
+            false,
+            "a refusal banks no usable output: {answer}"
+        );
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
+        assert_eq!(live_epoch(&srv), 1, "one settlement bumps once");
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a duplicate terminal for one epoch settles nothing"
+        );
+    }
+
     /// An accepted observation's line arrives as a finished card, in the order
     /// the agent sent it, and the turn's permission and answer routing stay as
     /// they were. A host notice is not sent, and a child's line stays in the
@@ -3082,6 +3139,7 @@ mod tests {
                 context_window: CONTEXT_WINDOW,
                 num_turns: 1,
                 reason: DoneReason::EndTurn,
+                raw_stop_reason: None,
             }
         };
         run_pump(&srv, Some(RECORDED_COST), |sender| {

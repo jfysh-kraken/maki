@@ -282,6 +282,7 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             context_size,
             context_window,
             num_turns,
+            ..
         } => Some(HostEvent::TurnEnd {
             reason: turn_end_reason(*reason)?,
             usage,
@@ -305,6 +306,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::MaxTurns => Some("max_turns"),
         DoneReason::Cancelled => Some("cancelled"),
         DoneReason::Dropped => Some("dropped"),
+        DoneReason::Refusal => Some("refused"),
         DoneReason::Compact => None,
     }
 }
@@ -343,6 +345,7 @@ mod tests {
             context_window: 200_000,
             num_turns: 4,
             reason,
+            raw_stop_reason: None,
         }
     }
 
@@ -408,6 +411,7 @@ mod tests {
     #[test_case(DoneReason::MaxTurns, Some("max_turns") ; "max_turns")]
     #[test_case(DoneReason::Cancelled, Some("cancelled") ; "cancelled")]
     #[test_case(DoneReason::Dropped, Some("dropped") ; "dropped")]
+    #[test_case(DoneReason::Refusal, Some("refused") ; "refused")]
     #[test_case(DoneReason::Compact, None ; "manual_compact_is_not_a_turn")]
     fn done_maps_to_a_turn_end_reason(reason: DoneReason, expected: Option<&str>) {
         let fired = fired(&done(reason));
