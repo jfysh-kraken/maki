@@ -9,8 +9,9 @@
 //!   duplicate-prompt and unknown/cross-session rejection) is 02.2b (see
 //!   `tests/prompt_routing.rs` and the `server.rs` routing tests);
 //! - `_maki/session/allocate` and `_maki/session/activate` runtime behavior
-//!   is 02.3, addressed cancel scoping is 02.9a, bounded release is 02.10b:
-//!   all four probes must still answer -32601 (see
+//!   is 02.3 (see `tests/allocation_activation.rs` and the `server.rs`
+//!   lease tests); addressed cancel scoping is 02.9a, bounded release is
+//!   02.10b: those two probes must still answer -32601 (see
 //!   `extension_runtime_seams_still_reject_clearly`).
 //!
 //! 02.2b changed the per-session observable used here: setup is fixed per
@@ -84,27 +85,30 @@ async fn two_sessions_coexist_under_one_pid_with_independent_pumps() {
     shared.shutdown().await.unwrap();
 }
 
-/// Allocation, activation, addressed cancel and release stay specified but not
-/// implemented: every probe answers -32601 like an unknown method, on a
-/// multi-session server too.
+/// Addressed cancel and active-session release stay specified but not
+/// implemented: the cancel probe answers -32601 like an unknown method, on a
+/// multi-session server too. A bare release probe fails param parsing first
+/// (see `extension_contract.rs`); the release seam itself — active sessions
+/// staying -32601 — is proven in `allocation_activation.rs`. Allocate and
+/// activate moved out of this list in 02.3.
 #[tokio::test]
 async fn extension_runtime_seams_still_reject_clearly() {
     let mut shared = SharedSessions::establish().await.unwrap();
-    for method in [
-        extension::ALLOCATE_METHOD,
-        extension::ACTIVATE_METHOD,
-        extension::CANCEL_METHOD,
-        extension::RELEASE_METHOD,
-    ] {
-        let reply = shared.child.probe_unsupported(method).await.unwrap();
-        assert_eq!(
-            reply["error"]["code"], -32601,
-            "{method} must reject as unknown, got: {reply}"
-        );
-        assert!(
-            reply.get("result").is_none(),
-            "{method} must not answer success: {reply}"
-        );
-    }
+    let reply = shared
+        .child
+        .probe_unsupported(extension::CANCEL_METHOD)
+        .await
+        .unwrap();
+    assert_eq!(
+        reply["error"]["code"],
+        -32601,
+        "{} must reject as unknown, got: {reply}",
+        extension::CANCEL_METHOD
+    );
+    assert!(
+        reply.get("result").is_none(),
+        "{} must not answer success: {reply}",
+        extension::CANCEL_METHOD
+    );
     shared.shutdown().await.unwrap();
 }

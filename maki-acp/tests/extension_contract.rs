@@ -42,25 +42,30 @@ async fn initialize_correlates_both_id_shapes(id: serde_json::Value) {
     child.shutdown().await.unwrap();
 }
 
-/// The multi-session extension is specified but not implemented on this
-/// branch, so capability checking must report it absent, and every
-/// extension probe must reject with -32601 instead of hanging or
-/// answering success.
+/// 02.3 implements allocate/activate, so the capability is advertised with
+/// exactly those methods. Addressed cancel (02.9a), release (02.10b), owned
+/// deletion (05.2), and model discovery (04.1) stay specified but not
+/// implemented: every probe answers -32601 instead of hanging or answering
+/// success.
 #[tokio::test]
-async fn unsupported_extension_capability_rejects_clearly() {
+async fn extension_capability_advertises_allocate_and_activate_only() {
     let mut child = MakiChild::spawn().await.unwrap();
     let initialize = child.initialize().await.unwrap();
-    let capability =
-        initialize["result"]["agentCapabilities"]["_meta"].get(extension::CAPABILITY_KEY);
-    assert!(
-        capability.is_none(),
-        "extension is specified-not-implemented here; advertising {capability:?} would lie"
+    let advertised = &initialize["result"]["agentCapabilities"]["_meta"]["maki.multiSession"];
+    assert_eq!(advertised["version"], 1, "{advertised}");
+    let methods: Vec<&str> = advertised["methods"]
+        .as_array()
+        .expect("methods is an array")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [extension::ALLOCATE_METHOD, extension::ACTIVATE_METHOD],
+        "capability lists only what the server answers: {methods:?}"
     );
     for method in [
-        extension::ALLOCATE_METHOD,
-        extension::ACTIVATE_METHOD,
         extension::CANCEL_METHOD,
-        extension::RELEASE_METHOD,
         extension::OWNED_DELETION_METHOD,
         &format!("{}list_models", extension::MODEL_DISCOVERY_PREFIX),
     ] {
@@ -74,6 +79,15 @@ async fn unsupported_extension_capability_rejects_clearly() {
             "{method} must not answer success: {reply}"
         );
     }
+    // Release parses before it routes: empty params fail parsing (-32602),
+    // while an unknown id routes past parsing to `resource_not_found`.
+    // Releasing an active session stays the 02.10b seam (-32601); the
+    // unactivated-allocation half is proven in `allocation_activation.rs`.
+    let empty = child
+        .probe_unsupported(extension::RELEASE_METHOD)
+        .await
+        .unwrap();
+    assert_eq!(empty["error"]["code"], -32602, "{empty}");
     child.shutdown().await.unwrap();
 }
 

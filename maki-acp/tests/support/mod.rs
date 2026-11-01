@@ -427,6 +427,60 @@ impl MakiChild {
         self.expect_response(&id).await
     }
 
+    /// Reserve an id without starting anything (02.3 allocate). The reply
+    /// itself is the assertion surface: `{sessionId, turnEpoch}` on success,
+    /// a JSON-RPC error otherwise.
+    pub async fn allocate_raw(&mut self, cwd: &str) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "_maki/session/allocate",
+            id.clone(),
+            serde_json::json!({"cwd": cwd}),
+        )
+        .await?;
+        self.expect_response(&id).await
+    }
+
+    /// Bind an allocated id to a model, mode, cwd, and absolute output (02.3
+    /// activate). The reply is the assertion surface; readiness follows on a
+    /// `_maki/session/lifecycle` notification.
+    pub async fn activate_raw(
+        &mut self,
+        session_id: &str,
+        model: &str,
+        mode: &str,
+        cwd: &str,
+        output: &str,
+    ) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "_maki/session/activate",
+            id.clone(),
+            serde_json::json!({
+                "sessionId": session_id,
+                "model": model,
+                "mode": mode,
+                "cwd": cwd,
+                "output": output,
+            }),
+        )
+        .await?;
+        self.expect_response(&id).await
+    }
+
+    /// Release a session without asserting success (02.3 implements the
+    /// unactivated-allocation half; active sessions stay the 02.10b seam).
+    pub async fn release_raw(&mut self, session_id: &str) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "_maki/session/release",
+            id.clone(),
+            serde_json::json!({"sessionId": session_id, "reason": "client_done"}),
+        )
+        .await?;
+        self.expect_response(&id).await
+    }
+
     /// Fire a `session/cancel` notification. One-way: a notification carries
     /// no id to answer on, so there is no reply to correlate.
     pub async fn cancel_notify(&mut self, session_id: &str) -> io::Result<()> {

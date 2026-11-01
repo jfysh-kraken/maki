@@ -1,12 +1,16 @@
 # Maki multi-session ACP extension (fork contract, slice 02.1)
 
-Status: **specified, not implemented**. The single-session server on this
-branch answers every `_maki/` method with `-32601 Method not found`; that
-rejection is the current, specified signal for "extension unsupported".
-Slice 02.2b implements prompt/event routing against this contract, and all
-later 02.x slices reuse it. The turn-epoch helper in
-`src/extension.rs` (`TurnEpoch`) is the single settlement contract 02.2b
-wires in; this document is its normative wording.
+Status: partially implemented on branch `nori/mvp`. The single-session
+server answered every `_maki/` method with `-32601 Method not found`; slice
+02.2b wired prompt/event routing against this contract, slice 02.3 wired
+`_maki/session/allocate` and `_maki/session/activate` (runtime in
+`maki-acp/src/server.rs`, lease/model/failure/responsiveness fixtures in
+`server.rs` tests and `tests/allocation_activation.rs`). Addressed cancel
+(02.9a) and release (02.10b) still answer `-32601`, as do the reserved 04.1
+and 05.2 names. This document stays normative; the one deliberate delta is
+the advertised method list: the capability only names the methods the binary
+answers (allocate+activate today; cancel joins in 02.9a, release in 02.10b),
+so probing an unlisted method keeps reporting "unsupported".
 
 Scope: one patched Maki PID owns independent concurrent ACP sessions with
 separate cwd/model/plan context, permission routing and supervised lifecycle.

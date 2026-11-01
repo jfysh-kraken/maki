@@ -36,6 +36,22 @@ pub const FIXED_AT_ACTIVATION_REASON: &str = "fixed_at_activation";
 /// so answers and events correlate by request and turn.
 pub const TURN_EPOCH_META_KEY: &str = "maki.turnEpoch";
 
+/// Advertise the implemented slice of the extension. The contract names four
+/// methods, but the capability only lists what this binary actually answers:
+/// 02.3 implements allocate and activate; addressed cancel joins in 02.9a and
+/// release in 02.10b. Clients MUST probe any method they intend to call: an
+/// unlisted method answers `-32601`, which is the "unsupported" signal, not a
+/// failure.
+pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
+    agent_client_protocol_schema::v1::Meta::from_iter([(
+        CAPABILITY_KEY.to_owned(),
+        serde_json::json!({
+            "version": CAPABILITY_VERSION,
+            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD],
+        }),
+    )])
+}
+
 /// Per-session turn epoch: 0 at allocate/activate, bumped on every terminal
 /// settlement, on an addressed cancel taking effect, and on handle loss. Late
 /// answers and events validate against it through [`TurnEpoch::check`]; the
@@ -179,5 +195,22 @@ mod tests {
         }
         assert!(MODEL_DISCOVERY_PREFIX.starts_with("_maki/"));
         assert_eq!(OWNED_DELETION_METHOD, "_maki/session/delete");
+    }
+
+    /// 02.3 advertises exactly the methods it answers: allocate and activate.
+    /// Addressed cancel (02.9a) and release (02.10b) stay probe-to--32601 until
+    /// their slices land, so advertising them now would lie.
+    #[test]
+    fn capability_advertises_only_the_implemented_methods() {
+        let meta = super::capability_meta();
+        let entry = meta.get(super::CAPABILITY_KEY).expect("capability keyed");
+        assert_eq!(entry["version"], super::CAPABILITY_VERSION);
+        let methods: Vec<&str> = entry["methods"]
+            .as_array()
+            .expect("methods is an array")
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert_eq!(methods, [super::ALLOCATE_METHOD, super::ACTIVATE_METHOD]);
     }
 }

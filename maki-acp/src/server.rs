@@ -16,25 +16,28 @@ use agent_client_protocol_schema::v1::{
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
+use futures::future::BoxFuture;
 use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
+use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType, ImageSource,
-    InputSource, SessionEndReason, SessionEvents,
+    AgentConfig, AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType,
+    ImageSource, InputSource, SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
-use maki_providers::settle_session;
+use maki_providers::{Timeouts, settle_session};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::{SessionClaim, SessionError};
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -120,6 +123,12 @@ struct SessionRuntime {
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
+    /// Absolute output path fixed at activation (`EXTENSION.md`): the plan
+    /// artifact in plan mode, the transcript-adjacent run record in build
+    /// mode. `None` for standard `session/new`/`session/load` runtimes, which
+    /// predate the extension. 03's transactional output reservation consumes
+    /// this; 02.3 only carries it through unchanged.
+    output: Option<PathBuf>,
     pending: PendingState,
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
@@ -127,6 +136,74 @@ struct SessionRuntime {
     /// The runtime owns its pump task; closing the session aborts and reaps it
     /// (bounded teardown of the release path itself is 02.10b).
     pump: JoinHandle<()>,
+}
+
+/// An allocated-but-unactivated lease (02.3). The id is reserved and the
+/// storage claim held, but no provider exists and no agent task runs: prompts
+/// are rejected, and nothing here can reach a provider. Activation consumes
+/// the entry (success transfers the claim to the runtime, failure drops it);
+/// release and ACP disconnect drop it the same way.
+struct Allocation {
+    /// Session cwd reserved alongside the id. Activation must name the same
+    /// cwd back: the lease covers one (id, cwd) pair, never a floating id a
+    /// later call can repoint.
+    cwd: PathBuf,
+    claim: SessionClaim,
+}
+
+/// Everything one activation needs, owned, so the slow half can move to a
+/// dedicated task and leave the routing loop responsive. `mcp` starts empty
+/// and `project_config` starts as the untrusted base: the task resolves trust
+/// and starts MCP before spawning the runtime.
+struct ActivationInput {
+    spawn: SpawnCtx,
+    trust_mode: TrustMode,
+    trust_policy: Arc<TrustConfig>,
+}
+
+/// A startup that died before the activation result settled. Carries the
+/// claim back so the loop releases the lease through the same helper as every
+/// other unwind path. The production starter is infallible today (model parse
+/// and trust resolution cannot fail, MCP start degrades to `None`); this arm
+/// exists for the instrumented fixture and for fallible startup later.
+struct ActivationFailure {
+    claim: SessionClaim,
+    reason: String,
+}
+
+type ActivationResult = Result<SessionRuntime, ActivationFailure>;
+
+/// Slow half of activation: trust resolution, provider/MCP startup and agent
+/// spawn, off the shared control loop. Production answers with the real
+/// runtime; fixtures record the requested model and answer with a stub (or a
+/// held/failed outcome), so no test needs provider contact.
+type ActivationStarter =
+    Arc<dyn Fn(ActivationInput) -> BoxFuture<'static, ActivationResult> + Send + Sync>;
+
+/// Everything `spawn_runtime` needs, owned. The standard paths build one from
+/// `AcpParams` on the loop; activation builds one from the requested
+/// model/mode/cwd/output and finishes it on a dedicated task.
+struct SpawnCtx {
+    out_tx: Sender<Value>,
+    elicits_form: bool,
+    model: Model,
+    mode: AgentMode,
+    output: Option<PathBuf>,
+    cwd: PathBuf,
+    resumed: Resumed,
+    claim: SessionClaim,
+    mcp: Option<McpHandle>,
+    project_config: ProjectConfig,
+    initial_cost: Option<f64>,
+    config: AgentConfig,
+    timeouts: Timeouts,
+    prompt_slots: Arc<ResolvedPrompts>,
+    yolo: bool,
+    defaults: SessionDefaults,
+    model_policy: Arc<ModelPolicy>,
+    plugin_rules: Arc<PluginRuleStore>,
+    storage: StateDir,
+    background: bool,
 }
 
 struct Server {
@@ -139,6 +216,24 @@ struct Server {
     /// answers `resource_not_found` without touching peer runtimes. Prompt and
     /// event routing proof on top of this table is 02.2b.
     sessions: HashMap<String, SessionRuntime>,
+    /// Unactivated allocation leases, by session id. No prompt is accepted and
+    /// no provider/task starts while an id sits here; activation consumes the
+    /// entry, release and disconnect drop it (02.3).
+    allocations: HashMap<String, Allocation>,
+    /// Activations with slow startup in flight, by session id. The value is
+    /// the task handle so shutdown can abort a startup the loop will never
+    /// settle; presence is the exactly-once guard: the first completion takes
+    /// the entry and settles the activation result, a second completion for
+    /// the same id finds nothing and is dropped.
+    activating: HashMap<String, JoinHandle<()>>,
+    /// Slow half of activation (see [`ActivationStarter`]).
+    starter: ActivationStarter,
+    /// How a finished startup reports back to the loop, which settles the
+    /// activation result exactly once via [`settle_activation`]. Weak, like
+    /// model discovery: an activation task must never keep the loop alive
+    /// once stdin closes, so EOF still disconnects `in_rx` and the loop
+    /// exits promptly; the task's report then fails and its pieces drop.
+    completion: WeakSender<Incoming>,
     on_session_end: Option<SessionEndHook>,
 }
 
@@ -163,11 +258,26 @@ impl Server {
     fn respond(&self, id: RequestId, result: Result<AgentResponse, AcpError>) {
         send(&self.out_tx, Response::new(id, result));
     }
+
+    /// Answers an extension method, which has no schema response type: the
+    /// result is plain JSON (`methods::*_result`), the error the standard
+    /// shape. Used for allocate/activate/release only.
+    fn respond_value(&self, id: RequestId, result: Result<Value, AcpError>) {
+        send(&self.out_tx, Response::new(id, result));
+    }
 }
 
 enum Incoming {
     Line(String),
     Models(Vec<String>),
+    /// A dedicated activation task finished slow startup. The loop settles
+    /// the activation result exactly once from here; the task itself never
+    /// answers the client. Boxed: the runtime dwarfs the other variants.
+    ActivationDone {
+        key: String,
+        id: RequestId,
+        outcome: Box<ActivationResult>,
+    },
 }
 
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
@@ -184,16 +294,20 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
         sessions: HashMap::new(),
+        allocations: HashMap::new(),
+        activating: HashMap::new(),
+        starter: production_starter(),
+        completion: in_tx.downgrade(),
         on_session_end: params.on_session_end.clone(),
     };
 
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
     let reader_task = tokio::spawn(read_stdin(in_tx));
@@ -202,6 +316,11 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
+            // The only settlement site for activation: the first completion
+            // takes the in-flight entry and answers, a second finds nothing.
+            Incoming::ActivationDone { key, id, outcome } => {
+                settle_activation(&mut server, key, id, *outcome);
+            }
         }
     }
 
@@ -323,6 +442,29 @@ async fn handle_request(
     raw: &Value,
     params: &AcpParams,
 ) {
+    // Fork extension methods with schema-less results (`EXTENSION.md`).
+    // Allocate and release-of-allocation answer synchronously: neither does
+    // slow work. Activate validates synchronously and defers the result: the
+    // dedicated task settles it exactly once on completion, so slow provider
+    // and MCP startup never blocks this loop. Addressed cancel scoping is
+    // 02.9a, active-session (bounded) release is 02.10b; both keep answering
+    // -32601 until their slices land.
+    if method == extension::ALLOCATE_METHOD {
+        let result = handle_allocate(srv, raw, params);
+        srv.respond_value(id, result);
+        return;
+    }
+    if method == extension::ACTIVATE_METHOD {
+        if let Some(result) = handle_activate(srv, raw, &id, params) {
+            srv.respond_value(id, result);
+        }
+        return;
+    }
+    if method == extension::RELEASE_METHOD {
+        let result = handle_release(srv, raw);
+        srv.respond_value(id, result);
+        return;
+    }
     let result = match method {
         "initialize" => {
             srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
@@ -340,15 +482,9 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw),
         "session/set_config_option" => handle_set_config(srv, raw),
-        // Fork extension seams (`EXTENSION.md` is normative). Specified but not
-        // implemented on this slice: every probe answers -32601 "unsupported".
-        // Allocation-vs-activation ordering is 02.3, addressed cancel scoping
-        // is 02.9a, bounded release is 02.10b; reserved 04.1/05.2 names keep
-        // answering -32601 through the catch-all below.
-        m if m == extension::ALLOCATE_METHOD => Err(extension_seam(m, "02.3")),
-        m if m == extension::ACTIVATE_METHOD => Err(extension_seam(m, "02.3")),
+        // Reserved 04.1/05.2 names keep answering -32601 through the catch-all
+        // below, as do addressed cancel and active-session release.
         m if m == extension::CANCEL_METHOD => Err(extension_seam(m, "02.9a")),
-        m if m == extension::RELEASE_METHOD => Err(extension_seam(m, "02.10b")),
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -359,6 +495,305 @@ async fn handle_request(
 /// reporting "unsupported" until that slice lands.
 fn extension_seam(_method: &str, _owner: &str) -> AcpError {
     AcpError::method_not_found()
+}
+
+/// Production slow half of activation: resolve trust, start MCP, then spawn
+/// the runtime, all on a dedicated task. Infallible today (trust resolution
+/// cannot fail and MCP start degrades to `None`); the `Err` arm exists for
+/// the instrumented fixture and for fallible startup later.
+async fn production_start(mut input: ActivationInput) -> ActivationResult {
+    let project_config = trusted_project_config(
+        &input.spawn.cwd,
+        &input.spawn.storage,
+        input.trust_mode,
+        &input.trust_policy,
+    );
+    let mcp = start_mcp(&input.spawn.cwd, &[], project_config.clone()).await;
+    input.spawn.project_config = project_config;
+    input.spawn.mcp = mcp;
+    Ok(spawn_runtime(input.spawn).1)
+}
+
+fn production_starter() -> ActivationStarter {
+    Arc::new(|input| Box::pin(production_start(input)))
+}
+
+#[derive(Debug, Deserialize)]
+struct AllocateParams {
+    cwd: PathBuf,
+}
+
+/// Reserves an id with no provider spin-up and no task spawn. The storage
+/// claim is the lease: holding it keeps the id alive, dropping it releases
+/// it, and `SessionClaim::is_held` observes it. Fast path only, so this
+/// answers synchronously from the loop.
+fn handle_allocate(srv: &mut Server, raw: &Value, params: &AcpParams) -> Result<Value, AcpError> {
+    let req: AllocateParams = parse_params(raw)?;
+    if !req.cwd.is_absolute() || !req.cwd.is_dir() {
+        return Err(AcpError::invalid_params().data(serde_json::json!({
+            "reason": "invalid_cwd",
+            "cwd": req.cwd,
+        })));
+    }
+    let claim = SessionClaim::fresh(&params.storage);
+    let session_id = claim.id().to_string();
+    srv.allocations.insert(
+        session_id.clone(),
+        Allocation {
+            cwd: req.cwd,
+            claim,
+        },
+    );
+    Ok(methods::allocate_result(&session_id))
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivateParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    model: String,
+    mode: String,
+    cwd: PathBuf,
+    output: PathBuf,
+}
+
+fn already_active(session_id: &str) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": "already_active",
+        "sessionId": session_id,
+    }))
+}
+
+fn activation_in_progress(session_id: &str) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": "activation_in_progress",
+        "sessionId": session_id,
+    }))
+}
+
+fn not_activated(session_id: &str) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": "not_activated",
+        "sessionId": session_id,
+    }))
+}
+
+/// Binds an allocated id to the requested model, fixed mode/cwd/absolute
+/// output, and starts its task. Returns `None` when the activation left on a
+/// dedicated task: the loop stays responsive and the task's completion
+/// settles the result exactly once via [`settle_activation`]. Any addressed
+/// failure consumes the lease (the client allocates again to retry); an
+/// unparsable request never reaches the lease.
+#[allow(clippy::too_many_lines)]
+fn handle_activate(
+    srv: &mut Server,
+    raw: &Value,
+    id: &RequestId,
+    params: &AcpParams,
+) -> Option<Result<Value, AcpError>> {
+    let req: ActivateParams = match parse_params(raw) {
+        Ok(req) => req,
+        Err(e) => return Some(Err(e)),
+    };
+    if srv.sessions.contains_key(&req.session_id) {
+        return Some(Err(already_active(&req.session_id)));
+    }
+    if srv.activating.contains_key(&req.session_id) {
+        return Some(Err(activation_in_progress(&req.session_id)));
+    }
+    let allocation = match srv.allocations.remove(&req.session_id) {
+        Some(allocation) => allocation,
+        None => return Some(Err(unknown_session(&req.session_id))),
+    };
+    // The lease is claimed from here on: validating, starting, failing, or
+    // succeeding, the allocation entry is gone and the claim moves with the
+    // activation. Any failure below drops it through `release_lease`, success
+    // hands it to the runtime. No path leaks the claim or files two runtimes.
+    let key = req.session_id.clone();
+    let claim = allocation.claim;
+    let model = match Model::from_spec_with_policy(&req.model, &params.model_policy) {
+        Ok(model) => model,
+        Err(e) => {
+            let error = AcpError::invalid_params().data(serde_json::json!({
+                "reason": e.to_string(),
+                "model": req.model,
+            }));
+            release_lease(claim);
+            return Some(Err(error));
+        }
+    };
+    let mode = match req.mode.as_str() {
+        "build" => AgentMode::Build,
+        "plan" => AgentMode::Plan(req.output.clone()),
+        _ => {
+            let error = AcpError::invalid_params().data(serde_json::json!({
+                "reason": "invalid_mode",
+                "mode": req.mode,
+            }));
+            release_lease(claim);
+            return Some(Err(error));
+        }
+    };
+    if req.cwd != allocation.cwd {
+        let error = AcpError::invalid_params().data(serde_json::json!({
+            "reason": "cwd_mismatch",
+            "cwd": req.cwd,
+        }));
+        release_lease(claim);
+        return Some(Err(error));
+    }
+    if !req.output.is_absolute() {
+        let error = AcpError::invalid_params().data(serde_json::json!({
+            "reason": "output_must_be_absolute",
+            "output": req.output,
+        }));
+        release_lease(claim);
+        return Some(Err(error));
+    }
+    // The constructor never creates a default-provider session: the runtime
+    // below is built with the requested model directly, and the recorded
+    // current model is that same spec. There is no switch to observe.
+    //
+    // Upgraded while the loop is alive, which it is: the loop runs this
+    // handler. The task's clone dies with the task; the weak itself never
+    // keeps `in_rx` connected, so EOF still ends the loop promptly.
+    let Some(done_tx) = srv.completion.upgrade() else {
+        release_lease(claim);
+        return Some(Err(AcpError::internal_error().data(serde_json::json!({
+            "reason": "server shutting down",
+            "sessionId": key,
+        }))));
+    };
+    let session_ref = SessionRef::from(claim.id());
+    let input = ActivationInput {
+        spawn: SpawnCtx {
+            out_tx: srv.out_tx.clone(),
+            elicits_form: srv.client_elicits_form,
+            model,
+            mode: mode.clone(),
+            output: Some(req.output.clone()),
+            cwd: req.cwd.clone(),
+            resumed: Resumed::empty(session_ref),
+            claim,
+            mcp: None,
+            // Untrusted base: the activation task resolves trust against the
+            // store before spawning, exactly like the standard paths.
+            project_config: ProjectConfig::discover(&req.cwd),
+            initial_cost: None,
+            config: params.config.clone(),
+            timeouts: params.timeouts,
+            prompt_slots: Arc::clone(&params.prompt_slots),
+            yolo: params.yolo,
+            defaults: params.defaults,
+            model_policy: Arc::clone(&params.model_policy),
+            plugin_rules: Arc::clone(&params.plugin_rules),
+            storage: params.storage.clone(),
+            background: params.background,
+        },
+        trust_mode: params.trust_mode,
+        trust_policy: Arc::clone(&params.trust_policy),
+    };
+    let starter = Arc::clone(&srv.starter);
+    let id = id.clone();
+    // Filed before spawning so a racing completion settles exactly once, and
+    // so shutdown can abort a startup the loop will never settle.
+    srv.activating.insert(
+        key.clone(),
+        tokio::spawn(async move {
+            let outcome = starter(input).await;
+            let _ = done_tx.send(Incoming::ActivationDone {
+                key,
+                id,
+                outcome: Box::new(outcome),
+            });
+        }),
+    );
+    None
+}
+
+/// Settles an activation completion from the loop: the first completion for
+/// an in-flight id takes the entry and answers exactly once; any second
+/// completion for the same id finds nothing and is dropped, never answered
+/// twice. Success files the runtime and announces `active`; failure unwinds
+/// the claim and answers an honest terminal while the peer stays usable.
+fn settle_activation(srv: &mut Server, key: String, id: RequestId, outcome: ActivationResult) {
+    if srv.activating.remove(&key).is_none() {
+        warn!(session = %key, "dropping a duplicate activation completion");
+        return;
+    }
+    match outcome {
+        Ok(runtime) => {
+            debug_assert_eq!(key, runtime.handle.session_id.to_string());
+            // Every activated runtime carries the fixed output 03 reserves
+            // against; standard runtimes (None) never pass through here.
+            debug_assert!(runtime.output.is_some());
+            srv.sessions.insert(key.clone(), runtime);
+            maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(key.as_str()));
+            srv.respond_value(id, Ok(methods::activate_result(&key)));
+            send(
+                &srv.out_tx,
+                Notification {
+                    method: Arc::from(extension::LIFECYCLE_NOTIFICATION),
+                    params: Some(methods::lifecycle_active_params(&key)),
+                },
+            );
+        }
+        Err(failure) => {
+            release_lease(failure.claim);
+            srv.respond_value(
+                id,
+                Err(AcpError::internal_error().data(serde_json::json!({
+                    "reason": failure.reason,
+                    "sessionId": key,
+                }))),
+            );
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+/// Releases an unactivated allocation: the lease drops, the id is forgotten.
+/// Releasing an id with startup in flight is rejected (that race belongs to
+/// cancel scoping, 02.9a); releasing an active session is still the 02.10b
+/// seam; releasing anything else is `resource_not_found`.
+fn handle_release(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
+    let req: ReleaseParams = parse_params(raw)?;
+    if let Some(allocation) = srv.allocations.remove(&req.session_id) {
+        release_lease(allocation.claim);
+        return Ok(methods::release_allocation_result(&req.session_id));
+    }
+    if srv.activating.contains_key(&req.session_id) {
+        return Err(activation_in_progress(&req.session_id));
+    }
+    if srv.sessions.contains_key(&req.session_id) {
+        return Err(extension_seam(extension::RELEASE_METHOD, "02.10b"));
+    }
+    Err(unknown_session(&req.session_id))
+}
+
+/// Drops an allocation's storage claim, releasing the lease. The single
+/// ownership-transfer site for failed activation, explicit release of an
+/// unactivated allocation, and the disconnect sweep below, so no unwind path
+/// leaks a claim or files a second runtime. 02.10b's EOF sweep reuses this
+/// helper.
+fn release_lease(claim: SessionClaim) {
+    drop(claim);
+}
+
+/// Releases every unactivated lease. Runs wherever sessions close: end of
+/// input, stop, and `session/load` replacement, so a client that disappears
+/// without explicit failure leaves no lease behind. In-flight startups own
+/// their claims in their tasks: the completion send fails once the loop is
+/// gone and the pieces (claim included) drop with the task.
+fn close_all_allocations(srv: &mut Server) {
+    for (_, allocation) in srv.allocations.drain() {
+        release_lease(allocation.claim);
+    }
 }
 
 async fn new_session(
@@ -539,12 +974,46 @@ fn start_session(
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
 ) -> SessionRef {
+    let ctx = SpawnCtx {
+        out_tx: srv.out_tx.clone(),
+        elicits_form: srv.client_elicits_form,
+        model: params.model.clone(),
+        mode: AgentMode::Build,
+        output: None,
+        cwd,
+        resumed,
+        claim,
+        mcp,
+        project_config,
+        initial_cost,
+        config: params.config.clone(),
+        timeouts: params.timeouts,
+        prompt_slots: Arc::clone(&params.prompt_slots),
+        yolo: params.yolo,
+        defaults: params.defaults,
+        model_policy: Arc::clone(&params.model_policy),
+        plugin_rules: Arc::clone(&params.plugin_rules),
+        storage: params.storage.clone(),
+        background: params.background,
+    };
+    let (session_ref, runtime) = spawn_runtime(ctx);
+    srv.sessions
+        .insert(session_ref.as_str().to_owned(), runtime);
+    session_ref
+}
+
+/// Builds a session runtime: agent task plus its own event pump. Used by the
+/// standard paths on the loop and by activation on its dedicated task; both
+/// file the finished runtime the same way, so activation constructs the
+/// requested model directly instead of starting a default session and
+/// switching it.
+fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
     // plain text instead.
-    let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&pending));
+    let (excluded_tools, local_tools) = if ctx.elicits_form {
+        let tool = question_tool(ctx.out_tx.downgrade(), Arc::clone(&pending));
         let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
         (Vec::new(), map)
     } else {
@@ -553,32 +1022,32 @@ fn start_session(
     // The ACP process cwd owns env, Lua, and application config, but the client
     // picks the session cwd. So permissions, where a saved answer lands, and
     // MCP config all follow the session's project, not ours.
-    let project_trusted = project_config.is_trusted();
-    let permissions_config = maki_config::load_permissions(&project_config);
+    let project_trusted = ctx.project_config.is_trusted();
+    let permissions_config = maki_config::load_permissions(&ctx.project_config);
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
-        model: params.model.clone(),
-        config: params.config.clone(),
+        model: ctx.model.clone(),
+        config: ctx.config,
         permissions_config,
-        timeouts: params.timeouts,
-        prompt_slots: Arc::clone(&params.prompt_slots),
+        timeouts: ctx.timeouts,
+        prompt_slots: ctx.prompt_slots,
         excluded_tools,
-        mcp_handle: mcp.clone(),
-        initial_wd: cwd.clone(),
-        resumed,
-        claim: claim.clone(),
-        storage: params.storage.clone(),
-        yolo: params.yolo,
+        mcp_handle: ctx.mcp.clone(),
+        initial_wd: ctx.cwd.clone(),
+        resumed: ctx.resumed,
+        claim: ctx.claim.clone(),
+        storage: ctx.storage,
+        yolo: ctx.yolo,
         unattended: false,
         system_prompt_override: None,
         append_system_prompt: None,
-        defaults: params.defaults,
-        model_policy: Arc::clone(&params.model_policy),
-        plugin_rules: Arc::clone(&params.plugin_rules),
-        project_config,
+        defaults: ctx.defaults,
+        model_policy: ctx.model_policy,
+        plugin_rules: ctx.plugin_rules,
+        project_config: ctx.project_config,
         local_tools,
         // Results ride the next prompt. The client never asked for a turn,
         // so nothing wakes one.
-        background: background_mode(params.background),
+        background: background_mode(ctx.background),
         // `close_all_sessions` ends it, on a stop as on end of input.
         stop: CancelToken::none(),
     });
@@ -590,26 +1059,24 @@ fn start_session(
     let pump = start_event_pump(
         events,
         session_ref.clone(),
-        srv.out_tx.clone(),
+        ctx.out_tx,
         Arc::clone(&pending),
-        cwd,
+        ctx.cwd,
         maki_storage::paths::home(),
         project_trusted,
-        initial_cost,
+        ctx.initial_cost,
     );
-    srv.sessions.insert(
-        session_ref.as_str().to_owned(),
-        SessionRuntime {
-            handle,
-            mcp,
-            current_mode: AgentMode::Build,
-            current_model: params.model.spec(),
-            pending,
-            claim,
-            pump,
-        },
-    );
-    session_ref
+    let runtime = SessionRuntime {
+        handle,
+        mcp: ctx.mcp,
+        current_mode: ctx.mode,
+        current_model: ctx.model.spec(),
+        output: ctx.output,
+        pending,
+        claim: ctx.claim,
+        pump,
+    };
+    (session_ref, runtime)
 }
 
 /// `false` is a zero `--background-timeout`: no seed is published, so no
@@ -803,6 +1270,16 @@ async fn close_one_session(srv: &mut Server, key: &str, reason: SessionEndReason
 /// shutdown path, not steady-state serialization: live pumps never wait on
 /// each other.
 async fn close_all_sessions(srv: &mut Server, reason: SessionEndReason) {
+    // Unactivated leases release first: a client that disappeared without
+    // explicit failure leaves nothing behind. In-flight startups are aborted
+    // next: their completions can never be settled once the loop is gone, and
+    // each owns its claim in its task, so aborting drops the lease with the
+    // pieces. Only then do the runtimes drain.
+    close_all_allocations(srv);
+    for (_, task) in srv.activating.drain() {
+        task.abort();
+        let _ = task.await;
+    }
     // Drained up front so one slow teardown cannot strand a peer runtime.
     let runtimes: Vec<SessionRuntime> = std::mem::take(&mut srv.sessions).into_values().collect();
     for state in runtimes {
@@ -896,6 +1373,14 @@ impl From<StoredSession> for Restored {
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
+    // An unactivated allocation holds no provider and no task: the prompt is
+    // rejected before anything is queued or started, and neither the lease
+    // nor any peer is touched.
+    if srv.allocations.contains_key(&*req.session_id.0)
+        || srv.activating.contains_key(&*req.session_id.0)
+    {
+        return Err(not_activated(&req.session_id.0));
+    }
     // Addressed to the request's own session; no current-session fallback. An
     // unknown id rejects here, before anything is queued or any peer is
     // touched; duplicate and cross-session rejection keep the same shape.
@@ -948,6 +1433,15 @@ fn fixed_at_activation() -> AcpError {
 
 fn handle_set_mode(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
+    // An unactivated allocation has no fixed setup yet: the change is
+    // rejected as not-activated, not applied, and the lease is untouched.
+    // Routing still comes first, so an unknown session answers
+    // `resource_not_found`.
+    if srv.allocations.contains_key(&*req.session_id.0)
+        || srv.activating.contains_key(&*req.session_id.0)
+    {
+        return Err(not_activated(&req.session_id.0));
+    }
     let session = srv.session(&req.session_id)?;
     debug!(
         session = %req.session_id.0,
@@ -960,6 +1454,13 @@ fn handle_set_mode(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError>
 
 fn handle_set_config(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
+    // Same lease rule as `handle_set_mode`: no fixed setup exists before
+    // activation, so the change is rejected without touching the lease.
+    if srv.allocations.contains_key(&*req.session_id.0)
+        || srv.activating.contains_key(&*req.session_id.0)
+    {
+        return Err(not_activated(&req.session_id.0));
+    }
     let session = srv.session(&req.session_id)?;
     debug!(
         session = %req.session_id.0,
@@ -983,7 +1484,9 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
             };
             // Asks stay: a call moved to the background outlives the turn
             // and may be parked on one, and a stale answer is tagged, so
-            // whoever waits next drops it.
+            // whoever waits next drops it. An unactivated allocation or an
+            // unknown id names no run to signal, so the notification is
+            // dropped the same way.
             if let Ok(session) = srv.session(&note.session_id) {
                 let _ = session.handle.cancel_tx.try_send(());
             }
@@ -1354,9 +1857,11 @@ mod tests {
     use maki_storage::sessions::{Session, StoredTokenUsage};
     use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use std::future;
+    use std::sync::atomic::AtomicBool;
 
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
     use tokio_util::task::AbortOnDropHandle;
 
@@ -1607,6 +2112,7 @@ mod tests {
             mcp: None,
             current_mode: AgentMode::Build,
             current_model: String::new(),
+            output: None,
             pending: Arc::default(),
             claim,
             pump: tokio::spawn(async {}),
@@ -1620,6 +2126,9 @@ mod tests {
         let (key, mut runtime) = fixture_runtime();
         // The answer channel under test is this runtime's own.
         runtime.handle.answer_tx = answer_tx;
+        // Dangled: single-session fixtures never activate, and nothing here
+        // upgrades the weak, so the dead link is never observed.
+        let (completion_tx, _completion_rx) = flume::unbounded();
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
@@ -1627,6 +2136,10 @@ mod tests {
             defaults: SessionDefaults::default(),
             on_session_end: None,
             sessions: HashMap::from([(key, runtime)]),
+            allocations: HashMap::new(),
+            activating: HashMap::new(),
+            starter: fixture_starter(&StarterHarness::default()),
+            completion: completion_tx.downgrade(),
         };
         (server, answer_rx, out_rx)
     }
@@ -3312,6 +3825,777 @@ mod tests {
             stdio.environment.get("TOKEN").map(String::as_str),
             Some("t")
         );
+    }
+
+    /// 02.3 allocation/activation: lease ownership, initial model selection,
+    /// pre-activation startup failure, and loop responsiveness under held
+    /// startup. The starter is instrumented: it records the model each
+    /// activation was constructed with (the session's very first provider
+    /// connection), and per test it can hold startup on a gate or fail it.
+    /// No prompt is ever sent in these fixtures, so nothing reaches a
+    /// provider: no keys, no network.
+    #[derive(Clone, Default)]
+    struct StarterHarness {
+        /// `(session_key, model_spec)` in construction order.
+        started: Arc<Mutex<Vec<(String, String)>>>,
+        /// Live input receivers, one per constructed stub: kept so an
+        /// accepted prompt has somewhere to send.
+        inputs: Arc<Mutex<Vec<flume::Receiver<AgentInput>>>>,
+        /// Live cancel receivers, one per constructed stub: `session/cancel`
+        /// dispatch is observed here.
+        cancels: Arc<Mutex<Vec<flume::Receiver<()>>>>,
+        /// When set, the starter parks on `gate` before constructing.
+        hold: Arc<AtomicBool>,
+        gate: Arc<Notify>,
+        /// When set, the starter fails with this reason instead of building.
+        fail: Arc<Mutex<Option<String>>>,
+    }
+
+    /// Fixture slow half of activation: records the requested model, then
+    /// answers with a stub runtime (or a held/failed outcome). The stub
+    /// carries the requested model/mode/output directly: no default-provider
+    /// session is ever built, so there is nothing to switch.
+    fn fixture_starter(harness: &StarterHarness) -> ActivationStarter {
+        let harness = harness.clone();
+        Arc::new(
+            move |input: ActivationInput| -> BoxFuture<'static, ActivationResult> {
+                let harness = harness.clone();
+                Box::pin(async move {
+                    if harness.hold.load(Ordering::SeqCst) {
+                        harness.gate.notified().await;
+                    }
+                    let spec = input.spawn.model.spec();
+                    harness
+                        .started
+                        .lock()
+                        .unwrap()
+                        .push((input.spawn.claim.id().to_string(), spec.clone()));
+                    if let Some(reason) = harness.fail.lock().unwrap().clone() {
+                        return Err(ActivationFailure {
+                            claim: input.spawn.claim,
+                            reason,
+                        });
+                    }
+                    let (input_tx, input_rx) = flume::unbounded();
+                    let (cancel_tx, cancel_rx) = flume::unbounded();
+                    harness.inputs.lock().unwrap().push(input_rx);
+                    harness.cancels.lock().unwrap().push(cancel_rx);
+                    let handle = InteractiveHandle {
+                        tool_names: Vec::new(),
+                        input_tx,
+                        answer_tx: flume::unbounded().0,
+                        cancel_tx,
+                        model_tx: flume::unbounded().0,
+                        mode_tx: flume::unbounded().0,
+                        session_id: SessionRef::from(input.spawn.claim.id()),
+                        permissions: Arc::new(PermissionManager::new(
+                            maki_config::PermissionsConfig::default(),
+                            PathBuf::from("/project"),
+                            ProjectConfig::for_project(Path::new("/project")),
+                            Arc::default(),
+                        )),
+                        task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
+                        spend: Arc::default(),
+                    };
+                    Ok(SessionRuntime {
+                        handle,
+                        mcp: None,
+                        current_mode: input.spawn.mode.clone(),
+                        current_model: spec,
+                        output: input.spawn.output.clone(),
+                        pending: Arc::default(),
+                        claim: input.spawn.claim,
+                        pump: tokio::spawn(async {}),
+                    })
+                })
+            },
+        )
+    }
+
+    fn server_with_harness(
+        harness: &StarterHarness,
+    ) -> (
+        Server,
+        flume::Receiver<Value>,
+        flume::Receiver<Incoming>,
+        // Keepalive: the server holds only a weak completion link (so tests
+        // never inherit the loop-liveness deadlock), and the weak upgrades
+        // only while this sender lives.
+        flume::Sender<Incoming>,
+    ) {
+        let (out_tx, out_rx) = flume::unbounded();
+        let (completion_tx, completion_rx) = flume::unbounded();
+        let server = Server {
+            out_tx,
+            model_specs: Vec::new(),
+            client_elicits_form: false,
+            defaults: SessionDefaults::default(),
+            on_session_end: None,
+            sessions: HashMap::new(),
+            allocations: HashMap::new(),
+            activating: HashMap::new(),
+            starter: fixture_starter(harness),
+            completion: completion_tx.downgrade(),
+        };
+        (server, out_rx, completion_rx, completion_tx)
+    }
+
+    fn allocate_request(cwd: &str) -> Value {
+        serde_json::json!({ "params": { "cwd": cwd } })
+    }
+
+    fn activate_request(session: &str, model: &str, mode: &str, cwd: &str, output: &str) -> Value {
+        serde_json::json!({
+            "params": {
+                "sessionId": session,
+                "model": model,
+                "mode": mode,
+                "cwd": cwd,
+                "output": output,
+            }
+        })
+    }
+
+    /// Next completion from an activation task, with the deadlock bound. A
+    /// timeout here is the loop blocked on slow startup.
+    async fn next_completion(
+        rx: &flume::Receiver<Incoming>,
+    ) -> (String, RequestId, ActivationResult) {
+        let incoming = timeout(STDIN_DEADLOCK_TIMEOUT, rx.recv_async())
+            .await
+            .expect("an activation task must report back without the loop")
+            .expect("the completion channel stays open");
+        match incoming {
+            Incoming::ActivationDone { key, id, outcome } => (key, id, *outcome),
+            // No model discovery runs in these fixtures, so any other
+            // variant is a bug in the test, not timing.
+            _ => panic!("expected an activation completion"),
+        }
+    }
+
+    /// Allocate through the real dispatch and read the leased id.
+    async fn allocate_id(
+        srv: &mut Server,
+        out_rx: &flume::Receiver<Value>,
+        params: &AcpParams,
+        cwd: &std::path::Path,
+        id: RequestId,
+    ) -> String {
+        handle_request(
+            srv,
+            extension::ALLOCATE_METHOD,
+            id.clone(),
+            &allocate_request(&cwd.to_string_lossy()),
+            params,
+        )
+        .await;
+        let reply = out_rx.try_recv().expect("allocate answers synchronously");
+        assert_eq!(reply["id"], serde_json::to_value(&id).unwrap());
+        assert_eq!(reply["result"]["turnEpoch"], 0);
+        reply["result"]["sessionId"]
+            .as_str()
+            .expect("a leased id")
+            .to_owned()
+    }
+
+    /// Rewire a fixture runtime's channels to live ones, so prompts and
+    /// cancels addressed to it are observable. Returns the receivers.
+    fn rewire_live(
+        runtime: &mut SessionRuntime,
+    ) -> (flume::Receiver<AgentInput>, flume::Receiver<()>) {
+        let (input_tx, input_rx) = flume::unbounded();
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        runtime.handle.input_tx = input_tx;
+        runtime.handle.cancel_tx = cancel_tx;
+        (input_rx, cancel_rx)
+    }
+
+    /// Allocate reserves an (id, cwd) lease with no provider and no task: the
+    /// claim is held, nothing was constructed, and the sessions table is
+    /// untouched.
+    #[tokio::test]
+    async fn allocate_reserves_a_lease_without_provider_or_task() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+
+        assert!(srv.sessions.is_empty(), "allocation spawns no runtime");
+        assert!(
+            harness.started.lock().unwrap().is_empty(),
+            "allocation constructs no provider"
+        );
+        let id: MakiId = session.parse().expect("a Maki id");
+        assert!(
+            SessionClaim::is_held(id, &storage),
+            "the allocation holds its storage lease"
+        );
+    }
+
+    #[test_case("relative/project" ; "a_relative_cwd")]
+    #[tokio::test]
+    async fn allocate_rejects_a_cwd_that_is_not_an_absolute_directory(relative: &str) {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let params = acp_params(storage);
+
+        handle_request(
+            &mut srv,
+            extension::ALLOCATE_METHOD,
+            RequestId::Number(1),
+            &allocate_request(relative),
+            &params,
+        )
+        .await;
+        let reply = out_rx.try_recv().expect("allocate answers synchronously");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["data"]["reason"], "invalid_cwd");
+        assert!(
+            srv.allocations.is_empty(),
+            "a rejected allocate leases nothing"
+        );
+    }
+
+    /// A prompt, mode change, or config change naming an unactivated
+    /// allocation is rejected before anything starts: no provider is
+    /// constructed, no task spawns, and the lease is untouched.
+    #[tokio::test]
+    async fn operations_on_an_unactivated_allocation_reject_without_starting_anything() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&session, "hello"),
+            &RequestId::Number(2),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::invalid_params().code);
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!({"reason": "not_activated", "sessionId": session}))
+        );
+        for raw in [mode_request(&session, "plan"), config_request(&session)] {
+            let err = if raw["params"].get("modeId").is_some() {
+                handle_set_mode(&srv, &raw).unwrap_err()
+            } else {
+                handle_set_config(&srv, &raw).unwrap_err()
+            };
+            assert_eq!(
+                err.data,
+                Some(serde_json::json!({"reason": "not_activated", "sessionId": session}))
+            );
+        }
+
+        assert!(
+            harness.started.lock().unwrap().is_empty(),
+            "a rejected prompt constructs no provider"
+        );
+        assert!(srv.sessions.is_empty(), "a rejected prompt spawns no task");
+        let id: MakiId = session.parse().unwrap();
+        assert!(
+            SessionClaim::is_held(id, &storage),
+            "rejected operations keep the lease"
+        );
+        assert!(out_rx.is_empty(), "rejections emit no session updates");
+    }
+
+    /// Activation constructs each session with its requested model directly:
+    /// the starter log (construction order) names each requested spec once,
+    /// each runtime files that same spec, and the default `params.model` is
+    /// never constructed unless requested.
+    #[tokio::test]
+    async fn activation_constructs_each_session_with_its_requested_model() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let projects = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let params = acp_params(storage);
+        let specs = ["openai/gpt-5", "openai/gpt-5.6-sol"];
+        assert_ne!(specs[0], specs[1]);
+
+        let mut sessions = Vec::new();
+        for (n, project) in projects.iter().enumerate() {
+            sessions.push((
+                specs[n].to_owned(),
+                allocate_id(
+                    &mut srv,
+                    &out_rx,
+                    &params,
+                    project.path(),
+                    RequestId::Number(n as i64 + 1),
+                )
+                .await,
+            ));
+        }
+        for (n, ((spec, session), project)) in sessions.iter().zip(projects.iter()).enumerate() {
+            let output = project.path().join("plan.md");
+            handle_request(
+                &mut srv,
+                extension::ACTIVATE_METHOD,
+                RequestId::Number(n as i64 + 10),
+                &activate_request(
+                    session,
+                    spec,
+                    "build",
+                    &project.path().to_string_lossy(),
+                    &output.to_string_lossy(),
+                ),
+                &params,
+            )
+            .await;
+        }
+        // Completions can land in any order; each is settled under its own
+        // key, and each runtime must file the model its own session asked for.
+        let expected: HashMap<&str, &str> = sessions
+            .iter()
+            .map(|(spec, session)| (session.as_str(), spec.as_str()))
+            .collect();
+        for _ in 0..sessions.len() {
+            let (key, id, outcome) = next_completion(&completion_rx).await;
+            settle_activation(&mut srv, key.clone(), id, outcome);
+            let reply = out_rx.try_recv().expect("activation settles its result");
+            assert_eq!(reply["result"]["sessionId"], key);
+            assert_eq!(reply["result"]["turnEpoch"], 0);
+            let lifecycle = out_rx.try_recv().expect("activation announces active");
+            assert_eq!(lifecycle["method"], extension::LIFECYCLE_NOTIFICATION);
+            assert_eq!(lifecycle["params"]["sessionId"], key);
+            assert_eq!(lifecycle["params"]["state"], "active");
+            assert_eq!(lifecycle["params"]["turnEpoch"], 0);
+            assert_eq!(lifecycle["params"]["usable"], true);
+            let runtime = srv.sessions.get(&key).expect("the runtime is filed");
+            assert_eq!(&runtime.current_model, expected[&key.as_str()]);
+            assert_eq!(runtime.current_mode, AgentMode::Build);
+            assert!(runtime.output.is_some(), "activation fixes the output");
+        }
+
+        let started = harness.started.lock().unwrap().clone();
+        assert_eq!(
+            started
+                .iter()
+                .map(|(_, spec)| spec.as_str())
+                .collect::<Vec<_>>(),
+            specs,
+            "each session is constructed once, with its requested model"
+        );
+        assert_eq!(srv.allocations.len(), 0, "activation consumes the lease");
+        assert!(
+            srv.activating.is_empty(),
+            "settling clears the in-flight entry"
+        );
+    }
+
+    /// An activation that fails fast (unparsable or disallowed model, bad
+    /// mode, mismatched cwd, relative output) consumes its lease and answers
+    /// without starting anything: the id is unknown afterwards, and no task
+    /// or provider was ever constructed.
+    #[tokio::test]
+    async fn failed_activation_releases_the_lease_before_answering() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        let cwd = project.path().to_string_lossy().into_owned();
+
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let output = project
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let bad_model = activate_request(&session, "nope/not-a-provider", "build", &cwd, &output);
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(2),
+            &bad_model,
+            &params,
+        )
+        .await;
+        let reply = out_rx.try_recv().expect("a fast failure answers at once");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert_eq!(reply["error"]["data"]["model"], "nope/not-a-provider");
+
+        assert!(srv.allocations.is_empty(), "the failure consumes the lease");
+        assert!(srv.activating.is_empty(), "no startup ever left the loop");
+        assert!(srv.sessions.is_empty(), "no runtime is filed");
+        assert!(
+            harness.started.lock().unwrap().is_empty(),
+            "validation runs before any construction"
+        );
+        let id: MakiId = session.parse().unwrap();
+        assert!(!SessionClaim::is_held(id, &storage), "the claim is dropped");
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&session, "hello"),
+            &RequestId::Number(3),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::resource_not_found(None).code);
+    }
+
+    #[test_case("build", "openai/gpt-5", "plan.md", "relative/output.md" ; "relative_output")]
+    #[test_case("build", "openai/gpt-5", "elsewhere", "plan.md" ; "mismatched_cwd")]
+    #[test_case("write", "openai/gpt-5", "plan.md", "plan.md" ; "unknown_mode")]
+    #[tokio::test]
+    async fn activation_validates_mode_cwd_and_output(
+        mode: &str,
+        model: &str,
+        cwd_leaf: &str,
+        output_leaf: &str,
+    ) {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let cwd = if cwd_leaf == "elsewhere" {
+            elsewhere.path().to_string_lossy().into_owned()
+        } else {
+            project.path().to_string_lossy().into_owned()
+        };
+        let output = if output_leaf == "relative/output.md" {
+            output_leaf.to_owned()
+        } else {
+            project
+                .path()
+                .join(output_leaf)
+                .to_string_lossy()
+                .into_owned()
+        };
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(2),
+            &activate_request(&session, model, mode, &cwd, &output),
+            &params,
+        )
+        .await;
+        let reply = out_rx.try_recv().expect("a fast failure answers at once");
+        assert_eq!(reply["error"]["code"], -32602);
+        assert!(srv.allocations.is_empty(), "the failure consumes the lease");
+        let id: MakiId = session.parse().unwrap();
+        assert!(!SessionClaim::is_held(id, &storage), "the claim is dropped");
+    }
+
+    /// Pre-activation half of the handoff test: slow startup fails before the
+    /// activation result settles it once, and settling the same completion
+    /// again answers nothing. The failure is confined to its session: the
+    /// peer runtime is untouched and still routes prompts. Post-activation
+    /// loss belongs to 02.10a and is not built here.
+    #[tokio::test]
+    async fn slow_startup_failure_settles_once_and_leaves_the_peer_usable() {
+        let harness = StarterHarness::default();
+        harness
+            .fail
+            .lock()
+            .unwrap()
+            .replace("provider exploded".to_owned());
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        // A live peer runtime with observable channels.
+        let (peer_key, mut peer) = fixture_runtime();
+        let (_peer_input, _peer_cancel) = rewire_live(&mut peer);
+        srv.sessions.insert(peer_key, peer);
+
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let output = project
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = project.path().to_string_lossy().into_owned();
+        let request_id = RequestId::Number(2);
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            request_id.clone(),
+            &activate_request(&session, "openai/gpt-5", "build", &cwd, &output),
+            &params,
+        )
+        .await;
+        assert!(
+            out_rx.is_empty(),
+            "slow startup answers nothing synchronously"
+        );
+
+        let (key, id, outcome) = next_completion(&completion_rx).await;
+        assert_eq!(key, session);
+        let outcome2 = match &outcome {
+            Err(failure) => Err(ActivationFailure {
+                claim: failure.claim.clone(),
+                reason: failure.reason.clone(),
+            }),
+            Ok(_) => panic!("the starter was armed to fail"),
+        };
+        settle_activation(&mut srv, key.clone(), id.clone(), outcome);
+        let reply = out_rx.try_recv().expect("the failure settles the result");
+        assert_eq!(reply["id"], serde_json::to_value(&id).unwrap());
+        assert_eq!(reply["error"]["code"], -32603);
+        assert_eq!(reply["error"]["data"]["reason"], "provider exploded");
+        assert_eq!(reply["error"]["data"]["sessionId"], session);
+
+        // The pre-activation half of the handoff: settling the same
+        // completion again must not answer a second time.
+        settle_activation(&mut srv, key, id, outcome2);
+        assert!(out_rx.is_empty(), "a second settle answers nothing");
+
+        assert_eq!(srv.sessions.len(), 1, "the failure files no runtime");
+        // The peer runtime is untouched: its prompt still routes.
+        let peer_key = srv.sessions.keys().next().unwrap().clone();
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&peer_key, "hello"),
+            &RequestId::Number(3),
+        )
+        .unwrap();
+        let failed_id: MakiId = session.parse().unwrap();
+        assert!(
+            !SessionClaim::is_held(failed_id, &storage),
+            "the failed lease is dropped"
+        );
+    }
+
+    /// Slow startup parks on a gate while the loop keeps routing: a peer
+    /// cancel dispatches and a peer prompt routes before the held activation
+    /// completes. Full permission-answer routing is 02.8; this proves the
+    /// dispatch path never waits on startup.
+    #[tokio::test]
+    async fn held_startup_leaves_peer_cancel_routing_responsive() {
+        let harness = StarterHarness::default();
+        harness.hold.store(true, Ordering::SeqCst);
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage);
+        let (peer_key, mut peer) = fixture_runtime();
+        let (_peer_input, peer_cancel) = rewire_live(&mut peer);
+        srv.sessions.insert(peer_key.clone(), peer);
+
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let output = project
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = project.path().to_string_lossy().into_owned();
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(2),
+            &activate_request(&session, "openai/gpt-5", "build", &cwd, &output),
+            &params,
+        )
+        .await;
+        assert!(out_rx.is_empty(), "held startup answers nothing yet");
+
+        // The peer stays routable while the activation task is parked: its
+        // cancel dispatches and its prompt is accepted, both bounded by the
+        // deadlock timeout rather than by the held gate.
+        handle_notification(
+            &srv,
+            "session/cancel",
+            &serde_json::json!({ "params": { "sessionId": peer_key } }),
+        );
+        timeout(STDIN_DEADLOCK_TIMEOUT, peer_cancel.recv_async())
+            .await
+            .expect("peer cancel routes while startup is held")
+            .expect("the cancel channel stays open");
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&peer_key, "hello"),
+            &RequestId::Number(3),
+        )
+        .unwrap();
+
+        harness.gate.notify_one();
+        let (key, id, outcome) = next_completion(&completion_rx).await;
+        settle_activation(&mut srv, key.clone(), id, outcome);
+        let reply = out_rx
+            .try_recv()
+            .expect("releasing the gate settles the result");
+        assert_eq!(reply["result"]["sessionId"], session);
+        let lifecycle = out_rx.try_recv().expect("activation announces active");
+        assert_eq!(lifecycle["params"]["state"], "active");
+        assert!(srv.sessions.contains_key(&session));
+    }
+
+    /// A client that disappears without explicit failure leaves leases this
+    /// slice releases on disconnect: the sweep drops every unactivated claim
+    /// and aborts every in-flight startup, and the ids are unknown afterwards.
+    #[tokio::test]
+    async fn disconnect_releases_abandoned_allocations() {
+        let harness = StarterHarness::default();
+        harness.hold.store(true, Ordering::SeqCst);
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let projects = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let params = acp_params(storage.clone());
+
+        let mut sessions = Vec::new();
+        for (n, project) in projects.iter().enumerate() {
+            sessions.push(
+                allocate_id(
+                    &mut srv,
+                    &out_rx,
+                    &params,
+                    project.path(),
+                    RequestId::Number(n as i64 + 1),
+                )
+                .await,
+            );
+        }
+        // One activation in flight, parked on the gate.
+        let output = projects[0]
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = projects[0].path().to_string_lossy().into_owned();
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(10),
+            &activate_request(&sessions[0], "openai/gpt-5", "build", &cwd, &output),
+            &params,
+        )
+        .await;
+        assert_eq!(srv.activating.len(), 1);
+
+        close_all_sessions(&mut srv, SessionEndReason::Shutdown).await;
+
+        assert!(srv.allocations.is_empty(), "the sweep drops every lease");
+        assert!(srv.activating.is_empty(), "in-flight startup is aborted");
+        for session in &sessions {
+            let id: MakiId = session.parse().unwrap();
+            assert!(
+                !SessionClaim::is_held(id, &storage),
+                "no claim survives disconnect"
+            );
+            let err = handle_prompt(
+                &mut srv,
+                &prompt_request(session, "hello"),
+                &RequestId::Number(20),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        }
+    }
+
+    /// Explicit release forgets an unactivated allocation: the lease drops and
+    /// the id is unknown afterwards. Active sessions stay the 02.10b seam.
+    #[tokio::test]
+    async fn release_forgets_an_unactivated_allocation() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage.clone());
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+
+        let raw = serde_json::json!({ "params": { "sessionId": session } });
+        let result = handle_release(&mut srv, &raw).unwrap();
+        assert_eq!(result["released"], true);
+        assert_eq!(result["sessionId"], session);
+        assert_eq!(result["turnEpoch"], 0);
+        let id: MakiId = session.parse().unwrap();
+        assert!(
+            !SessionClaim::is_held(id, &storage),
+            "release drops the lease"
+        );
+
+        let repeat = handle_release(&mut srv, &raw).unwrap_err();
+        assert_eq!(repeat.code, AcpError::resource_not_found(None).code);
+        assert_eq!(repeat.data, Some(serde_json::json!({"sessionId": session})));
+        let unknown =
+            serde_json::json!({ "params": { "sessionId": MakiId::generate().to_string() } });
+        assert_eq!(
+            handle_release(&mut srv, &unknown).unwrap_err().code,
+            AcpError::resource_not_found(None).code
+        );
+    }
+
+    /// Releasing an active session is not the lease release above: bounded
+    /// teardown is 02.10b's, so the method keeps answering -32601 there.
+    #[tokio::test]
+    async fn release_of_an_active_session_stays_the_02_10b_seam() {
+        let (mut srv, ..) = test_server();
+        let key = session_key(&srv);
+        let raw = serde_json::json!({ "params": { "sessionId": key } });
+        let err = handle_release(&mut srv, &raw).unwrap_err();
+        assert_eq!(err.code, AcpError::method_not_found().code);
     }
 }
 

@@ -14,8 +14,9 @@
 //! - post-activation model/mode changes route, then reject with
 //!   `fixed_at_activation`, leaving the fixed setup and the peer alone;
 //! - an idle session stays usable after a cancel dispatch and a rejection;
-//! - the extension runtime seams still answer -32601 (02.3/02.9a/02.10b own
-//!   them; see also `extension_runtime_seams_still_reject_clearly`).
+//! - the extension runtime seams stay -32601 (addressed cancel is 02.9a,
+//!   release is 02.10b; allocate/activate moved out of this list in 02.3,
+//!   see also `extension_runtime_seams_still_reject_clearly`).
 //!
 //! Every wait is a read-until-match with the frame bound, never a sleep:
 //! correlation itself is the interleaving proof, since peer traffic buffers
@@ -183,24 +184,18 @@ async fn post_activation_changes_route_then_reject() {
         assert_fixed(&mode, session);
     }
 
-    // The runtime seams stay specified-but-unimplemented: 02.3/02.9a/02.10b
-    // own them, and routing must not have started answering them.
-    for method in [
-        extension::ALLOCATE_METHOD,
-        extension::ACTIVATE_METHOD,
-        extension::CANCEL_METHOD,
-        extension::RELEASE_METHOD,
-    ] {
-        let reply = shared.child.probe_unsupported(method).await.unwrap();
-        assert_eq!(
-            reply["error"]["code"], -32601,
-            "{method} must reject as unknown, got: {reply}"
-        );
-        assert!(
-            reply.get("result").is_none(),
-            "{method} must not answer success: {reply}"
-        );
-    }
+    // The runtime seams stay specified-but-unimplemented: addressed cancel
+    // is 02.9a and active-session release is 02.10b, and routing must not
+    // have started answering them. Allocate/activate implement in 02.3 (a
+    // bare probe of release fails param parsing first; see
+    // `extension_contract.rs` and `allocation_activation.rs`).
+    let cancel = shared
+        .child
+        .probe_unsupported(extension::CANCEL_METHOD)
+        .await
+        .unwrap();
+    assert_eq!(cancel["error"]["code"], -32601, "{cancel}");
+    assert!(cancel.get("result").is_none());
 
     shared.shutdown().await.unwrap();
 }
