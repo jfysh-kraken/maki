@@ -8,10 +8,14 @@ server answered every `_maki/` method with `-32601 Method not found`; slice
 `server.rs` tests and `tests/allocation_activation.rs`), slice 02.7 wired
 terminal reasons, slice 02.8 wired concurrent permission routing
 (several outstanding asks under globally unique ids, task delivery,
-blocking-mode terminal retirement), and slice 02.9a wires addressed turn
+blocking-mode terminal retirement), slice 02.9a wired addressed turn
 cancellation (exactly-once settlement through the turn epoch, retirement of
 the cancelled turn's asks in both modes, `cleanup_unconfirmed` retry gating;
-fixtures in `server.rs` tests). Ask retirement on the handle-loss (02.10a)
+fixtures in `server.rs` tests), and slice 02.9b wires cleanup confirmation
+and retry (the cancelled run's terminal confirms in blocking mode, failure
+or a lapsed bounded wait reports explicitly non-resumable uncertainty;
+fixtures in `server.rs` tests, escaped-child limitations recorded in
+`tests/cleanup_probes.rs`). Ask retirement on the handle-loss (02.10a)
 path is downstream debt, not built here. Active-session release (02.10b)
 still answers `-32601`, as do the reserved 04.1 and 05.2 names. This document
 stays normative; the one deliberate delta is the advertised method list: the
@@ -204,9 +208,9 @@ standard `PromptResponse.stopReason` keeps its standard values; `rawReason`
   rejected rather than revived. An addressed cancel (02.9a) retires every
   outstanding ask of the cancelled turn in both modes — the run is stopped, so
   unlike a terminally-settled detached turn nothing outlives it — and marks
-  the session non-resumable until 02.9b confirms tool cleanup. Detached
-  sessions keep their asks across terminal settlement; retirement on handle
-  loss (02.10a) is downstream debt.
+  the session non-resumable until 02.9b confirms tool cleanup (see "Cleanup
+ confirmation" below). Detached sessions keep their asks across terminal
+ settlement; retirement on handle loss (02.10a) is downstream debt.
 
 `TurnEpoch` (`src/extension.rs`) is the single implementation all slices
 share:
@@ -238,10 +242,51 @@ Wire example (stale cancel pin):
 
 ```json
 // -> {"jsonrpc":"2.0","id":9,"method":"_maki/session/cancel",
-//     "params":{"sessionId":"CgbPLtxCvEPvJvwaGMUWo","turnEpoch":0}}
+//     "params":{"sessionId":"CgbPLtxCvEPvwaGMUWo","turnEpoch":0}}
 // <- {"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"Invalid params",
 //     "data":{"expectedEpoch":1,"gotEpoch":0}}}
 ```
+
+## Cleanup confirmation (02.9b)
+
+A cancelled session accepts another prompt only after its addressed turn and
+blocking tools have confirmed cleanup; unconfirmed cleanup stays explicitly
+non-resumable. The criterion is the cancelled run's terminal as observed by
+the session's event pump, and it holds under `--background-timeout 0`
+(blocking mode) only: with no seed published no call can move off its turn,
+so when the run ends its blocking tools ended with it.
+
+- The addressed cancel settles the prompt at once (answer `cancelled`) and
+  marks the session non-resumable. Replacement prompts reject with
+  `invalid_params` / `data: {"reason": "cleanup_unconfirmed",
+  "sessionId": ..., "uncertain": false}` before anything is queued; the peer
+  is untouched. Runtime usability is the send itself: a dead run reports
+  "session ended" instead of queueing onto it.
+- The cancelled run's `Done` terminal (whatever its reason) confirms cleanup:
+  the run ended, so in blocking mode its tools stopped with it. The terminal
+  answers nothing — the prompt already settled — and reopens the session for
+  exactly one new turn. A duplicate terminal afterwards confirms nothing and
+  answers nothing.
+- The cancelled run's `Error` terminal is failure, not confirmation: the tools
+  may have stopped with it, but the abnormal end proves nothing. The session
+  records the uncertainty and stays non-resumable; the rejection then carries
+  `"uncertain": true`. Uncertainty never self-heals into retry.
+- Bounded wait: a cancelled run that reports no terminal within 30 seconds
+  (held cleanup) flips the rejection to `"uncertain": true`. Overdue is a
+  report, not a verdict — a late terminal still confirms — and the session
+  stays non-resumable either way.
+- Late answers for the cancelled turn's retired asks are rejected by the same
+  epoch check as ever (stale-turn and cross-session answers never apply), so
+  they cannot affect the replacement turn; the replacement's own terminal
+  settles exactly once under its own epoch.
+- What this criterion does NOT prove: that an escaped tool actually died.
+  Process exit or process-group reaping alone never proves a `setsid`-escaped
+  tool died — it left the group before the kill. The executable record of
+  that limitation is `tests/cleanup_probes.rs`; controlled live proof that
+  tools really die is 02.11's, and final independent-cancellation acceptance
+  stays gated on it.
+- `session/load` replaces the runtime wholesale (abort, not confirmation) and
+  is not a confirmation path; its teardown bounds belong to 02.10a/02.10b.
 
 ## Routing-loop rule
 
@@ -263,9 +308,9 @@ itself only matches ids and epochs.
 02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
 ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
  02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
- cancellation, 02.9b cleanup confirmation and retry, 02.10a–b
+  cancellation, 02.9b cleanup confirmation and retry, 02.10a–b
  supervision/release bounds, 02.11 engine acceptance. Of the above, slices
- through 02.9a are implemented (active-session release still answers
+ through 02.9b are implemented (active-session release still answers
  `-32601`, as do the reserved 04.1/05.2 names); the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

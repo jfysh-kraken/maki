@@ -427,6 +427,30 @@ impl MakiChild {
         self.expect_response(&id).await
     }
 
+    /// 02.9b scaffolding for 02.11's controlled live probes: send a
+    /// `session/prompt` without waiting for its answer and return the id to
+    /// correlate later with [`MakiChild::expect_response`]. 02.11 drives the
+    /// live sequence off this primitive — send, read-until-match the
+    /// tool-call update, cancel mid-tool, read the `cancelled` answer plus
+    /// the run's terminal, confirm the retry is accepted — so no 02.9b test
+    /// calls it (nothing here may reach a provider: no keys, no network).
+    /// Process exit or process-group reaping alone never proves an escaped
+    /// `setsid` tool died; see `tests/cleanup_probes.rs` for the executable
+    /// record 02.11 must not convert into cleanup proof.
+    pub async fn send_prompt(&mut self, session_id: &str, text: &str) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "session/prompt",
+            id.clone(),
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": text }],
+            }),
+        )
+        .await?;
+        Ok(id)
+    }
+
     /// Reserve an id without starting anything (02.3 allocate). The reply
     /// itself is the assertion surface: `{sessionId, turnEpoch}` on success,
     /// a JSON-RPC error otherwise.

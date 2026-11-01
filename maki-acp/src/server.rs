@@ -4,6 +4,7 @@ use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, CancelNotification, ConfigOptionUpdate,
@@ -61,6 +62,15 @@ const SESSION_BUSY_CODE: i32 = -32000;
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 
+/// How long a cancelled run may take to report its terminal before the
+/// session reports the cleanup as uncertain instead of merely pending (02.9b).
+/// The bound only changes the report: a held cleanup stays non-resumable
+/// either way, and final acceptance stays gated on 02.11's controlled live
+/// evidence. Generous on purpose: a slow tool that still observes its cancel
+/// reports late but confirmed, while a tool that never reports at all flips
+/// the rejection to uncertain instead of hanging the client on "pending".
+const CLEANUP_GRACE: Duration = Duration::from_secs(30);
+
 /// What the client still owes us. Every agent waits on its own answer channel,
 /// so a child's permission can be outstanding next to the main agent's. The
 /// epoch lives here, under the same guard as the prompt it settles, so
@@ -89,10 +99,22 @@ struct Pending {
     blocking: bool,
     /// 02.9a: set when an addressed cancel settles a live turn. The session
     /// accepts no further prompt while set (see `handle_prompt`): settlement
-    /// alone never reopens the session. 02.9b clears it after confirming tool
-    /// cleanup (`confirm_cleanup`, the gate interface left for that slice);
-    /// until then replacement prompts reject with `cleanup_unconfirmed`.
+    /// alone never reopens the session. 02.9b clears it through
+    /// `confirm_cleanup` once the cancelled run's terminal proves its
+    /// blocking tools stopped; until then replacement prompts reject with
+    /// `cleanup_unconfirmed`.
     awaiting_cleanup: bool,
+    /// 02.9b: set when the cancelled run failed instead of stopping (its
+    /// terminal was an `Error`, not a `Done`), or observed through
+    /// `is_uncertain` once the bounded wait lapses with no terminal at all.
+    /// Stays non-resumable either way: the flag only changes the rejection
+    /// report from "pending" to "uncertain", never into a retry license.
+    cleanup_uncertain: bool,
+    /// 02.9b: when the cancelled turn started waiting for its tools to stop.
+    /// Bounds the wait (`CLEANUP_GRACE`): a terminal that never arrives is
+    /// held cleanup, reported as uncertain, still non-resumable. `None`
+    /// while no cleanup is awaited.
+    awaiting_since: Option<Instant>,
 }
 
 impl Default for Pending {
@@ -106,6 +128,8 @@ impl Default for Pending {
             asks: HashMap::new(),
             blocking: true,
             awaiting_cleanup: false,
+            cleanup_uncertain: false,
+            awaiting_since: None,
         }
     }
 }
@@ -165,12 +189,60 @@ impl Pending {
         !self.awaiting_cleanup
     }
 
-    /// 02.9b calls this after confirming the cancelled turn's tool cleanup;
-    /// until then the session stays non-resumable. No handler calls it yet:
-    /// positive retry/new-turn proof belongs to 02.9b, not this slice.
-    #[allow(dead_code)]
+    /// 02.9b: whether a `cleanup_unconfirmed` rejection must report the
+    /// cleanup as uncertain rather than merely pending. True when the
+    /// cancelled run failed instead of stopping, or when the bounded wait
+    /// lapsed with no terminal at all (held cleanup). Both stay
+    /// non-resumable; this only changes the report, never into a retry.
+    fn is_uncertain(&self) -> bool {
+        self.cleanup_uncertain || self.cleanup_overdue()
+    }
+
+    /// The bounded wait lapsed while cleanup was still unconfirmed: the run
+    /// may still be stopping its tools, or it may never report at all. Either
+    /// way the session cannot claim the tools died, so the rejection says so.
+    fn cleanup_overdue(&self) -> bool {
+        match self.awaiting_since {
+            Some(since) => self.awaiting_cleanup && since.elapsed() >= CLEANUP_GRACE,
+            None => false,
+        }
+    }
+
+    /// 02.9b confirmation: the cancelled turn's tools are recorded as
+    /// stopped. Called by the pump when the cancelled run's terminal arrives
+    /// while no live turn is parked (see the `Done`/`Error` arms of
+    /// `start_event_pump`): a `Done` means the run ended, and under
+    /// `--background-timeout 0` no call outlives its run, so the cancelled
+    /// turn's blocking tools stopped with it. An `Error` terminal is failure,
+    /// not confirmation (see `note_run_ended`). 02.11 owns the controlled
+    /// live proof that tools really died; this gate only records what the run
+    /// reported — and a process exit or process-group reap alone never proves
+    /// an escaped `setsid` tool died (see the escaped-child record in
+    /// `tests/cleanup_probes.rs`).
     fn confirm_cleanup(&mut self) {
         self.awaiting_cleanup = false;
+        self.cleanup_uncertain = false;
+        self.awaiting_since = None;
+    }
+
+    /// 02.9b pump observation of the cancelled run's terminal, after
+    /// `settle_prompt` found no live turn to settle. `failed == false`
+    /// (`Done`, whatever its reason: the run ended, so in blocking mode its
+    /// tools stopped with it) confirms cleanup and reopens the session for
+    /// exactly one new turn. `failed == true` (`Error`: the run failed
+    /// instead of stopping) records the uncertainty and stays non-resumable.
+    /// A no-op unless cleanup is awaited, so duplicate or unrelated terminals
+    /// can never reopen a session or revive a failed one. Nothing is answered
+    /// here: the prompt already settled through `settle_cancel`.
+    fn note_run_ended(&mut self, failed: bool) {
+        if !self.awaiting_cleanup {
+            return;
+        }
+        if failed {
+            self.cleanup_uncertain = true;
+        } else {
+            self.confirm_cleanup();
+        }
     }
 
     /// Single control-lock claim for an incoming answer: remove-then-validate
@@ -195,9 +267,12 @@ impl Pending {
     /// so a terminal racing the cancel lands stale either way. A settled turn
     /// retires every outstanding ask in both modes — the run is stopped, so
     /// unlike a terminally-settled detached turn nothing can outlive it — and
-    /// marks the session non-resumable until 02.9b confirms cleanup. Whether
-    /// the underlying tools actually died is 02.9b's confirmation, not
-    /// claimed here.
+    /// marks the session non-resumable until the pump observes the cancelled
+    /// run's terminal and confirms cleanup through `note_run_ended` (02.9b).
+    /// A `Done` terminal confirms; an `Error` terminal or a lapsed bounded
+    /// wait records explicitly non-resumable uncertainty. Whether an escaped
+    /// tool actually died is 02.11's controlled live evidence, not claimed
+    /// here.
     fn settle_cancel(&mut self) -> CancelSettlement {
         let turn = self.epoch.current();
         let live = match (&self.prompt, self.turn) {
@@ -209,6 +284,7 @@ impl Pending {
         if live {
             self.asks.clear();
             self.awaiting_cleanup = true;
+            self.awaiting_since = Some(Instant::now());
             CancelSettlement {
                 prompt: self.prompt.take(),
                 turn: Some(turn),
@@ -709,14 +785,18 @@ fn not_activated(session_id: &str) -> AcpError {
     }))
 }
 
-/// 02.9a: a session whose turn was cancelled stays non-resumable until 02.9b
-/// confirms tool cleanup. The gate interface 02.9b builds on is the
-/// `awaiting_cleanup` flag (`Pending::confirm_cleanup` clears it); until then
-/// every replacement prompt rejects here, before anything is queued.
-fn cleanup_unconfirmed(session_id: &str) -> AcpError {
+/// 02.9a gate, 02.9b report: a session whose turn was cancelled stays
+/// non-resumable until the pump confirms its tool cleanup. `uncertain` is
+/// true when the cancelled run failed instead of stopping, or when the
+/// bounded cleanup wait lapsed with no terminal: the rejection then reports
+/// the uncertainty explicitly instead of claiming the tools merely pend.
+/// Either way no retry path reopens the session; only `confirm_cleanup`
+/// (through the pump's terminal observation) does.
+fn cleanup_unconfirmed(session_id: &str, uncertain: bool) -> AcpError {
     AcpError::invalid_params().data(serde_json::json!({
         "reason": "cleanup_unconfirmed",
         "sessionId": session_id,
+        "uncertain": uncertain,
     }))
 }
 
@@ -949,7 +1029,8 @@ struct CancelParams {
 /// session still bumps (so a racing terminal lands stale) but stays usable:
 /// nothing ran, so there is no cleanup to confirm. Settlement alone never
 /// reopens a cancelled session: replacement prompts reject with
-/// `cleanup_unconfirmed` until 02.9b confirms tool cleanup.
+/// `cleanup_unconfirmed` until the pump observes the cancelled run's
+/// terminal and confirms its tool cleanup (02.9b).
 fn handle_cancel(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
     let req: CancelParams = parse_params(raw)?;
     // No runtime exists behind a lease: the cancel names no turn to settle
@@ -1616,11 +1697,15 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // unknown id rejects here, before anything is queued or any peer is
     // touched; duplicate and cross-session rejection keep the same shape.
     let session = srv.session(&req.session_id)?;
-    // 02.9a: a cancelled-awaiting-cleanup session accepts nothing until 02.9b
-    // confirms tool cleanup. Settlement alone never reopens it; the peer's
-    // slot is untouched by this rejection.
-    if !session.pending.lock().unwrap().is_resumable() {
-        return Err(cleanup_unconfirmed(&req.session_id.0));
+    // 02.9a: a cancelled-awaiting-cleanup session accepts nothing until the
+    // pump confirms its tool cleanup (02.9b: the cancelled run's terminal).
+    // Settlement alone never reopens it; the peer's slot is untouched by
+    // this rejection. Runtime usability is the send below: a dead run
+    // reports "session ended" instead of queueing onto it.
+    let resumable = session.pending.lock().unwrap().is_resumable();
+    if !resumable {
+        let uncertain = session.pending.lock().unwrap().is_uncertain();
+        return Err(cleanup_unconfirmed(&req.session_id.0, uncertain));
     }
     debug!(
         session = %req.session_id.0,
@@ -2009,6 +2094,16 @@ fn start_event_pump(
                                 Ok(AgentResponse::PromptResponse(resp)),
                             ),
                         );
+                    } else {
+                        // 02.9b: no live turn to settle. When an addressed
+                        // cancel settled the turn ahead of its run, this
+                        // terminal is that run ending: under
+                        // `--background-timeout 0` nothing outlives the run,
+                        // so its end confirms the cancelled turn's blocking
+                        // tools stopped and reopens the session for exactly
+                        // one new turn. Nothing is answered: the prompt
+                        // already settled through `settle_cancel`.
+                        pending.lock().unwrap().note_run_ended(false);
                     }
                     continue;
                 }
@@ -2030,6 +2125,14 @@ fn start_event_pump(
                         };
                         let error = error.data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                    } else {
+                        // 02.9b: the cancelled run failed instead of stopping.
+                        // Its tools may have stopped with it, but the abnormal
+                        // end proves nothing, so the session records the
+                        // uncertainty and stays non-resumable; the retry
+                        // rejection reports it. (Task/pump loss itself is
+                        // 02.10a's; this arm only records the failed cleanup.)
+                        pending.lock().unwrap().note_run_ended(true);
                     }
                     continue;
                 }
@@ -2807,6 +2910,23 @@ mod tests {
             num_turns: 1,
             reason: DoneReason::EndTurn,
             raw_stop_reason: None,
+        }
+    }
+
+    /// What the pump sees when a cancelled run actually stops: `run.rs`
+    /// maps `Err(Cancelled)` to `Ok(DoneReason::Cancelled)` and emits it, so
+    /// a stopped run always reports `Done`, never `Error`. Only real failures
+    /// surface as `AgentEvent::Error`.
+    fn cancelled_done_event() -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: CONTEXT_WINDOW,
+            num_turns: 1,
+            reason: DoneReason::Cancelled,
+            raw_stop_reason: Some("cancelled".to_owned()),
         }
     }
 
@@ -4051,6 +4171,22 @@ mod tests {
         assert!(answer_a_rx.is_empty(), "a late answer cannot revive A");
         assert!(answer_b_rx.is_empty(), "nothing lands on the peer");
 
+        // Settlement alone never reopens A: a replacement prompt rejects
+        // while cleanup is unconfirmed. Positive retry proof is 02.9b's.
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "too soon"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::invalid_params().code);
+        assert_eq!(
+            err.data,
+            Some(
+                serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a, "uncertain": false})
+            )
+        );
+
         // A late terminal from the cancelled turn settles nothing: the prompt
         // is gone and the epoch stands, so it can never settle a later turn.
         assert_eq!(
@@ -4065,6 +4201,19 @@ mod tests {
         assert!(
             out_rx.try_recv().is_err(),
             "no second answer for the settled turn"
+        );
+        // 02.9b: that same terminal is the cancelled run ending, so in
+        // blocking mode it confirms the tools stopped with it — settlement
+        // still settled nothing, but the session is resumable now.
+        assert!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_resumable(),
+            "the run's terminal confirms its cleanup"
         );
 
         // B runs a full turn afterwards: its text and prompt answer carry its
@@ -4102,6 +4251,240 @@ mod tests {
                 .current(),
             1
         );
+        // B settling moves only B: A's epoch stands and no frame names A.
+        assert_eq!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1,
+            "B settling never moves A's epoch"
+        );
+
+        // B stays responsive on its next turn. A's replacement/retry race is
+        // 02.9b's fixture below, on the confirmation this test just proved.
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays responsive");
+    }
+
+    /// 02.9b headline fixture: Stop A, confirm its turn/tool cleanup through
+    /// the cancelled run's terminal, then accept another A prompt while B
+    /// continues under the same Maki PID (one `Server`, two runtimes — no
+    /// second process). Late answers and duplicate terminals from the
+    /// cancelled turn cannot affect A's replacement turn, and B's traffic
+    /// never leaks into A. No prompt here reaches a provider: turns are
+    /// parked by hand and terminals are fed as synthetic agent events, so no
+    /// keys or network are involved.
+    #[tokio::test]
+    async fn stop_confirm_cleanup_then_retry_while_the_peer_continues() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (answer_a_tx, answer_a_rx) = flume::unbounded();
+        srv.sessions.get_mut(&key_a).unwrap().handle.answer_tx = answer_a_tx;
+        let (input_a_rx, cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (answer_b_tx, answer_b_rx) = flume::unbounded();
+        runtime_b.handle.answer_tx = answer_b_tx;
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        assert_ne!(key_a, key_b, "two sessions hold distinct ids");
+
+        // Both sessions work a turn; A also waits on a permission ask.
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+        let sid_a = srv
+            .sessions
+            .get(&key_a)
+            .unwrap()
+            .handle
+            .session_id
+            .to_string();
+        {
+            let mut guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            guard.asks.insert(
+                ANSWERED_ID,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: sid_a.clone(),
+                    epoch: 0,
+                },
+            );
+        }
+
+        // Stop A: settles its turn, retires its ask, signals its run.
+        let result = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_a } }),
+        )
+        .unwrap();
+        assert_eq!(result["cancelled"], true);
+        assert_eq!(result["turnEpoch"], 1);
+        assert!(
+            cancel_a_rx.try_recv().is_ok(),
+            "the addressed cancel signals A's run"
+        );
+        let answer = out_rx.try_recv().expect("A's prompt settles once");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "cancelled");
+
+        // Premature retry is rejected before anything is queued...
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "too soon"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(
+                serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a, "uncertain": false})
+            )
+        );
+        assert!(input_a_rx.is_empty(), "a rejected retry queues no input");
+
+        // ...until the cancelled run's terminal confirms its tools stopped.
+        // The confirmation answers nothing: the prompt already settled.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(cancelled_done_event()).unwrap();
+        })
+        .await;
+        assert!(
+            out_rx.is_empty(),
+            "the confirmation terminal answers nothing"
+        );
+        assert!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_resumable(),
+            "a stopped run reopens its session"
+        );
+        assert_eq!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1,
+            "confirming cleanup moves no epoch"
+        );
+
+        // The retry is accepted onto the confirmed session...
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "again"),
+            &RequestId::Number(9),
+        )
+        .expect("confirmed cleanup reopens A");
+        assert!(
+            input_a_rx.try_recv().is_ok(),
+            "the replacement turn is queued on A's run"
+        );
+        // ...for exactly one turn: a second prompt still rejects as busy.
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "overlap"),
+            &RequestId::Number(10),
+        )
+        .unwrap_err();
+        assert_eq!(i32::from(err.code), -32603);
+        assert_eq!(err.message, PROMPT_RUNNING);
+
+        // A late answer for the retired ask drops without reaching any agent...
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(answer_a_rx.is_empty(), "a late answer cannot revive A");
+        assert!(answer_b_rx.is_empty(), "nothing lands on the peer");
+
+        // ...and the replacement turn settles exactly once under its own epoch.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("the replacement turn settles");
+        assert_eq!(answer["id"], 9);
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            1,
+            "the replacement settles the turn it ran under"
+        );
+        // A duplicate terminal after the replacement settled is dropped: the
+        // session is not awaiting cleanup, so it confirms nothing and answers
+        // nothing.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        assert!(
+            out_rx.is_empty(),
+            "no second answer for the settled replacement"
+        );
+
+        // B ran undisturbed throughout and settles under its own epoch.
+        {
+            let guard = srv.sessions.get(&key_b).unwrap().pending.lock().unwrap();
+            assert_eq!(guard.prompt, Some(RequestId::Number(8)));
+            assert_eq!(guard.epoch.current(), 0);
+        }
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("B settles its own prompt");
+        assert_eq!(answer["id"], 8);
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "B settles the turn it ran under"
+        );
+    }
+
+    /// 02.9b held cleanup: with no terminal from the cancelled run the
+    /// session stays non-resumable, the rejection reports the uncertainty
+    /// explicitly once the bounded wait lapses, and B stays responsive. A
+    /// late terminal still confirms: overdue is a report, not a verdict.
+    #[tokio::test]
+    async fn held_cleanup_prevents_retry_reports_uncertainty_and_leaves_the_peer_alive() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (_input_a_rx, _cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+        handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_a } }),
+        )
+        .unwrap();
+        let answer = out_rx.try_recv().expect("the cancelled prompt settles");
+        assert_eq!(answer["id"], PROMPT_ID);
         assert!(
             !srv.sessions
                 .get(&key_a)
@@ -4109,30 +4492,224 @@ mod tests {
                 .pending
                 .lock()
                 .unwrap()
-                .is_resumable(),
-            "B settling never reopens A"
+                .is_resumable()
         );
 
-        // Replacement prompts for A reject while cleanup is unconfirmed; B
-        // stays responsive on its next turn. Positive retry proof belongs to
-        // 02.9b, after its confirmation gate lands.
+        // Premature retry rejects as pending, not uncertain...
         let err = handle_prompt(
             &mut srv,
-            &prompt_request(&key_a, "again"),
+            &prompt_request(&key_a, "too soon"),
             &RequestId::Number(9),
         )
         .unwrap_err();
-        assert_eq!(err.code, AcpError::invalid_params().code);
         assert_eq!(
             err.data,
-            Some(serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a}))
+            Some(
+                serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a, "uncertain": false})
+            )
         );
+
+        // ...while B runs its turn to completion under the same PID.
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("B settles its own prompt");
+        assert_eq!(answer["id"], 8);
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays responsive on its next turn");
+
+        // The bounded wait lapses with no terminal: held cleanup, reported.
+        {
+            let mut guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            guard.awaiting_since = Some(Instant::now() - CLEANUP_GRACE - Duration::from_secs(1));
+            assert!(guard.is_uncertain(), "a lapsed bound reports uncertainty");
+        }
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "still soon"),
+            &RequestId::Number(11),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(
+                serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a, "uncertain": true})
+            ),
+            "held cleanup reports uncertainty, still non-resumable"
+        );
+
+        // A late terminal still confirms: the run ended, so in blocking mode
+        // its tools stopped with it — overdue never hardens into failure.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(cancelled_done_event()).unwrap();
+        })
+        .await;
+        assert!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_resumable()
+        );
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "late but confirmed"),
+            &RequestId::Number(12),
+        )
+        .expect("a late terminal confirms the held cleanup");
+    }
+
+    /// 02.9b failed cleanup: an `Error` terminal from the cancelled run is
+    /// failure, not confirmation. The session reports the uncertainty
+    /// explicitly, stays non-resumable, and never self-heals into retry; B is
+    /// unaffected throughout.
+    #[tokio::test]
+    async fn failed_cleanup_reports_uncertainty_and_stays_non_resumable() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (_input_a_rx, _cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+        handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_a } }),
+        )
+        .unwrap();
+        let answer = out_rx.try_recv().expect("the cancelled prompt settles");
+        assert_eq!(answer["id"], PROMPT_ID);
+
+        // The cancelled run fails instead of stopping: no answer (the prompt
+        // already settled), no resumability, recorded uncertainty.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth: false,
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+        assert!(out_rx.is_empty(), "a failed cleanup answers nothing");
+        {
+            let guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            assert!(
+                !guard.is_resumable(),
+                "failed cleanup never reopens the session"
+            );
+            assert!(guard.is_uncertain(), "failed cleanup reports uncertainty");
+        }
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "retry"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(
+                serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a, "uncertain": true})
+            )
+        );
+
+        // A repeated failure changes nothing: uncertainty never self-heals.
+        drive_runtime(&srv, &key_a, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth: false,
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+        assert!(
+            !srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_resumable()
+        );
+        assert!(out_rx.is_empty(), "a repeated failure answers nothing");
+
+        // B is unaffected: it settles and stays responsive.
+        drive_runtime(&srv, &key_b, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: TEXT_B.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let settled: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(
+            settled.len(),
+            2,
+            "B's text and B's prompt answer: {settled:?}"
+        );
+        assert_eq!(settled[1]["id"], 8);
         handle_prompt(
             &mut srv,
             &prompt_request(&key_b, "b-next"),
             &RequestId::Number(10),
         )
         .expect("the peer stays responsive");
+    }
+
+    /// 02.9b gate matrix on `Pending` itself: an observation with nothing
+    /// awaited changes nothing, a `Done` confirms, an `Error` records
+    /// uncertainty. Overdue is report-only: it never appears without a wait.
+    #[test]
+    fn cleanup_confirmation_marks_exactly_what_the_run_reported() {
+        let mut pending = Pending::default();
+        pending.note_run_ended(false);
+        assert!(
+            pending.is_resumable(),
+            "no awaited cleanup, nothing to confirm"
+        );
+        assert!(!pending.is_uncertain(), "no wait lapses without one");
+
+        pending.turn = Some(pending.epoch.current());
+        pending.prompt = Some(RequestId::Number(PROMPT_ID));
+        assert!(pending.settle_cancel().cancelled);
+        assert!(!pending.is_resumable(), "a settled cancel awaits cleanup");
+        assert!(
+            !pending.is_uncertain(),
+            "a fresh cancel is pending, not uncertain"
+        );
+
+        pending.note_run_ended(true);
+        assert!(
+            !pending.is_resumable(),
+            "failed cleanup never reopens the session"
+        );
+        assert!(pending.is_uncertain(), "failed cleanup reports uncertainty");
+
+        pending.confirm_cleanup();
+        assert!(
+            pending.is_resumable(),
+            "a confirmed cleanup reopens the session"
+        );
+        assert!(!pending.is_uncertain());
     }
 
     /// A stale turn pin changes nothing: no signal, no bump, no settlement,
