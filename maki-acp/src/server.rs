@@ -865,7 +865,38 @@ async fn handle_request(
     }
     if method == extension::CANCEL_METHOD {
         let result = handle_cancel(srv, raw);
-        srv.respond_value(id, result);
+        match result {
+            Ok(result) => {
+                let key = result["sessionId"].as_str().unwrap().to_string();
+                let pending = Arc::clone(&srv.sessions[&key].pending);
+                let out_tx = srv.out_tx.clone();
+                tokio::spawn(async move {
+                    let deadline = Instant::now() + Duration::from_secs(25);
+                    let response = loop {
+                        {
+                            let guard = pending.lock().unwrap();
+                            if guard.is_lost() || guard.is_released() || guard.is_uncertain() {
+                                break Err(cleanup_unconfirmed(&key, true));
+                            }
+                            if guard.is_resumable() {
+                                break Ok(result);
+                            }
+                        }
+                        if Instant::now() >= deadline {
+                            pending.lock().unwrap().cleanup_uncertain = true;
+                            break Err(cleanup_unconfirmed(&key, true));
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
+                    let frame = match response {
+                        Ok(value) => serde_json::json!({"jsonrpc":"2.0", "id":id, "result":value}),
+                        Err(error) => serde_json::json!({"jsonrpc":"2.0", "id":id, "error":error}),
+                    };
+                    send(&out_tx, frame);
+                });
+            }
+            Err(error) => srv.respond_value(id, Err(error)),
+        }
         return;
     }
     if method == extension::MODEL_LIST_METHOD {

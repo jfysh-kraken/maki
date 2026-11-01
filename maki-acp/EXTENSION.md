@@ -176,6 +176,12 @@ Request params:
   Without the pin, the cancel applies to whatever turn is running.
 
 Result: `{ "sessionId": "...", "cancelled": true, "turnEpoch": 1 }`.
+The extension request waits off the routing loop for blocking-run cleanup
+confirmation before returning success. Peers remain routable. Failure, loss or
+a 25-second confirmation deadline returns `cleanup_unconfirmed` with
+`uncertain: true`; deadline uncertainty is sticky. The outstanding prompt still
+settles immediately as cancelled, and standard ACP cancel notifications retain
+their immediate notification behavior. A successful idle cancel needs no cleanup.
 `cancelled: false` means no turn was running; the epoch still bumps (see
 Settlement), so a racing terminal cannot settle afterwards. Cancelling an
 unknown session is `resource_not_found`.
