@@ -106,17 +106,16 @@ async fn holds_one_setup_while_observing_peer_responses() {
         list["sessions"].is_array(),
         "peer session/list must answer a session array: {list}"
     );
-    peer.set_mode(&peer_session, "plan").await.unwrap();
-    let peer_update = peer
-        .expect_notification(|frame| {
-            frame["method"] == "session/update"
-                && frame["params"]["update"]["currentModeId"] == "plan"
-        })
-        .await
-        .unwrap();
+    // 02.2b: setup is fixed per session, so the per-session observable is the
+    // addressed rejection, correlated to its own request, not a mode update.
+    let mode_reply = peer.set_mode_raw(&peer_session, "plan").await.unwrap();
     assert_eq!(
-        peer_update["params"]["sessionId"].as_str(),
-        Some(peer_session.as_str())
+        mode_reply["error"]["code"], -32602,
+        "peer mode change routes to its session and rejects: {mode_reply}"
+    );
+    assert_eq!(
+        mode_reply["error"]["data"]["reason"], "fixed_at_activation",
+        "peer mode change is fixed at activation: {mode_reply}"
     );
 
     let reply = held.expect_response(&held_id).await.unwrap();
@@ -149,29 +148,38 @@ async fn two_session_and_ab_project_helpers_smoke() {
         "peer B must run on project B"
     );
 
+    // 02.2b: setup is fixed per session; each peer independently routes its
+    // own change to the addressed rejection while the other peer is unaffected.
     let session_a = sessions.a.session_id.clone();
     let session_b = sessions.b.session_id.clone();
-    sessions.a.child.set_mode(&session_a, "plan").await.unwrap();
-    sessions
-        .b
+    let reply_a = sessions
+        .a
         .child
-        .set_mode(&session_b, "build")
+        .set_mode_raw(&session_a, "plan")
         .await
         .unwrap();
-    for (peer, expected) in [
-        (&mut sessions.a.child, session_a.as_str()),
-        (&mut sessions.b.child, session_b.as_str()),
-    ] {
-        let update = peer
-            .expect_notification(|frame| frame["method"] == "session/update")
-            .await
-            .unwrap();
-        assert_eq!(
-            update["params"]["sessionId"].as_str(),
-            Some(expected),
-            "the mode notification must address its own session"
-        );
-    }
+    assert_eq!(
+        reply_a["error"]["code"], -32602,
+        "peer A routes its own mode change: {reply_a}"
+    );
+    assert_eq!(
+        reply_a["error"]["data"]["reason"], "fixed_at_activation",
+        "peer A setup is fixed at activation: {reply_a}"
+    );
+    let reply_b = sessions
+        .b
+        .child
+        .set_mode_raw(&session_b, "build")
+        .await
+        .unwrap();
+    assert_eq!(
+        reply_b["error"]["code"], -32602,
+        "peer B routes its own mode change: {reply_b}"
+    );
+    assert_eq!(
+        reply_b["error"]["data"]["reason"], "fixed_at_activation",
+        "peer B setup is fixed at activation: {reply_b}"
+    );
 
     sessions.shutdown().await.unwrap();
 }

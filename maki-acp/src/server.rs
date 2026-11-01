@@ -7,13 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, CancelNotification, ConfigOptionUpdate,
-    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
-    InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
-    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
-    SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    ContentBlock, EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest,
+    JsonRpcMessage, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer,
+    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
+    RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionInfo,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -60,15 +59,25 @@ const SESSION_BUSY_CODE: i32 = -32000;
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 
 /// What the client still owes us. Every agent waits on its own answer channel,
-/// so a child's permission can be outstanding next to the main agent's.
+/// so a child's permission can be outstanding next to the main agent's. The
+/// epoch lives here, under the same guard as the prompt it settles, so
+/// terminal settlement is check-and-bump in one lock: the single settlement
+/// contract (`EXTENSION.md`), with no second epoch mechanism anywhere.
 #[derive(Default)]
 struct Pending {
     prompt: Option<RequestId>,
+    /// Epoch the outstanding prompt runs under. `None` while idle; a terminal
+    /// with no turn outstanding settles nothing and is dropped.
+    turn: Option<u64>,
+    epoch: TurnEpoch,
     asks: HashMap<i64, Ask>,
 }
 
 /// How to read the answer and who gets it. A subagent's permission carries the
 /// channel its own agent waits on, everything else answers the main agent.
+/// Every ask is bound to the session and turn that issued it: stale answers
+/// are dropped, never applied, and the full concurrent-ask routing proof on
+/// top of this binding is 02.8.
 enum Ask {
     /// `request_id` is the agent-side id of the ask the tool is parked on, not
     /// the JSON-RPC id and not the client-facing tool call: the answer is
@@ -76,8 +85,27 @@ enum Ask {
     Permission {
         request_id: String,
         answer_tx: Option<Sender<String>>,
+        session: String,
+        epoch: u64,
     },
-    Elicitation,
+    Elicitation {
+        session: String,
+        epoch: u64,
+    },
+}
+
+impl Ask {
+    fn session(&self) -> &str {
+        match self {
+            Ask::Permission { session, .. } | Ask::Elicitation { session, .. } => session,
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        match self {
+            Ask::Permission { epoch, .. } | Ask::Elicitation { epoch, .. } => *epoch,
+        }
+    }
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -96,10 +124,6 @@ struct SessionRuntime {
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
-    /// The single settlement contract (`EXTENSION.md`, 02.1). 02.2a owns one
-    /// epoch per runtime; 02.2b wires bump/check into terminals, cancels and
-    /// answers. No second epoch mechanism may appear.
-    epoch: TurnEpoch,
     /// The runtime owns its pump task; closing the session aborts and reaps it
     /// (bounded teardown of the release path itself is 02.10b).
     pump: JoinHandle<()>,
@@ -108,7 +132,6 @@ struct SessionRuntime {
 struct Server {
     out_tx: Sender<Value>,
     model_specs: Vec<String>,
-    model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     defaults: SessionDefaults,
     /// ID-addressed runtime ownership. No current-session slot remains: every
@@ -126,12 +149,6 @@ impl Server {
     fn session(&self, id: &SessionId) -> Result<&SessionRuntime, AcpError> {
         self.sessions
             .get(&*id.0)
-            .ok_or_else(|| unknown_session(&id.0))
-    }
-
-    fn session_mut(&mut self, id: &SessionId) -> Result<&mut SessionRuntime, AcpError> {
-        self.sessions
-            .get_mut(&*id.0)
             .ok_or_else(|| unknown_session(&id.0))
     }
 }
@@ -170,7 +187,6 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let mut server = Server {
         out_tx,
         model_specs: available_model_specs(&params.model_policy),
-        model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
         sessions: HashMap::new(),
@@ -257,9 +273,11 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     // gone peer never blocks another's announcement.
     for runtime in srv.sessions.values() {
         let option = methods::model_config_option(&runtime.current_model, &srv.model_specs);
+        let epoch = runtime.pending.lock().unwrap().epoch.current();
         session_update(
             &srv.out_tx,
             &SessionId::from(runtime.handle.session_id.to_string()),
+            epoch,
             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
         );
     }
@@ -419,10 +437,13 @@ async fn load_session(
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
+    // The runtime below starts fresh, so its epoch is the initial one; no
+    // prompt has run yet for these replayed updates to belong to.
+    let replay_epoch = TurnEpoch::initial().current();
     for update in
         translate::replay_history(restored.session.messages(), replay_cwd, home.as_deref())
     {
-        session_update(&srv.out_tx, &sid, update);
+        session_update(&srv.out_tx, &sid, replay_epoch, update);
     }
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
@@ -585,7 +606,6 @@ fn start_session(
             current_model: params.model.spec(),
             pending,
             claim,
-            epoch: TurnEpoch::initial(),
             pump,
         },
     );
@@ -649,8 +669,19 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool 
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             let guard = rx.lock().await;
-            let request = AgentRequest::CreateElicitationRequest(request);
-            let id = ask_client(&out_tx, &pending, Ask::Elicitation, request);
+            let epoch = pending.lock().unwrap().epoch.current();
+            let request = AgentRequest::CreateElicitationRequest(
+                request.meta(extension::turn_epoch_meta(epoch)),
+            );
+            let id = ask_client(
+                &out_tx,
+                &pending,
+                Ask::Elicitation {
+                    session: session_id.clone(),
+                    epoch,
+                },
+                request,
+            );
             let response = ctx.cancel.race(guard.recv_async()).await;
             // Cleared while still holding the channel, so a stale id cannot
             // clobber whatever ask comes next.
@@ -788,7 +819,12 @@ async fn close_runtime(srv: &Server, state: SessionRuntime, reason: SessionEndRe
     }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
-    if let Some(id) = state.pending.lock().unwrap().prompt.take() {
+    let owed = {
+        let mut guard = state.pending.lock().unwrap();
+        guard.turn = None;
+        guard.prompt.take()
+    };
+    if let Some(id) = owed {
         let resp = PromptResponse::new(StopReason::Cancelled);
         srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
     }
@@ -860,13 +896,13 @@ impl From<StoredSession> for Restored {
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    // Addressed to the request's own session; no current-session fallback.
-    // 02.2b proves the routing on top: interleaving, duplicate-prompt and
-    // cross-session rejection, and epoch settlement of terminals.
+    // Addressed to the request's own session; no current-session fallback. An
+    // unknown id rejects here, before anything is queued or any peer is
+    // touched; duplicate and cross-session rejection keep the same shape.
     let session = srv.session(&req.session_id)?;
     debug!(
         session = %req.session_id.0,
-        epoch = session.epoch.current(),
+        epoch = session.pending.lock().unwrap().epoch.current(),
         "prompt addressed"
     );
 
@@ -879,9 +915,11 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         InputSource::Acp,
     );
 
-    // One outstanding id per session, checked and set under the same guard:
-    // `input_tx` is unbounded, so a second prompt would queue happily and
-    // overwrite the first id, leaving that request unanswered forever.
+    // One outstanding prompt per session, checked and set under the same
+    // guard: `input_tx` is unbounded, so a second prompt would queue happily
+    // and overwrite the first id, leaving that request unanswered forever.
+    // The turn snapshots the live epoch, so the terminal that settles this
+    // prompt can only settle this turn, never the next one.
     let mut pending = session.pending.lock().unwrap();
     if pending.prompt.is_some() {
         return Err(AcpError::new(-32603, "a prompt is already running"));
@@ -891,84 +929,55 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         .input_tx
         .send(input)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
+    pending.turn = Some(pending.epoch.current());
     pending.prompt = Some(id.clone());
     Ok(())
 }
 
-fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
-    let req: SetSessionModeRequest = parse_params(raw)?;
-    let mode_str = req.mode_id.0.to_string();
-    let new_mode = methods::mode_id_to_agent_mode(&mode_str)
-        .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
-
-    // Per-session setup, changed only on the addressed runtime; the peer keeps
-    // its own. Fixed-at-activation rejection (route-then-reject with
-    // `fixed_at_activation`) is 02.2b: standard clients keep working here.
-    let session = srv.session_mut(&req.session_id)?;
-    debug!(
-        session = %req.session_id.0,
-        epoch = session.epoch.current(),
-        "mode addressed"
-    );
-    session.handle.switch_mode(new_mode.clone());
-    session.current_mode = new_mode;
-
-    let sid = SessionId::from(session.handle.session_id.to_string());
-    session_update(
-        &srv.out_tx,
-        &sid,
-        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(mode_str))),
-    );
-    Ok(AgentResponse::SetSessionModeResponse(
-        SetSessionModeResponse::new(),
-    ))
+/// Setup is fixed per session: route-then-reject for a post-activation
+/// model/mode change (`EXTENSION.md`). Routing comes first, so an unknown
+/// session still answers `resource_not_found`; a routed one is rejected
+/// without applying anything, emitting anything, or touching the peer. Nori
+/// starts another session for a different setup. The error shape stays
+/// standard, so standard clients keep working.
+fn fixed_at_activation() -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": extension::FIXED_AT_ACTIVATION_REASON,
+    }))
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
-    let req: SetSessionConfigOptionRequest = parse_params(raw)?;
-    if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
-        let detail = format!("unknown config option: {}", req.config_id);
-        return Err(AcpError::invalid_params().data(json_str(&detail)));
-    }
-
-    let SessionConfigOptionValue::ValueId { value } = req.value else {
-        return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
-    };
-    let spec = value.0.to_string();
-    if !srv.model_policy.allows(&spec) {
-        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
-    }
-    let model =
-        Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
-
-    // Per-session, like the mode above; fixed-at-activation rejection is 02.2b.
-    let session = srv.session_mut(&req.session_id)?;
+fn handle_set_mode(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+    let req: SetSessionModeRequest = parse_params(raw)?;
+    let session = srv.session(&req.session_id)?;
     debug!(
         session = %req.session_id.0,
-        epoch = session.epoch.current(),
-        "config addressed"
+        mode = ?session.current_mode,
+        epoch = session.pending.lock().unwrap().epoch.current(),
+        "mode change rejected: setup fixed at activation"
     );
-    session
-        .handle
-        .model_tx
-        .send(model)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.current_model = spec.clone();
+    Err(fixed_at_activation())
+}
 
-    Ok(AgentResponse::SetSessionConfigOptionResponse(
-        SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
-            &spec,
-            &srv.model_specs,
-        )]),
-    ))
+fn handle_set_config(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+    let req: SetSessionConfigOptionRequest = parse_params(raw)?;
+    let session = srv.session(&req.session_id)?;
+    debug!(
+        session = %req.session_id.0,
+        model = %session.current_model,
+        epoch = session.pending.lock().unwrap().epoch.current(),
+        "config change rejected: setup fixed at activation"
+    );
+    Err(fixed_at_activation())
 }
 
 fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
-            // Addressed to the notification's own session. A miss is dropped:
-            // a notification carries no id to answer on. Addressed cancel with
-            // an epoch pin (`_maki/session/cancel`) and turn scoping are 02.9a.
+            // Identity-check and dispatch only: the notification names its own
+            // session, a miss is dropped (no id to answer on), and a hit only
+            // signals the run. Session/turn scoping and settlement gating are
+            // 02.9a, so no epoch moves here; the run's terminal settles the
+            // prompt through `settle_prompt` as usual.
             let Ok(note) = parse_params::<CancelNotification>(raw) else {
                 return;
             };
@@ -990,30 +999,48 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         return;
     };
     // Ask ids are minted from one process-wide counter, so the owning runtime
-    // is found by identity without touching peers. Strict per-session answer
-    // identity (rejecting a frame that names another live session) is 02.2b.
+    // is found by identity without touching peers.
     let mut found = None;
-    for runtime in srv.sessions.values() {
+    for (key, runtime) in srv.sessions.iter() {
         if let Some(ask) = runtime.pending.lock().unwrap().asks.remove(&want) {
-            found = Some((ask, runtime.handle.answer_tx.clone()));
+            found = Some((key.clone(), ask));
             break;
         }
     }
-    let Some((ask, main_answer_tx)) = found else {
+    let Some((owner, ask)) = found else {
         warn!(%id, "response for an unknown request id");
         return;
     };
+    let Some(runtime) = srv.sessions.get(&owner) else {
+        warn!(%id, owner, "response for a released session");
+        return;
+    };
+    // The ask is bound to the session and turn that issued it. A stale answer
+    // is dropped, never applied, so a stale allow can never green a later
+    // turn's tool call; a binding naming another session is dropped the same
+    // way (global ids make that structural, the check makes it explicit).
+    // Full concurrent-ask routing on top of this binding is 02.8.
+    let live = {
+        let guard = runtime.pending.lock().unwrap();
+        ask.session() == owner && guard.epoch.check(ask.epoch()).is_ok()
+    };
+    if !live {
+        warn!(%id, owner, "dropping an answer that no longer belongs to the live turn");
+        return;
+    }
+    let main_answer_tx = runtime.handle.answer_tx.clone();
     let (answer, answer_tx) = match &ask {
         Ask::Permission {
             request_id,
             answer_tx,
+            ..
         } => (
             TaggedAnswer::new(request_id.clone(), permission_answer(raw)).encode(),
             answer_tx.as_ref(),
         ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
-        Ask::Elicitation => (
+        Ask::Elicitation { .. } => (
             raw.get("result")
                 .cloned()
                 .unwrap_or(Value::Null)
@@ -1162,8 +1189,12 @@ fn start_event_pump(
                         }
                         None => (id, scope, None),
                     };
-                    let request =
-                        AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
+                    // The ask carries the session and turn that issued it, so the
+                    // answer can be gated on the live epoch on the way back;
+                    // the frame carries the turn for request/turn correlation.
+                    let epoch = pending.lock().unwrap().epoch.current();
+                    let request = AgentRequest::RequestPermissionRequest(
+                        RequestPermissionRequest::new(
                             sid.clone(),
                             translate::permission_update(
                                 id,
@@ -1174,13 +1205,17 @@ fn start_event_pump(
                                 home.as_deref(),
                             ),
                             permissions::permission_options(project_trusted),
-                        ));
+                        )
+                        .meta(extension::turn_epoch_meta(epoch)),
+                    );
                     ask_client(
                         &out_tx,
                         &pending,
                         Ask::Permission {
                             request_id,
                             answer_tx,
+                            session: sid.to_string(),
+                            epoch,
                         },
                         request,
                     );
@@ -1210,8 +1245,9 @@ fn start_event_pump(
                 } => {
                     cost.settle(ledger);
                     tool_inputs.clear();
-                    if let Some(id) = finish_turn(&pending) {
-                        let resp = PromptResponse::new(translate::map_done_reason(reason));
+                    if let Some((id, turn)) = settle_prompt(&pending) {
+                        let resp = PromptResponse::new(translate::map_done_reason(reason))
+                            .meta(extension::turn_epoch_meta(turn));
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(
@@ -1232,7 +1268,7 @@ fn start_event_pump(
                     // whole file a `write` was carrying stays pinned forever.
                     tool_inputs.clear();
                     cost.settle(totals.cost);
-                    if let Some(id) = finish_turn(&pending) {
+                    if let Some((id, _turn)) = settle_prompt(&pending) {
                         let error = if auth {
                             AcpError::auth_required()
                         } else {
@@ -1245,15 +1281,31 @@ fn start_event_pump(
                 }
                 _ => continue,
             };
-            session_update(&out_tx, &sid, update);
+            let epoch = pending.lock().unwrap().epoch.current();
+            session_update(&out_tx, &sid, epoch, update);
         }
     })
 }
 
-/// Takes the client's outstanding `session/prompt`, if any. Its asks stay
-/// until answered: a call moved to the background can still be parked on one.
-fn finish_turn(pending: &PendingState) -> Option<RequestId> {
-    pending.lock().unwrap().prompt.take()
+/// Settles the outstanding prompt exactly once through the turn epoch: the
+/// first terminal for the live turn takes the prompt and bumps the epoch, and
+/// answers with the epoch the turn settled under. A terminal with no prompt
+/// outstanding, or one whose turn is no longer live, settles nothing and is
+/// dropped, so it can never settle the next turn instead. Asks stay until
+/// answered: a call moved to the background can still be parked on one.
+fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
+    let mut guard = pending.lock().unwrap();
+    let live = match (&guard.prompt, guard.turn) {
+        (Some(_), Some(turn)) => guard.epoch.check(turn).is_ok(),
+        _ => false,
+    };
+    if !live {
+        return None;
+    }
+    let turn = guard.epoch.current();
+    guard.epoch.bump();
+    guard.turn = None;
+    guard.prompt.take().map(|id| (id, turn))
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -1262,9 +1314,10 @@ fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
     }
 }
 
-fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate) {
-    let notification =
-        AgentNotification::SessionNotification(SessionNotification::new(sid.clone(), update));
+fn session_update(out_tx: &Sender<Value>, sid: &SessionId, epoch: u64, update: SessionUpdate) {
+    let notification = AgentNotification::SessionNotification(
+        SessionNotification::new(sid.clone(), update).meta(extension::turn_epoch_meta(epoch)),
+    );
     send(
         out_tx,
         Notification {
@@ -1556,7 +1609,6 @@ mod tests {
             current_model: String::new(),
             pending: Arc::default(),
             claim,
-            epoch: TurnEpoch::initial(),
             pump: tokio::spawn(async {}),
         };
         (key, runtime)
@@ -1571,13 +1623,25 @@ mod tests {
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
-            model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
             sessions: HashMap::from([(key, runtime)]),
         };
         (server, answer_rx, out_rx)
+    }
+
+    /// The live epoch of the single runtime single-session fixtures install.
+    fn live_epoch(srv: &Server) -> u64 {
+        pending(srv).lock().unwrap().epoch.current()
+    }
+
+    /// Parks an outstanding prompt for the single runtime, the way
+    /// `handle_prompt` leaves it: the request id plus the turn it runs under.
+    fn park_prompt(srv: &Server, id: RequestId) {
+        let mut guard = pending(srv).lock().unwrap();
+        guard.turn = Some(guard.epoch.current());
+        guard.prompt = Some(id);
     }
 
     /// The single runtime single-session fixtures install. Multi-session
@@ -1761,19 +1825,25 @@ mod tests {
         }
 
         // Pending slots and epochs are per runtime: settling A leaves B alone.
-        srv.sessions
-            .get(&key_a)
-            .unwrap()
-            .pending
-            .lock()
-            .unwrap()
-            .prompt = Some(RequestId::Number(PROMPT_ID));
+        // The parked prompt carries its turn, the way `handle_prompt` leaves
+        // it; the terminal below settles it and bumps A's epoch by itself.
+        {
+            let runtime = srv.sessions.get(&key_a).unwrap();
+            let mut guard = runtime.pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(PROMPT_ID));
+        }
         drive_runtime(&srv, &key_a, |sender| {
             sender.send(done_event()).unwrap();
         })
         .await;
         let answer = out_rx.try_recv().expect("A settles its own prompt");
         assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the answer carries the turn it settled: {answer}"
+        );
         assert!(
             srv.sessions
                 .get(&key_b)
@@ -1786,11 +1856,29 @@ mod tests {
             "settling A never touches B's pending slot"
         );
 
-        let bumped = only_mut_addr(&mut srv, &key_a).epoch.bump();
-        assert_eq!(bumped, 1);
+        assert_eq!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1,
+            "settling A bumps A's epoch"
+        );
         assert!(
-            srv.sessions.get(&key_b).unwrap().epoch.check(0).is_ok(),
-            "bumping A never moves B's epoch"
+            srv.sessions
+                .get(&key_b)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .check(0)
+                .is_ok(),
+            "settling A never moves B's epoch"
         );
         assert_eq!(
             srv.sessions.get(&key_a).unwrap().current_model,
@@ -1814,15 +1902,42 @@ mod tests {
         &only(srv).pending
     }
 
-    fn permission_ask(answer_tx: Option<Sender<String>>) -> Ask {
+    fn session_key(srv: &Server) -> String {
+        only(srv).handle.session_id.to_string()
+    }
+
+    fn permission_ask(srv: &Server, answer_tx: Option<Sender<String>>) -> Ask {
         Ask::Permission {
             request_id: PARENT_TOOL_USE_ID.to_owned(),
             answer_tx,
+            session: session_key(srv),
+            epoch: live_epoch(srv),
         }
     }
 
-    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    fn elicitation_ask(srv: &Server) -> Ask {
+        Ask::Elicitation {
+            session: session_key(srv),
+            epoch: live_epoch(srv),
+        }
+    }
+
+    fn server_with_permission_ask(
+        answer_tx: Option<Sender<String>>,
+    ) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (server, answer_rx, out_rx) = test_server();
+        let ask = permission_ask(&server, answer_tx);
+        pending(&server)
+            .lock()
+            .unwrap()
+            .asks
+            .insert(ANSWERED_ID, ask);
+        (server, answer_rx, out_rx)
+    }
+
+    fn server_with_elicitation() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+        let (server, answer_rx, out_rx) = test_server();
+        let ask = elicitation_ask(&server);
         pending(&server)
             .lock()
             .unwrap()
@@ -2175,7 +2290,7 @@ mod tests {
     #[tokio::test]
     async fn event_pump_delivers_everything_queued_before_the_close() {
         let (srv, .., out_rx) = test_server();
-        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
                 .send(AgentEvent::TextDelta {
@@ -2204,7 +2319,7 @@ mod tests {
     #[tokio::test]
     async fn an_accepted_notice_reaches_the_client_in_stream_order() {
         let (srv, .., out_rx) = test_server();
-        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
                 .send(AgentEvent::ObservationLine {
@@ -2268,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_turn_answers_the_prompt_with_its_error_kind(auth: bool, expected: AcpError) {
         let (srv, .., out_rx) = test_server();
-        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
         run_pump(&srv, None, |sender| {
             sender
                 .send(AgentEvent::Error {
@@ -2513,7 +2628,7 @@ mod tests {
     #[test_case(Value::from(UNANSWERABLE_ID), false ; "an_id_matching_no_ask_answers_nothing")]
     #[tokio::test]
     async fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
-        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+        let (srv, answer_rx, ..) = server_with_permission_ask(None);
 
         handle_incoming_response(
             &srv,
@@ -2538,7 +2653,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+        let (srv, answer_rx, ..) = server_with_permission_ask(None);
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -2558,7 +2673,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
+        let (srv, answer_rx, ..) = server_with_elicitation();
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
@@ -2570,6 +2685,358 @@ mod tests {
             serde_json::from_str::<Value>(&forwarded).unwrap(),
             raw["result"]
         );
+    }
+
+    /// 02.2b routing: one active prompt per session, strict identity
+    /// rejection, fixed-at-activation setup, and exactly-once settlement
+    /// through the turn epoch. No prompt here reaches a provider: prompts go
+    /// through `handle_prompt` against runtimes whose channels lead nowhere,
+    /// and interleaving is driven with synthetic agent events.
+    const FIXED_AT_ACTIVATION: &str = "fixed_at_activation";
+    const PROMPT_RUNNING: &str = "a prompt is already running";
+
+    fn prompt_request(session: &str, text: &str) -> Value {
+        serde_json::json!({
+            "params": {
+                "sessionId": session,
+                "prompt": [{ "type": "text", "text": text }],
+            }
+        })
+    }
+
+    fn mode_request(session: &str, mode: &str) -> Value {
+        serde_json::json!({ "params": { "sessionId": session, "modeId": mode } })
+    }
+
+    fn config_request(session: &str) -> Value {
+        serde_json::json!({
+            "params": { "sessionId": session, "configId": "model", "value": "openai/gpt-5" }
+        })
+    }
+
+    /// A server whose runtime can actually take a prompt: the fixture's input
+    /// channel is rewired to a live one, so an accepted prompt sends into the
+    /// void instead of failing on a dropped receiver. Nothing runs, so no
+    /// provider, keys, or network are involved.
+    fn server_with_live_input() -> (
+        Server,
+        String,
+        flume::Receiver<AgentInput>,
+        flume::Receiver<Value>,
+    ) {
+        let (mut server, _answer_rx, out_rx) = test_server();
+        let (input_tx, input_rx) = flume::unbounded();
+        let key = server.sessions.keys().next().unwrap().clone();
+        server.sessions.get_mut(&key).unwrap().handle.input_tx = input_tx;
+        (server, key, input_rx, out_rx)
+    }
+
+    /// A second prompt on a busy session rejects without replacing the
+    /// outstanding request or starting a new turn.
+    #[tokio::test]
+    async fn a_second_prompt_rejects_without_replacing_the_outstanding_request() {
+        let (mut srv, key, _input_rx, ..) = server_with_live_input();
+        let first = RequestId::Number(PROMPT_ID);
+        handle_prompt(&mut srv, &prompt_request(&key, "first"), &first).unwrap();
+
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "second"),
+            &RequestId::Number(8),
+        )
+        .unwrap_err();
+        assert_eq!(i32::from(err.code), -32603);
+        assert_eq!(err.message, PROMPT_RUNNING);
+        let guard = pending(&srv).lock().unwrap();
+        assert_eq!(
+            guard.prompt,
+            Some(first),
+            "a duplicate prompt never overwrites the outstanding request"
+        );
+        assert_eq!(
+            guard.turn,
+            Some(0),
+            "a duplicate prompt never starts another turn"
+        );
+    }
+
+    /// A prompt naming an unknown session rejects before anything is queued,
+    /// and neither live runtime's pending request, turn, nor epoch moves.
+    #[tokio::test]
+    async fn a_prompt_for_an_unknown_session_rejects_without_touching_the_peer() {
+        let (mut srv, ..) = server_with_live_input();
+        let (other_key, other) = fixture_runtime();
+        srv.sessions.insert(other_key, other);
+
+        let unknown = MakiId::generate().to_string();
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&unknown, "hello"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        assert_eq!(err.data, Some(serde_json::json!({"sessionId": unknown})));
+        for runtime in srv.sessions.values() {
+            let guard = runtime.pending.lock().unwrap();
+            assert!(
+                guard.prompt.is_none() && guard.turn.is_none(),
+                "an unknown prompt parks nothing"
+            );
+            assert_eq!(guard.epoch.current(), 0, "an unknown prompt moves no epoch");
+        }
+    }
+
+    /// The first terminal for the live turn settles it and bumps the epoch; a
+    /// second terminal for the same epoch is dropped without another bump,
+    /// and the next prompt starts a new turn under the new epoch.
+    #[tokio::test]
+    async fn a_terminal_settles_once_and_the_next_prompt_starts_a_new_turn() {
+        let (mut srv, key, _input_rx, ..) = server_with_live_input();
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "first"),
+            &RequestId::Number(7),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                settle_prompt(pending(&srv)),
+                Some((RequestId::Number(7), 0))
+            ),
+            "the terminal settles the turn it ran under"
+        );
+        assert_eq!(live_epoch(&srv), 1);
+        assert_eq!(
+            settle_prompt(pending(&srv)),
+            None,
+            "a second terminal for one epoch is dropped"
+        );
+        assert_eq!(live_epoch(&srv), 1, "a dropped terminal never bumps");
+
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "second"),
+            &RequestId::Number(8),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                settle_prompt(pending(&srv)),
+                Some((RequestId::Number(8), 1))
+            ),
+            "another prompt after idle starts a new turn"
+        );
+        assert_eq!(live_epoch(&srv), 2);
+    }
+
+    /// A terminal from a turn that is no longer live settles nothing: the
+    /// parked prompt stays for the path that owns the new epoch (an addressed
+    /// cancel in 02.9a), and the epoch it bumped to stands.
+    #[tokio::test]
+    async fn a_stale_terminal_cannot_settle_another_turn() {
+        let (srv, ..) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        pending(&srv).lock().unwrap().epoch.bump();
+
+        assert_eq!(
+            settle_prompt(pending(&srv)),
+            None,
+            "the stale terminal settles nothing"
+        );
+        let guard = pending(&srv).lock().unwrap();
+        assert_eq!(
+            guard.prompt,
+            Some(RequestId::Number(PROMPT_ID)),
+            "the prompt stays parked for the path that owns the new epoch"
+        );
+        assert_eq!(guard.epoch.current(), 1);
+    }
+
+    /// Post-activation setup changes route to the addressed session, then
+    /// reject with the contract reason: nothing is applied and nothing is
+    /// emitted. An unknown session rejects with `resource_not_found` first.
+    #[tokio::test]
+    async fn post_activation_mode_and_config_changes_route_then_reject() {
+        let (srv, ..) = test_server();
+        let key = session_key(&srv);
+
+        for raw in [mode_request(&key, "plan"), config_request(&key)] {
+            let err = if raw["params"].get("modeId").is_some() {
+                handle_set_mode(&srv, &raw).unwrap_err()
+            } else {
+                handle_set_config(&srv, &raw).unwrap_err()
+            };
+            assert_eq!(err.code, AcpError::invalid_params().code);
+            assert_eq!(
+                err.data,
+                Some(serde_json::json!({"reason": FIXED_AT_ACTIVATION})),
+                "the rejection names the fixed-at-activation reason: {raw}"
+            );
+        }
+        assert_eq!(
+            only(&srv).current_mode,
+            AgentMode::Build,
+            "the fixed mode is unchanged"
+        );
+        assert!(
+            only(&srv).current_model.is_empty(),
+            "the fixed model is unchanged"
+        );
+
+        let unknown = MakiId::generate().to_string();
+        for raw in [mode_request(&unknown, "plan"), config_request(&unknown)] {
+            let err = if raw["params"].get("modeId").is_some() {
+                handle_set_mode(&srv, &raw).unwrap_err()
+            } else {
+                handle_set_config(&srv, &raw).unwrap_err()
+            };
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+            assert_eq!(err.data, Some(serde_json::json!({"sessionId": unknown})));
+        }
+    }
+
+    /// Rejecting on one session emits nothing and leaves the peer's pending
+    /// request, turn, epoch, and setup alone.
+    #[tokio::test]
+    async fn a_fixed_rejection_leaves_the_peer_alone() {
+        let (mut srv, _, out_rx) = test_server();
+        let peer = session_key(&srv);
+        let (other_key, other) = fixture_runtime();
+        srv.sessions.insert(other_key.clone(), other);
+        srv.sessions.get_mut(&other_key).unwrap().current_model =
+            "other-vendor/other-model".to_owned();
+
+        for raw in [mode_request(&peer, "plan"), config_request(&peer)] {
+            let rejected = if raw["params"].get("modeId").is_some() {
+                handle_set_mode(&srv, &raw).is_err()
+            } else {
+                handle_set_config(&srv, &raw).is_err()
+            };
+            assert!(rejected);
+        }
+        assert!(out_rx.is_empty(), "a rejection emits no session update");
+        let runtime = srv.sessions.get(&other_key).unwrap();
+        let guard = runtime.pending.lock().unwrap();
+        assert!(
+            guard.prompt.is_none() && guard.turn.is_none(),
+            "the peer parks nothing"
+        );
+        assert_eq!(guard.epoch.current(), 0, "the peer epoch never moves");
+        assert_eq!(
+            runtime.current_model, "other-vendor/other-model",
+            "the peer setup is unchanged"
+        );
+    }
+
+    /// A stale answer is dropped, never applied: the waiting turn keeps
+    /// waiting and the next turn's tool stays denied.
+    #[tokio::test]
+    async fn a_stale_answer_is_dropped_and_never_applied() {
+        let (srv, answer_rx, ..) = server_with_permission_ask(None);
+        pending(&srv).lock().unwrap().epoch.bump();
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+
+        assert!(
+            answer_rx.is_empty(),
+            "the stale answer was dropped: {STALE_ALLOW}"
+        );
+        assert!(!next_turn_is_allowed(&srv), "{STALE_ALLOW}");
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "a consumed answer cannot replay onto the next turn"
+        );
+    }
+
+    /// The ask binding names its session and turn; an answer bound to another
+    /// session is dropped even though its id matches a live ask.
+    #[tokio::test]
+    async fn an_answer_bound_to_another_session_is_dropped() {
+        let (srv, answer_rx, ..) = test_server();
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let foreign = Ask::Permission {
+            request_id: PARENT_TOOL_USE_ID.to_owned(),
+            answer_tx: None,
+            session: "another-session".to_owned(),
+            epoch: live_epoch(&srv),
+        };
+        pending(&srv)
+            .lock()
+            .unwrap()
+            .asks
+            .insert(ANSWERED_ID, foreign);
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+
+        assert!(
+            answer_rx.is_empty(),
+            "a cross-session answer is never applied"
+        );
+    }
+
+    /// Turn-scoped frames carry the turn they were issued under: updates and
+    /// asks name the session and epoch, and the prompt answer settles the
+    /// turn it ran under while bumping to the next.
+    #[tokio::test]
+    async fn outgoing_turn_frames_carry_session_and_epoch() {
+        let (srv, .., out_rx) = test_server();
+        let sid = session_key(&srv);
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.to_owned(),
+                })
+                .unwrap();
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(
+            frames.len(),
+            3,
+            "text, ask, then the settling answer: {frames:?}"
+        );
+        assert_eq!(frames[0]["params"]["sessionId"], sid);
+        assert_eq!(
+            frames[0]["params"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the update carries its turn: {frames:?}"
+        );
+        assert_eq!(frames[1]["method"], "session/request_permission");
+        assert_eq!(frames[1]["params"]["sessionId"], sid);
+        assert_eq!(
+            frames[1]["params"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the ask carries its turn: {frames:?}"
+        );
+        assert_eq!(frames[2]["id"], PROMPT_ID);
+        assert_eq!(frames[2]["result"]["stopReason"], "end_turn");
+        assert_eq!(
+            frames[2]["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the answer settles the turn it ran under: {frames:?}"
+        );
+        assert_eq!(live_epoch(&srv), 1, "settling bumps to the next turn");
+    }
+
+    /// A cancel naming an unknown session is dropped: notifications carry no
+    /// id to answer on, and no live runtime is disturbed.
+    #[tokio::test]
+    async fn a_cancel_for_an_unknown_session_is_dropped() {
+        let (srv, ..) = test_server();
+        let raw = serde_json::json!({
+            "params": { "sessionId": MakiId::generate().to_string() }
+        });
+        handle_notification(&srv, "session/cancel", &raw);
+
+        let guard = pending(&srv).lock().unwrap();
+        assert!(guard.prompt.is_none() && guard.turn.is_none());
+        assert_eq!(guard.epoch.current(), 0);
     }
 
     #[tokio::test]

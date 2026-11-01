@@ -373,8 +373,20 @@ impl MakiChild {
 
     /// Switch a session's mode. The reply plus the following
     /// `session/update` notification let fixtures observe notifications
-    /// without any provider contact.
+    /// without any provider contact. Only valid while the server applies
+    /// mode changes; 02.2b fixes setup per session, so 02.2b fixtures use
+    /// [`MakiChild::set_mode_raw`] and assert the rejection instead.
     pub async fn set_mode(&mut self, session_id: &str, mode: &str) -> io::Result<Value> {
+        let reply = self.set_mode_raw(session_id, mode).await?;
+        assert_no_error(&reply);
+        Ok(reply["result"].clone())
+    }
+
+    /// Switch a session's mode without asserting success. 02.2b rejects with
+    /// `invalid_params`/`fixed_at_activation`, so the reply itself is the
+    /// assertion surface; correlation by id still holds via
+    /// `expect_response`.
+    pub async fn set_mode_raw(&mut self, session_id: &str, mode: &str) -> io::Result<Value> {
         let id = self.fresh_id();
         self.send_request(
             "session/set_mode",
@@ -382,9 +394,48 @@ impl MakiChild {
             serde_json::json!({"sessionId": session_id, "modeId": mode}),
         )
         .await?;
-        let reply = self.expect_response(&id).await?;
-        assert_no_error(&reply);
-        Ok(reply["result"].clone())
+        self.expect_response(&id).await
+    }
+
+    /// Set a session config option without asserting success (see
+    /// [`MakiChild::set_mode_raw`]: the rejection is the assertion surface).
+    pub async fn set_config_raw(&mut self, session_id: &str, value: &str) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "session/set_config_option",
+            id.clone(),
+            serde_json::json!({"sessionId": session_id, "configId": "model", "value": value}),
+        )
+        .await?;
+        self.expect_response(&id).await
+    }
+
+    /// Send a prompt without asserting success. Only used against sessions
+    /// that reject before any run exists (unknown ids): a prompt to a live
+    /// session would reach the provider, which fixtures never do.
+    pub async fn prompt_raw(&mut self, session_id: &str, text: &str) -> io::Result<Value> {
+        let id = self.fresh_id();
+        self.send_request(
+            "session/prompt",
+            id.clone(),
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": text }],
+            }),
+        )
+        .await?;
+        self.expect_response(&id).await
+    }
+
+    /// Fire a `session/cancel` notification. One-way: a notification carries
+    /// no id to answer on, so there is no reply to correlate.
+    pub async fn cancel_notify(&mut self, session_id: &str) -> io::Result<()> {
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        }))
+        .await
     }
 
     /// Probe an extension method the current server must reject clearly.

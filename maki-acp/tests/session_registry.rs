@@ -2,17 +2,22 @@
 //! each with its own event pump and conversation context, with no
 //! current-session slot and no per-session process fallback.
 //!
-//! Fake client only, and no prompt is ever sent: no inference, provider keys
-//! or network. What this fixture deliberately leaves for later slices (not
-//! silent gaps):
+//! Fake client only, and no prompt is ever sent to a live session: no
+//! inference, provider keys or network. What this fixture deliberately leaves
+//! for later slices (not silent gaps):
 //! - prompt/event routing proof (interleaving, exactly-once settlement,
-//!   duplicate-prompt and unknown/cross-session rejection) is 02.2b;
-//! - fixed-at-activation route-then-reject for post-activation model/mode
-//!   changes is 02.2b (both sessions keep standard per-session behavior here);
+//!   duplicate-prompt and unknown/cross-session rejection) is 02.2b (see
+//!   `tests/prompt_routing.rs` and the `server.rs` routing tests);
 //! - `_maki/session/allocate` and `_maki/session/activate` runtime behavior
 //!   is 02.3, addressed cancel scoping is 02.9a, bounded release is 02.10b:
 //!   all four probes must still answer -32601 (see
 //!   `extension_runtime_seams_still_reject_clearly`).
+//!
+//! 02.2b changed the per-session observable used here: setup is fixed per
+//! session, so a mode change routes to its session and rejects with
+//! `fixed_at_activation` instead of emitting a `currentModeId` update. Pump
+//! addressing itself stays covered by the `two_runtimes_coexist` unit test,
+//! which drives both pumps with synthetic events.
 
 mod support;
 
@@ -20,8 +25,11 @@ use maki_acp::extension;
 use support::SharedSessions;
 
 /// Both runtimes coexist under the same Maki PID: opening the second session
-/// never closes or disturbs the first, and each pump addresses only its own
-/// session. One child process by construction, so one PID by construction.
+/// never closes or disturbs the first, and each session routes only its own
+/// operations. One child process by construction, so one PID by construction.
+/// 02.2b: setup is fixed per session, so each mode change routes to its
+/// session and rejects with `fixed_at_activation`; an unknown id rejects as
+/// `resource_not_found` without touching either runtime.
 #[tokio::test]
 async fn two_sessions_coexist_under_one_pid_with_independent_pumps() {
     let mut shared = SharedSessions::establish().await.unwrap();
@@ -37,35 +45,41 @@ async fn two_sessions_coexist_under_one_pid_with_independent_pumps() {
         "session B runs on project B"
     );
 
-    // A is still usable after B opened: the registry never replaced it.
-    shared.child.set_mode(&shared.a, "plan").await.unwrap();
-    shared.child.set_mode(&shared.b, "build").await.unwrap();
+    // A is still usable after B opened: the registry never replaced it, and
+    // each session routes its own change to the fixed-at-activation rejection.
+    for (session, mode) in [(&shared.a, "plan"), (&shared.b, "build")] {
+        let reply = shared.child.set_mode_raw(session, mode).await.unwrap();
+        assert_eq!(
+            reply["error"]["code"], -32602,
+            "{session} routes its own mode change: {reply}"
+        );
+        assert_eq!(
+            reply["error"]["data"]["reason"], "fixed_at_activation",
+            "{session} rejects post-activation changes: {reply}"
+        );
+    }
 
-    let a = shared.a.clone();
-    let update_a = shared
-        .child
-        .expect_notification(|frame| {
-            frame["method"] == "session/update" && frame["params"]["sessionId"] == a
-        })
-        .await
-        .unwrap();
+    // An unknown id rejects without touching either runtime.
+    let unknown = format!("{}-missing", shared.a);
+    let missing = shared.child.set_mode_raw(&unknown, "plan").await.unwrap();
     assert_eq!(
-        update_a["params"]["update"]["currentModeId"], "plan",
-        "A's pump addresses A's own session: {update_a}"
+        missing["error"]["code"], -32002,
+        "an unknown session rejects: {missing}"
     );
+    assert_eq!(missing["error"]["data"]["sessionId"], unknown);
 
-    let b = shared.b.clone();
-    let update_b = shared
-        .child
-        .expect_notification(|frame| {
-            frame["method"] == "session/update" && frame["params"]["sessionId"] == b
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        update_b["params"]["update"]["currentModeId"], "build",
-        "B's pump addresses B's own session: {update_b}"
-    );
+    // Both sessions still route afterwards: neither rejection disturbed a peer.
+    for session in [&shared.a, &shared.b] {
+        let reply = shared
+            .child
+            .set_config_raw(session, "openai/gpt-5")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply["error"]["data"]["reason"], "fixed_at_activation",
+            "{session} still routes after the peer rejected: {reply}"
+        );
+    }
 
     shared.shutdown().await.unwrap();
 }

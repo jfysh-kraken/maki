@@ -28,6 +28,13 @@ pub const MODEL_DISCOVERY_PREFIX: &str = "_maki/model/";
 pub const OWNED_DELETION_CAPABILITY: &str = "maki.ownedDeletion";
 /// Method 05.2 owned transcript deletion will own. Named only.
 pub const OWNED_DELETION_METHOD: &str = "_maki/session/delete";
+/// `data.reason` answering a post-activation model/mode change. Setup is
+/// fixed per session; the client starts another session for a new setup.
+pub const FIXED_AT_ACTIVATION_REASON: &str = "fixed_at_activation";
+/// `_meta` key carrying the turn epoch on turn-scoped server-to-client
+/// frames (session updates, permission/elicitation asks, prompt responses),
+/// so answers and events correlate by request and turn.
+pub const TURN_EPOCH_META_KEY: &str = "maki.turnEpoch";
 
 /// Per-session turn epoch: 0 at allocate/activate, bumped on every terminal
 /// settlement, on an addressed cancel taking effect, and on handle loss. Late
@@ -58,6 +65,15 @@ impl std::fmt::Display for StaleEpoch {
 }
 
 impl std::error::Error for StaleEpoch {}
+
+/// Stamps a turn-scoped frame with the epoch it was issued under. The only
+/// production constructor for the key, so every frame names it identically.
+pub fn turn_epoch_meta(epoch: u64) -> agent_client_protocol_schema::v1::Meta {
+    agent_client_protocol_schema::v1::Meta::from_iter([(
+        TURN_EPOCH_META_KEY.to_owned(),
+        serde_json::Value::from(epoch),
+    )])
+}
 
 impl TurnEpoch {
     /// Epoch of a freshly allocated or activated session.
@@ -139,6 +155,16 @@ mod tests {
         assert_eq!(rejection.expected, 0);
         assert_eq!(rejection.got, STALE_FUTURE);
         assert!(rejection.to_string().contains('7'));
+    }
+
+    #[test]
+    fn turn_epoch_meta_names_the_epoch() {
+        let meta = super::turn_epoch_meta(3);
+        assert_eq!(
+            meta.get(super::TURN_EPOCH_META_KEY),
+            Some(&serde_json::Value::from(3))
+        );
+        assert_eq!(meta.len(), 1);
     }
 
     #[test]
