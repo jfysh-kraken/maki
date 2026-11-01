@@ -880,8 +880,10 @@ async fn handle_request(
     }
     if method == extension::OWNED_DELETION_METHOD {
         // 05.2 owned transcript deletion: in-process only, strictly the
-        // addressed transcript, under a protected exclusive claim.
-        let result = handle_delete(srv, raw, &params.storage);
+        // addressed transcript, under a protected exclusive claim. The
+        // storage half runs on a blocking thread (05.3b), so an index-lock
+        // wait never pins the routing loop.
+        let result = handle_delete_async(srv, raw, &params.storage).await;
         srv.respond_value(id, result);
         return;
     }
@@ -1622,36 +1624,58 @@ struct DeleteParams {
 ///   `deleted`. Primary-delete failures report `error` and stay retryable.
 ///   Auxiliary archive/task-log sweep warnings stay in `detail`/stderr and
 ///   never flip the primary status.
+// Sync entry point kept for the unit tests; production dispatch uses
+// `handle_delete_async` so the blocking storage half runs off-loop.
+#[cfg(test)]
 fn handle_delete(srv: &Server, raw: &Value, storage: &StateDir) -> Result<Value, AcpError> {
     let req: DeleteParams = parse_params(raw)?;
     let id: MakiId = req.session_id.parse().map_err(|_| {
         AcpError::invalid_params().data(serde_json::json!({"sessionId": req.session_id}))
     })?;
-    if srv.allocations.contains_key(&req.session_id)
-        || srv.activating.contains_key(&req.session_id)
-        || srv.sessions.contains_key(&req.session_id)
+    if let Some(busy) = delete_liveness(srv, &req.session_id) {
+        return Ok(busy);
+    }
+    delete_stored(storage, id, &req.session_id)
+}
+
+/// Live-state half of `_maki/session/delete`: answers `busy` when this
+/// process owns the transcript (allocation, activating startup, active
+/// runtime, or in-flight release) without touching the filesystem, so a
+/// resumed session is never deleted. Runs on the routing loop.
+fn delete_liveness(srv: &Server, session_id: &str) -> Option<Value> {
+    if srv.allocations.contains_key(session_id)
+        || srv.activating.contains_key(session_id)
+        || srv.sessions.contains_key(session_id)
     {
-        return Ok(methods::delete_result(
-            &req.session_id,
+        return Some(methods::delete_result(
+            session_id,
             "busy",
             "session is live in this process",
         ));
     }
     if matches!(
-        srv.release_records.lock().unwrap().get(&req.session_id),
+        srv.release_records.lock().unwrap().get(session_id),
         Some(ReleaseRecord::InFlight { .. })
     ) {
-        return Ok(methods::delete_result(
-            &req.session_id,
+        return Some(methods::delete_result(
+            session_id,
             "busy",
             "session release is in flight",
         ));
     }
+    None
+}
+
+/// Storage half of `_maki/session/delete`: strict-claim delete of exactly
+/// the addressed transcript. Blocking (claim, file and index-lock work up
+/// to the 5s index wait): call only from a blocking thread, never the async
+/// routing loop.
+fn delete_stored(storage: &StateDir, id: MakiId, session_id: &str) -> Result<Value, AcpError> {
     let sessions_dir = storage
         .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
         .map_err(|error| {
             AcpError::internal_error().data(serde_json::json!({
-                "sessionId": req.session_id,
+                "sessionId": session_id,
                 "reason": error.to_string(),
             }))
         })?;
@@ -1659,14 +1683,14 @@ fn handle_delete(srv: &Server, raw: &Value, storage: &StateDir) -> Result<Value,
         Ok(claim) => claim,
         Err(SessionError::Busy { .. }) => {
             return Ok(methods::delete_result(
-                &req.session_id,
+                session_id,
                 "busy",
                 "session is held by another process",
             ));
         }
         Err(error) => {
             return Ok(methods::delete_result(
-                &req.session_id,
+                session_id,
                 "error",
                 &format!("strict claim failed: {error}"),
             ));
@@ -1675,26 +1699,48 @@ fn handle_delete(srv: &Server, raw: &Value, storage: &StateDir) -> Result<Value,
     // The claim is held across the delete: no probe, no force path.
     match StoredSession::delete(&claim, storage) {
         Ok(()) => Ok(methods::delete_result(
-            &req.session_id,
+            session_id,
             "deleted",
             "transcript deleted",
         )),
         Err(error) if error.is_not_found() => Ok(methods::delete_result(
-            &req.session_id,
+            session_id,
             "absent",
             "no transcript for session",
         )),
         Err(SessionError::Busy { .. }) => Ok(methods::delete_result(
-            &req.session_id,
+            session_id,
             "busy",
             "session is held by another process",
         )),
         Err(error) => Ok(methods::delete_result(
-            &req.session_id,
+            session_id,
             "error",
             &format!("delete failed: {error}"),
         )),
     }
+}
+
+/// Async dispatch wrapper (05.3b): liveness answers on the routing loop, the
+/// blocking storage delete runs on a blocking thread so an index-lock wait
+/// (up to 5s on contention) never pins the tokio worker behind the loop.
+async fn handle_delete_async(
+    srv: &Server,
+    raw: &Value,
+    storage: &StateDir,
+) -> Result<Value, AcpError> {
+    let req: DeleteParams = parse_params(raw)?;
+    let id: MakiId = req.session_id.parse().map_err(|_| {
+        AcpError::invalid_params().data(serde_json::json!({"sessionId": req.session_id}))
+    })?;
+    if let Some(busy) = delete_liveness(srv, &req.session_id) {
+        return Ok(busy);
+    }
+    let storage = storage.clone();
+    let session_id = req.session_id.clone();
+    spawn_blocking(move || delete_stored(&storage, id, &session_id))
+        .await
+        .map_err(|error| AcpError::internal_error().data(json_str(&error)))?
 }
 
 #[derive(Debug, Deserialize)]
@@ -8256,6 +8302,33 @@ mod tests {
         let result = handle_delete(&srv, &delete_request(&id.to_string()), &storage)
             .expect("I/O failure answers with error status");
         assert_eq!(result["status"], "error");
+    }
+
+    /// 05.3b: the async dispatch path answers off the routing loop (storage
+    /// work on a blocking thread) with the same contract: deleted, then
+    /// idempotent absent; malformed ids reject before touching storage.
+    #[tokio::test]
+    async fn owned_delete_async_path_matches_sync_contract() {
+        let harness = StarterHarness::default();
+        let (srv, _, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let id = stored_session_with_transcript(&storage);
+
+        let first = handle_delete_async(&srv, &delete_request(&id.to_string()), &storage)
+            .await
+            .expect("delete answers");
+        assert_eq!(first["status"], "deleted");
+
+        let repeat = handle_delete_async(&srv, &delete_request(&id.to_string()), &storage)
+            .await
+            .expect("repeat answers");
+        assert_eq!(repeat["status"], "absent");
+
+        let malformed = handle_delete_async(&srv, &delete_request("not-an-id"), &storage)
+            .await
+            .unwrap_err();
+        assert_eq!(malformed.code, AcpError::invalid_params().code);
     }
 
     /// 02.10b helpers: a release request plus the deferred-outcome collector.

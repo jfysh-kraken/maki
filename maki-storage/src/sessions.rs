@@ -76,6 +76,48 @@ const CWD_INDEX_LOCK_FILE: &str = "cwd_latest.lock";
 /// fd-inheritance window: a genuine holder outlives that by design.
 const CWD_INDEX_LOCK_WAIT: Duration = Duration::from_secs(5);
 const CWD_INDEX_LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Test-only pause points at the index read-modify-write points (05.3b).
+/// Production builds see none of this: the module and both call sites are
+/// `cfg(test)`, so the hooks compile to nothing outside tests. A parked
+/// writer holds `cwd_latest.lock` between `load_cwd_index` and the
+/// `atomic_write`, letting a test drive a peer writer or purge into the
+/// lock wait deterministically.
+#[cfg(test)]
+pub(crate) mod index_pause {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// When set, a writer reaching an index read-modify-write point parks
+    /// there (still holding the index lock) until the flag clears.
+    pub static PAUSE_AT_INDEX_RMW: AtomicBool = AtomicBool::new(false);
+    /// Writers currently parked at a pause point.
+    pub static PARKED_WRITERS: AtomicU32 = AtomicU32::new(0);
+
+    pub fn pause_at_rmw_point() {
+        if !PAUSE_AT_INDEX_RMW.load(Ordering::SeqCst) {
+            return;
+        }
+        PARKED_WRITERS.fetch_add(1, Ordering::SeqCst);
+        while PAUSE_AT_INDEX_RMW.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        PARKED_WRITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Waits (with a loud deadline, never forever) for `count` writers to
+    /// park. Panics instead of hanging the suite when nobody arrives.
+    pub fn wait_parked(count: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while PARKED_WRITERS.load(Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "index writer never reached the pause point"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
@@ -1568,6 +1610,8 @@ fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), Sto
     // note on `CWD_INDEX_LOCK_FILE`); the index lock below is taken second.
     let _index_lock = acquire_cwd_index_lock(dir)?;
     let mut index = load_cwd_index(dir);
+    #[cfg(test)]
+    index_pause::pause_at_rmw_point();
     let id_str = session_id.to_string();
     if index.get(cwd).is_some_and(|v| *v == id_str) {
         return Ok(());
@@ -1635,6 +1679,8 @@ fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageEr
     // Same lock order as `update_cwd_index`: claim first, index lock second.
     let _index_lock = acquire_cwd_index_lock(dir)?;
     let mut index = load_cwd_index(dir);
+    #[cfg(test)]
+    index_pause::pause_at_rmw_point();
     let before = index.len();
     index.retain(|_, v| v.parse::<MakiId>() != Ok(session_id));
     if index.len() != before {
@@ -2461,8 +2507,8 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, acquire_cwd_index_lock_for, cwd_index_lock_path, generate_title, json_path,
-        jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch, update_cwd_index,
+        TAIL_BUF, acquire_cwd_index_lock_for, cwd_index_lock_path, generate_title, index_pause,
+        json_path, jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch, update_cwd_index,
         write_full_session,
     };
     use super::{
@@ -2481,6 +2527,7 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -3774,6 +3821,203 @@ mod tests {
             matches!(err, StorageError::IndexBusy),
             "a silent skip is not an option, got: {err}"
         );
+    }
+
+    // -- Deterministic save/purge interleavings (05.3b) --
+    //
+    // The pause points sit inside the lock-held region (after `load_cwd_index`,
+    // before the `atomic_write`), so a parked writer holds `cwd_latest.lock`.
+    // A peer that arrives mid-RMW must block in `acquire_cwd_index_lock`,
+    // never slip a stale snapshot past the parked writer. Without the lock
+    // the save-vs-purge test below would resurrect the purged entry (the
+    // parked save's snapshot still maps it) and the two-saves test could drop
+    // one entry; both fail loudly instead of hanging.
+    //
+    // The pause flag is process-global, so these tests serialise on a shared
+    // guard; otherwise two of them setting the flag at once would park each
+    // other's peers.
+
+    static PAUSE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// B's save parked mid-read-modify-write (holding the index lock) with a
+    /// snapshot that still maps A's cwd, while A's purge arrives and must
+    /// wait; after release the purge removes exactly A's entry and B's entry
+    /// survives. Real storage paths throughout (`save_to` / `delete_from`),
+    /// no mocked deletion replies.
+    #[test]
+    fn index_interleaving_save_vs_purge_keeps_latest() {
+        let _serial = PAUSE_TEST_GUARD.lock().unwrap();
+        index_pause::PAUSE_AT_INDEX_RMW.store(false, Ordering::SeqCst);
+        assert_eq!(
+            index_pause::PARKED_WRITERS.load(Ordering::SeqCst),
+            0,
+            "no writer parks outside a pause test"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session_a: TestSession = Session::new("m", "/project-a");
+        session_a.save_to(&claim_for(dir, &session_a), dir).unwrap();
+        let id_a = session_a.id;
+        let mut session_b: TestSession = Session::new("m", "/project-b");
+        let id_b = session_b.id;
+
+        index_pause::PAUSE_AT_INDEX_RMW.store(true, Ordering::SeqCst);
+        let dir_b = dir.to_path_buf();
+        let save_b = thread::spawn(move || {
+            let result = session_b.save_to(&claim_for(&dir_b, &session_b), &dir_b);
+            (id_b, result)
+        });
+        index_pause::wait_parked(1);
+        // B is parked mid-RMW holding the lock. A's purge must block behind
+        // it, never land a stale write first.
+        let purge_done = Arc::new(AtomicBool::new(false));
+        let purge_flag = Arc::clone(&purge_done);
+        let dir_a = dir.to_path_buf();
+        let purge_a = thread::spawn(move || {
+            let claim = claim_id(&dir_a, id_a);
+            let result = TestSession::delete_from(&claim, &dir_a);
+            purge_flag.store(true, Ordering::SeqCst);
+            result
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !purge_done.load(Ordering::SeqCst),
+            "purge must wait for the parked save, not slip past it"
+        );
+        index_pause::PAUSE_AT_INDEX_RMW.store(false, Ordering::SeqCst);
+        let (saved_b, save_result) = save_b.join().unwrap();
+        save_result.unwrap();
+        purge_a.join().unwrap().unwrap();
+        assert_eq!(saved_b, id_b);
+
+        let index = load_cwd_index(dir);
+        assert_eq!(
+            index.get("/project-b"),
+            Some(&id_b.to_string()),
+            "B's save lands in the index"
+        );
+        assert!(
+            !index.values().any(|v| *v == id_a.to_string()),
+            "A's purge removes exactly A's entry, the parked snapshot never resurrects it"
+        );
+        assert!(!jsonl_path(dir, id_a).exists(), "A's transcript is gone");
+        assert!(
+            TestSession::load_from(id_b, dir).is_ok(),
+            "B's transcript loads"
+        );
+    }
+
+    /// Two saves to distinct session IDs through the same pause points: the
+    /// second blocks behind the parked first, then both entries survive.
+    #[test]
+    fn index_interleaving_two_saves_to_distinct_ids_keep_both() {
+        let _serial = PAUSE_TEST_GUARD.lock().unwrap();
+        index_pause::PAUSE_AT_INDEX_RMW.store(false, Ordering::SeqCst);
+        assert_eq!(index_pause::PARKED_WRITERS.load(Ordering::SeqCst), 0);
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session_a: TestSession = Session::new("m", "/project-a");
+        let id_a = session_a.id;
+        let mut session_b: TestSession = Session::new("m", "/project-b");
+        let id_b = session_b.id;
+
+        index_pause::PAUSE_AT_INDEX_RMW.store(true, Ordering::SeqCst);
+        let dir_a = dir.to_path_buf();
+        let save_a =
+            thread::spawn(move || session_a.save_to(&claim_for(&dir_a, &session_a), &dir_a));
+        index_pause::wait_parked(1);
+        let saved_b = Arc::new(AtomicBool::new(false));
+        let saved_flag = Arc::clone(&saved_b);
+        let dir_b = dir.to_path_buf();
+        let save_b = thread::spawn(move || {
+            let result = session_b.save_to(&claim_for(&dir_b, &session_b), &dir_b);
+            saved_flag.store(true, Ordering::SeqCst);
+            result
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !saved_b.load(Ordering::SeqCst),
+            "second save must wait for the parked first"
+        );
+        index_pause::PAUSE_AT_INDEX_RMW.store(false, Ordering::SeqCst);
+        save_a.join().unwrap().unwrap();
+        save_b.join().unwrap().unwrap();
+
+        let index = load_cwd_index(dir);
+        assert_eq!(index.get("/project-a"), Some(&id_a.to_string()));
+        assert_eq!(index.get("/project-b"), Some(&id_b.to_string()));
+    }
+
+    /// Timed lock holder for
+    /// [`index_writer_waits_for_lock_release_in_another_process`]. Spawned as
+    /// `current_exe --exact <this test>` with `MAKI_STORAGE_INDEX_LOCK_TIMED`
+    /// (lock path), `MAKI_STORAGE_INDEX_LOCK_READY` (readiness file) and
+    /// `MAKI_STORAGE_INDEX_LOCK_HOLD_MS` set; with none set it is a no-op so
+    /// the normal suite stays green.
+    #[test]
+    fn index_lock_child_holds_lock_briefly() {
+        let (Ok(lock_path), Ok(ready_path), Ok(hold_ms)) = (
+            std::env::var("MAKI_STORAGE_INDEX_LOCK_TIMED"),
+            std::env::var("MAKI_STORAGE_INDEX_LOCK_READY"),
+            std::env::var("MAKI_STORAGE_INDEX_LOCK_HOLD_MS"),
+        ) else {
+            return;
+        };
+        let hold_ms: u64 = hold_ms.parse().expect("hold ms parses");
+        let _held = Lock::acquire(Path::new(&lock_path)).expect("child takes index lock");
+        fs::write(&ready_path, b"ready").expect("child signals parent");
+        thread::sleep(Duration::from_millis(hold_ms));
+    }
+
+    /// A second process holding `cwd_latest.lock` blocks the writer until
+    /// release: the writer waits (well under its 5s budget) and then lands
+    /// the entry, instead of failing `IndexBusy` or skipping the update.
+    #[test]
+    fn index_writer_waits_for_lock_release_in_another_process() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let lock_path = cwd_index_lock_path(&dir);
+        let ready_path = dir.join("child-ready");
+        let _child = KillOnDrop(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("sessions::tests::index_lock_child_holds_lock_briefly")
+                .env("MAKI_STORAGE_INDEX_LOCK_TIMED", &lock_path)
+                .env("MAKI_STORAGE_INDEX_LOCK_READY", &ready_path)
+                .env("MAKI_STORAGE_INDEX_LOCK_HOLD_MS", "500")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn lock-holding child process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "lock-holding child never signalled readiness"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let id = MakiId::generate();
+        let start = Instant::now();
+        update_cwd_index(&dir, "/project", id).unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250),
+            "writer must have waited for the other process, took {waited:?}"
+        );
+        assert_eq!(load_cwd_index(&dir).get("/project"), Some(&id.to_string()));
     }
 
     /// Clones share one lock, so a snapshot still queued keeps its session
