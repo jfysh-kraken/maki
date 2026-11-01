@@ -831,7 +831,10 @@ async fn call_tool(
 /// Nobody can answer its permission prompts, so a call that would prompt is
 /// denied and the subagent is told why. Your rules, "allow for this session"
 /// answers and YOLO still apply, so add allow rules for what it runs (see
-/// [Permissions](/docs/permissions/)). It always runs in build mode. While the
+/// [Permissions](/docs/permissions/)). An attached session inherits its
+/// parent's mode: a plan parent's child keeps the nominated plan file as
+/// its one writable path, anything else native-write rejects. A background
+/// session opened by chat id always runs in build mode. While the
 /// chat is in plan mode its file-write tools are denied. Its thinking never
 /// goes above the chat's current setting.
 ///
@@ -1144,6 +1147,15 @@ async fn session(
         stop: StopMark::default(),
     });
     cancellation.end_mailbox_on_cancel(child_cancel.clone());
+    // 02.6: an attached child inherits the parent mode/plan path fixed at
+    // open (Build stays the default for top-level work). A background
+    // session opened by chat id has no parent mode to inherit: it stays
+    // Build and every write asks `background_write_block` instead.
+    let inherited_mode = if owner.is_some() {
+        AgentMode::Build
+    } else {
+        agent_ctx.mode.clone()
+    };
     let background = match owner {
         Some((session, task, cancel)) => {
             try_pair!(registry.register(BackgroundTask {
@@ -1219,6 +1231,7 @@ async fn session(
         },
         context,
         opts,
+        mode: inherited_mode,
         mcp: agent_ctx
             .mcp
             .as_ref()
@@ -1468,6 +1481,10 @@ struct SessionState {
     context: RunContextBuilder,
     /// Already reconciled against `params.model`, so every reader agrees.
     opts: RequestOptions,
+    /// 02.6: the parent mode/plan path fixed at open. Attached sessions
+    /// inherit it; background sessions stay Build and rely on
+    /// `background_write_block` instead.
+    mode: AgentMode,
     /// Fresh per session so `tool_search` loads never leak between a
     /// subagent and its parent.
     mcp: Option<McpSession>,
@@ -1838,10 +1855,10 @@ fn announce_consumed(event_tx: &EventSender, text: &str, images: &[ImageSource])
     });
 }
 
-fn plugin_input(message: String, opts: RequestOptions) -> AgentInput {
+fn plugin_input(message: String, opts: RequestOptions, mode: AgentMode) -> AgentInput {
     AgentInput {
         message,
-        mode: AgentMode::Build,
+        mode,
         images: Vec::new(),
         preamble: Vec::new(),
         earlier: Vec::new(),
@@ -1965,7 +1982,7 @@ async fn prompt(
     let history_len = s.history.len();
     let mut input = AgentInput {
         earlier,
-        ..plugin_input(message, s.opts)
+        ..plugin_input(message, s.opts, s.mode.clone())
     };
     // A call moved off a run reports to the session's mailbox, and the caller
     // is owed the answer that comes after it. So the prompt waits for every
@@ -2017,7 +2034,7 @@ async fn prompt(
                 input = AgentInput {
                     preamble: notices,
                     earlier: take_waiting(&inbox, &s.sub_event_tx),
-                    ..plugin_input(String::new(), s.opts)
+                    ..plugin_input(String::new(), s.opts, s.mode.clone())
                 };
             }
             Ok(None) => break None,
@@ -2112,8 +2129,13 @@ fn send(_lua: &Lua, this: &LuaSession, message: String) -> LuaResult<Pair<bool>>
         return Ok(err_pair(refusal));
     }
     // A sent message never picks the run's settings, so these are inert.
-    this.inbox
-        .push(plugin_input(message, RequestOptions::default()));
+    // Mode is inert here too: `EarlierInput` drops it, the prompt's own
+    // stored mode decides the run.
+    this.inbox.push(plugin_input(
+        message,
+        RequestOptions::default(),
+        AgentMode::Build,
+    ));
     Ok((Some(true), None))
 }
 
@@ -2367,6 +2389,118 @@ mod tests {
             std::env::current_dir().expect("the process cwd is readable"),
             process_cwd,
             "attached resolution never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.6 joint proof (02.5a cwd audit + plan gate): an attached child
+    /// inherits its parent cwd AND its fixed mode/plan path together, and a
+    /// nested child opened from it inherits both again. No background move
+    /// happens here, so this is also the blocking (`--background-timeout 0`)
+    /// path: blocking execution alone never restores the silent Build
+    /// default. Proved through the real `maki.agent.session` open for both
+    /// levels, with the process cwd unchanged throughout.
+    #[tokio::test]
+    async fn attached_and_nested_sessions_inherit_plan_mode_and_cwd() {
+        use maki_agent::agent::tool_dispatch::silent_mutation_check;
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = tempfile::TempDir::new().unwrap();
+        let dir = project.path().canonicalize().unwrap();
+        assert_ne!(
+            dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+        let plan = dir.join("plan.md");
+        assert!(plan.is_absolute(), "the nominated plan path is absolute");
+        std::fs::write(&plan, "draft").unwrap();
+        std::fs::write(dir.join("other.md"), "untouchable").unwrap();
+
+        let permissions = Arc::new(maki_agent::permissions::PermissionManager::new(
+            maki_config::PermissionsConfig {
+                default: maki_config::DefaultEffect::Allow,
+                rules: vec![],
+                ..Default::default()
+            },
+            dir.clone(),
+            maki_config::ProjectConfig::discover(&dir),
+            Arc::default(),
+        ));
+        let plan_mode = maki_agent::AgentMode::Plan(plan.clone());
+        let mut ctx = stub_ctx_with(&plan_mode, None, None);
+        ctx.cwd = dir.clone();
+        ctx.permissions = permissions;
+        assert_eq!(ctx.cwd, dir, "the parent serves its own project");
+
+        let lua = mlua::Lua::new();
+        let sess = native_session(&lua, &ctx).await;
+        let (child_mode, child_cwd, child_permissions) = session_state(&sess, |state| {
+            (
+                state.mode.clone(),
+                state.params.permissions.cwd(),
+                Arc::clone(&state.params.permissions),
+            )
+        });
+        assert_eq!(
+            child_mode, plan_mode,
+            "the attached child keeps the parent gate"
+        );
+        assert_eq!(child_cwd, dir, "the attached child keeps the parent cwd");
+
+        // The gate itself: the nominated plan file writes, another in-cwd
+        // native write rejects under the inherited mode.
+        let mut check_ctx = stub_ctx_with(&child_mode, None, None);
+        check_ctx.cwd = dir.clone();
+        check_ctx.permissions = Arc::clone(&child_permissions);
+        assert!(
+            silent_mutation_check(&check_ctx, "write", &plan.display().to_string()).is_ok(),
+            "the plan session writes its nominated file"
+        );
+        assert!(
+            silent_mutation_check(
+                &check_ctx,
+                "write",
+                &dir.join("other.md").display().to_string()
+            )
+            .is_err(),
+            "another in-cwd native write still rejects under the inherited gate"
+        );
+
+        // Nested child: opened from the attached child's lineage, it retains
+        // the same gate and cwd rather than falling back to Build.
+        let mut nested_parent =
+            maki_agent::tools::test_support::stub_ctx_with(&child_mode, None, None);
+        nested_parent.cwd = dir.clone();
+        nested_parent.permissions = Arc::clone(&child_permissions);
+        nested_parent.session_id = ctx.session_id.clone();
+        let nested = native_session(&lua, &nested_parent).await;
+        let (nested_mode, nested_cwd) = session_state(&nested, |state| {
+            (state.mode.clone(), state.params.permissions.cwd())
+        });
+        assert_eq!(
+            nested_mode, plan_mode,
+            "the nested child keeps the grandparent gate, not a silent Build default"
+        );
+        assert_eq!(
+            nested_cwd, dir,
+            "the nested child keeps the grandparent cwd"
+        );
+
+        // Build default still works: a Build parent begets a Build child.
+        let mut build_ctx = stub_ctx_with(&maki_agent::AgentMode::Build, None, None);
+        build_ctx.cwd = dir.clone();
+        build_ctx.permissions = Arc::clone(&child_permissions);
+        let build_sess = native_session(&lua, &build_ctx).await;
+        assert_eq!(
+            session_state(&build_sess, |state| state.mode.clone()),
+            maki_agent::AgentMode::Build,
+            "build stays the default"
+        );
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "mode/cwd inheritance never moves the Maki process cwd"
         );
     }
 
