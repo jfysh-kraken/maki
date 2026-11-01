@@ -15,17 +15,21 @@ fixtures in `server.rs` tests), slice 02.9b wires cleanup confirmation
 and retry (the cancelled run's terminal confirms in blocking mode, failure
 or a lapsed bounded wait reports explicitly non-resumable uncertainty;
 fixtures in `server.rs` tests, escaped-child limitations recorded in
-`tests/cleanup_probes.rs`), and slice 02.10a wires task/pump supervision
+`tests/cleanup_probes.rs`), slice 02.10a wires task/pump supervision
 (post-activation task/pump death, stream end, dead input channels, and
 provider-init failure detected from activation onward including while idle;
 exactly-once loss settlement through the turn epoch, ask retirement in both
 modes, `lost` lifecycle with the 02.1 reason/rawReason/usable fields;
-fixtures in `server.rs` tests). Active-session release (02.10b)
-still answers `-32601`, as do the reserved 04.1 and 05.2 names. This document
+fixtures in `server.rs` tests), and slice 02.10b wires bounded individual
+release and shutdown (release settles through the per-session control lock,
+tears down task/pump/hooks/MCP boundedly off the routing loop, and reports
+`released`/`release_failed` with prior loss where recorded; fixtures in
+`server.rs` tests and `tests/allocation_activation.rs`). The reserved 04.1
+and 05.2 names still answer `-32601`. This document
 stays normative; the one deliberate delta is the advertised method list: the
-capability only names the methods the binary answers (allocate+activate+cancel
-today; release joins in 02.10b), so probing an unlisted method keeps reporting
-"unsupported".
+capability only names the methods the binary answers
+(allocate+activate+cancel+release today), so probing an unlisted method keeps
+reporting "unsupported".
 
 Scope: one patched Maki PID owns independent concurrent ACP sessions with
 separate cwd/model/plan context, permission routing and supervised lifecycle.
@@ -162,15 +166,23 @@ unknown session is `resource_not_found`.
 
 ### `_maki/session/release`
 
-Releases one session; its peers stay usable. The server acks immediately and
-tears down in the background: the ack MUST NOT wait for task join, MCP
-shutdown or transcript flush (bounded teardown is slice 02.10b).
+Releases one session; its peers stay usable. The loop only runs the fast
+prologue — drops the routing entry, settles through the control lock, answers
+the owed prompt, signals the addressed run — and the background task owns the
+slow teardown plus the answer, so slow hooks/MCP never block shared routing.
+The deferred answer is bounded (see below); a second release while it is in
+flight answers `release_in_progress`.
 
 Request params: `{ "sessionId": "...", "reason": "client_done" }`
-(`reason` is a free-form client note, echoed in the lifecycle event).
+(`reason` is a free-form client note, echoed in the lifecycle event;
+`client_done` when absent.)
 Result: `{ "sessionId": "...", "released": true, "turnEpoch": 1 }`.
-Release is idempotent: releasing an already-released id re-answers success
-with the same shape. Releasing an unknown (never-allocated) id is
+Teardown failure answers `-32603` with
+`data: {"reason": "release_failed", "stage": "hook"|"mcp"|"release",
+"rawReason": ..., "usable": false, "sessionId": ...}` instead — never
+`released`. Release is idempotent per outcome: re-releasing a released id
+re-answers the recorded success, re-releasing a failed id re-answers the
+recorded failure. Releasing an unknown (never-allocated) id is
 `resource_not_found`.
 
 ## Lifecycle and lost handles
@@ -187,18 +199,44 @@ Server-to-client notification `_maki/session/lifecycle`:
 }
 ```
 
-`state` is one of `allocated`, `active`, `released`, `lost`. Transitions
-`allocated -> active -> released` are client-driven; `lost` is server-driven
-only: the session's task or event pump died outside a client release (panic,
-supervisor kill, EOF teardown race). A `lost` handle is unusable afterwards;
-the client MUST `release` it to drop the routing entry, and any further
-`session/prompt` or addressed call on it answers `resource_not_found`.
+`state` is one of `allocated`, `active`, `released`, `release_failed`,
+`lost`. Transitions `allocated -> active -> released` are client-driven;
+`release_failed` is the same transition attempted but with a bounded teardown
+stage giving up (never followed by `released` for that session); `lost` is
+server-driven only: the session's task or event pump died outside a client
+release (panic, supervisor kill, EOF teardown race). A `lost` handle is
+unusable afterwards; the client MUST `release` it to drop the routing entry —
+that release reports the recorded prior loss in `priorLoss` plus its own
+cleanup result — and any further `session/prompt` or addressed call on it
+answers `resource_not_found`.
+
+A successful release frame echoes the release note in `rawReason`
+(`client_done` by default; `shutdown` or `replaced` on the close paths), and
+a release of a supervised-dead handle adds the recorded prior loss:
+
+```json
+{
+  "sessionId": "...",
+  "state": "released",
+  "turnEpoch": 1,
+  "rawReason": "client_done",
+  "usable": false,
+  "priorLoss": { "reason": "task_lost", "rawReason": "pump_dead" }
+}
+```
+
+A failed teardown sends `state: "release_failed"` with `stage` naming the
+bounded stage that gave up (`hook`, `mcp`, or `release` for the overall cap),
+the verbatim cause in `rawReason`, and the client's note in `releaseNote`.
+`usable` is always false on both release outcomes: neither frame reopens the
+session.
 
 `rawReason` carries the terminal reason verbatim (provider refusal/filter
 text, `Done` reason, loss cause); it is never remapped, so later slices can
 preserve provider semantics (02.7) without re-parsing display strings.
 `usable` tells the client whether another prompt will be accepted: `false`
-for `released`/`lost` and for non-retryable terminals, `true` otherwise. The
+for `released`/`release_failed`/`lost` and for non-retryable terminals,
+`true` otherwise. The
 standard `PromptResponse.stopReason` keeps its standard values; `rawReason`
 / `usable` are the fork's additive signal.
 
@@ -292,7 +330,7 @@ so when the run ends its blocking tools ended with it.
   tools really die is 02.11's, and final independent-cancellation acceptance
   stays gated on it.
 - `session/load` replaces the runtime wholesale (abort, not confirmation) and
-  is not a confirmation path; its teardown bounds belong to 02.10a/02.10b.
+  is not a confirmation path; its teardown runs the 02.10b background release.
 
 ## Task supervision (02.10a)
 
@@ -324,15 +362,16 @@ prompt exists yet); this slice owns post-activation failures only.
 - Incomplete-teardown boundary: loss performs no teardown — the claim stays
   held and dead handles stay filed. A dropped handle is explicitly not
   cleanup proof. Individual runtime release, EOF/shutdown bounds, and prior-
-  loss-plus-cleanup reporting belong to 02.10b, which inherits the recorded
+  loss-plus-cleanup reporting are 02.10b's, which inherits the recorded
   `loss_reason`/`loss_raw`.
 
 ## Routing-loop rule
 
 Slow setup (provider construction, MCP start, history replay) and slow
 release (task join, MCP shutdown, flush) MUST NOT block the shared routing
-loop: allocate/activate/release ack from the loop and do the slow work on
-spawned tasks, reporting readiness via `_maki/session/lifecycle`. The loop
+loop: allocate/activate answer from the loop with the slow work on spawned
+tasks, and release answers from its background task once bounded teardown
+settles, with readiness/outcome on `_maki/session/lifecycle`. The loop
 itself only matches ids and epochs.
 
 ## Reservations (named only, not implemented)
@@ -345,11 +384,11 @@ itself only matches ids and epochs.
 ## Deferred to later slices
 
  02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
- ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
+  ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
   02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
   cancellation, 02.9b cleanup confirmation and retry, 02.10a task/pump
  supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance. Of the
- above, slices through 02.10a are implemented (active-session release still
- answers `-32601`, as do the reserved 04.1/05.2 names); the harness in `tests/`
+ above, slices through 02.10b are implemented (only the reserved 04.1/05.2
+ names still answer `-32601`); the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

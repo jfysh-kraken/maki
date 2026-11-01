@@ -15,9 +15,10 @@
 //!   `fixed_at_activation`, leaving the fixed setup and the peer alone;
 //! - an idle session stays usable after a cancel dispatch and a rejection;
 //! - addressed cancel answers over the wire (02.9a: idle shape, stale pin,
-//!   unknown session), while active-session release stays the -32601 seam
-//!   (02.10b; allocate/activate moved out of the seam list in 02.3, see
-//!   also `addressed_cancel_answers_while_active_release_stays_a_seam`).
+//!   unknown session), while active-session release is 02.10b (wire shape in
+//!   `tests/allocation_activation.rs`, bounds at unit level in `server.rs`;
+//!   allocate/activate moved out of the seam list in 02.3, see
+//!   also `addressed_cancel_answers_on_both_live_sessions`).
 //!
 //! Every wait is a read-until-match with the frame bound, never a sleep:
 //! correlation itself is the interleaving proof, since peer traffic buffers
@@ -187,9 +188,8 @@ async fn post_activation_changes_route_then_reject() {
     // 02.9a: addressed cancel answers on the wire. The idle session reports
     // `cancelled: false` with the bumped epoch and stays usable; a stale pin
     // rejects with expected/got epochs; an unknown session rejects without
-    // touching either runtime. Active-session release stays the 02.10b seam
-    // (-32601); allocate/activate implement in 02.3 (a bare probe of release
-    // fails param parsing first; see `extension_contract.rs` and
+    // touching either runtime. Active-session release is 02.10b (a bare probe
+    // of release fails param parsing first; see `extension_contract.rs` and
     // `allocation_activation.rs`).
     let idle = shared.child.cancel_raw(&shared.a, None).await.unwrap();
     assert_eq!(idle["result"]["sessionId"], shared.a, "{idle}");

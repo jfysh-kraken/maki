@@ -1,9 +1,9 @@
 //! Fork multi-session ACP extension names and the turn-epoch settlement
 //! helper. Specified in slice 02.1 (`EXTENSION.md` is normative); the
-//! multi-session runtime that wires these in arrives in 02.2a/02.2b. The only
-//! executable piece here is [`TurnEpoch`], the single settlement contract
-//! every later slice shares: bump on terminal/cancel/loss, check late
-//! answers and events against it.
+//! multi-session runtime that wires these in arrives across 02.2a–02.10b.
+//! The only executable piece here is [`TurnEpoch`], the single settlement
+//! contract every later slice shares: bump on terminal/cancel/loss/release,
+//! check late answers and events against it.
 
 /// `_meta` key under `agentCapabilities` advertising the extension. Clients
 /// branch on its presence, never on an agent version string.
@@ -46,17 +46,17 @@ pub const RAW_REASON_META_KEY: &str = "maki.rawReason";
 pub const USABLE_META_KEY: &str = "maki.usable";
 
 /// Advertise the implemented slice of the extension. The contract names four
-/// methods, but the capability only lists what this binary actually answers:
-/// 02.3 implements allocate and activate, 02.9a adds addressed cancel;
-/// release stays probe-to--32601 until 02.10b lands. Clients MUST probe any
-/// method they intend to call: an unlisted method answers `-32601`, which is
-/// the "unsupported" signal, not a failure.
+/// methods, and the capability lists what this binary actually answers:
+/// 02.3 implements allocate and activate, 02.9a adds addressed cancel, and
+/// 02.10b adds bounded active-session release. Clients MUST probe any method
+/// they intend to call: an unlisted method answers `-32601`, which is the
+/// "unsupported" signal, not a failure.
 pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
     agent_client_protocol_schema::v1::Meta::from_iter([(
         CAPABILITY_KEY.to_owned(),
         serde_json::json!({
             "version": CAPABILITY_VERSION,
-            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD, CANCEL_METHOD],
+            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD, CANCEL_METHOD, RELEASE_METHOD],
         }),
     )])
 }
@@ -247,8 +247,9 @@ mod tests {
     }
 
     /// 02.3 advertises exactly the methods it answers: allocate and activate.
-    /// 02.9a adds addressed cancel; active-session release (02.10b) stays
-    /// probe-to--32601 until its slice lands, so advertising it now would lie.
+    /// 02.9a adds addressed cancel, 02.10b adds bounded active-session
+    /// release; advertising an unanswered method would lie, so each slice
+    /// extends this list as it lands.
     #[test]
     fn capability_advertises_only_the_implemented_methods() {
         let meta = super::capability_meta();
@@ -265,7 +266,8 @@ mod tests {
             [
                 super::ALLOCATE_METHOD,
                 super::ACTIVATE_METHOD,
-                super::CANCEL_METHOD
+                super::CANCEL_METHOD,
+                super::RELEASE_METHOD
             ]
         );
     }

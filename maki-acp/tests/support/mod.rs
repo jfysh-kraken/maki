@@ -502,7 +502,8 @@ impl MakiChild {
     }
 
     /// Release a session without asserting success (02.3 implements the
-    /// unactivated-allocation half; active sessions stay the 02.10b seam).
+    /// unactivated-allocation half; 02.10b implements the active-session
+    /// half with a deferred, bounded answer).
     pub async fn release_raw(&mut self, session_id: &str) -> io::Result<Value> {
         let id = self.fresh_id();
         self.send_request(

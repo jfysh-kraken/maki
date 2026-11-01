@@ -42,7 +42,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::extension::TurnEpoch;
@@ -70,6 +71,19 @@ static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUE
 /// reports late but confirmed, while a tool that never reports at all flips
 /// the rejection to uncertain instead of hanging the client on "pending".
 const CLEANUP_GRACE: Duration = Duration::from_secs(30);
+
+/// 02.10b bounded release: every per-session teardown stage is capped, so one
+/// wedged hook or MCP server cannot stall the routing loop or a shutdown.
+/// The session-end hook (the `SessionEnd` callback, invoked per released
+/// session) gets its own short bound; the MCP handle keeps its internal
+/// 2s shutdown bound with this outer cap as backstop; the overall cap keeps
+/// the whole release — hook, task/pump/supervisor reap, MCP shutdown — under
+/// the fixture deadlock bound even when every stage hangs at once. Per-stage
+/// failures surface as `release_failed` (never as `released`); 02.11 owns
+/// tuning these bounds against controlled live evidence.
+const RELEASE_HOOK_TIMEOUT: Duration = Duration::from_secs(2);
+const RELEASE_MCP_TIMEOUT: Duration = Duration::from_secs(3);
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// What the client still owes us. Every agent waits on its own answer channel,
 /// so a child's permission can be outstanding next to the main agent's. The
@@ -124,6 +138,12 @@ struct Pending {
     lost: bool,
     loss_reason: Option<String>,
     loss_raw: Option<String>,
+    /// 02.10b: Close dropped the routing entry. Set once under the control
+    /// lock in the release prologue, atomically with the cancel settlement or
+    /// loss snapshot, so a racing terminal, loss report, answer, or second
+    /// settle can never revive the handle, change its outcome, or touch a
+    /// peer. Late paths check this flag and settle/send nothing.
+    released: bool,
 }
 
 impl Default for Pending {
@@ -142,6 +162,7 @@ impl Default for Pending {
             lost: false,
             loss_reason: None,
             loss_raw: None,
+            released: false,
         }
     }
 }
@@ -196,10 +217,11 @@ struct CancelSettlement {
 
 impl Pending {
     /// Whether the session accepts another prompt. False after an addressed
-    /// cancel settles a live turn, until 02.9b confirms tool cleanup, and
-    /// false once 02.10a marks supervised loss: a lost handle never reopens.
+    /// cancel settles a live turn, until 02.9b confirms tool cleanup, false
+    /// once 02.10a marks supervised loss, and false once 02.10b releases the
+    /// routing entry: a released handle never reopens.
     fn is_resumable(&self) -> bool {
-        !self.awaiting_cleanup && !self.lost
+        !self.awaiting_cleanup && !self.lost && !self.released
     }
 
     /// 02.10a: whether supervised loss was already recorded. A lost handle is
@@ -207,6 +229,22 @@ impl Pending {
     /// further prompt or addressed call answers `resource_not_found`.
     fn is_lost(&self) -> bool {
         self.lost
+    }
+
+    /// 02.10b: whether Close already dropped the routing entry. Late answers,
+    /// terminals, loss reports, and second settles no-op against a released
+    /// handle: they cannot revive it, change its outcome, or touch a peer.
+    fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// 02.10b release prologue, under the same control lock as `claim_ask`,
+    /// `settle_cancel`, and `settle_loss`: marks the handle released
+    /// atomically with the settle/snapshot the caller just took, so a racing
+    /// pump terminal or loss report lands on the other side of the mark and
+    /// is dropped. Called once; the routing entry is already gone.
+    fn mark_released(&mut self) {
+        self.released = true;
     }
 
     /// 02.9b: whether a `cleanup_unconfirmed` rejection must report the
@@ -270,9 +308,14 @@ impl Pending {
     /// the check and the take. Removes the ask either way (exactly-once: a
     /// replay finds an unknown id), and returns it only when it is live for
     /// `owner` under the current epoch. Anything else — unknown,
-    /// already-answered, cross-session, or stale-turn — is dropped by the
-    /// caller without reaching any agent.
+    /// already-answered, cross-session, stale-turn, or released — is dropped
+    /// by the caller without reaching any agent.
     fn claim_ask(&mut self, wire_id: i64, owner: &str) -> Option<Ask> {
+        // 02.10b: the routing entry is gone and the asks are retired; a late
+        // answer must not claim anything, revive the handle, or touch a peer.
+        if self.is_released() {
+            return None;
+        }
         let ask = self.asks.remove(&wire_id)?;
         if ask.session() == owner && self.epoch.check(ask.epoch()).is_ok() {
             Some(ask)
@@ -294,6 +337,18 @@ impl Pending {
     /// tool actually died is 02.11's controlled live evidence, not claimed
     /// here.
     fn settle_cancel(&mut self) -> CancelSettlement {
+        // 02.10b: a settle after Close changes nothing — no bump, no take —
+        // so a Stop racing a release can never revive the handle or move its
+        // epoch. Close itself settles before marking released, under this same
+        // guard, so it queues behind an in-flight cancel instead of bypassing.
+        if self.is_released() {
+            return CancelSettlement {
+                prompt: None,
+                turn: None,
+                cancelled: false,
+                epoch: self.epoch.current(),
+            };
+        }
         let turn = self.epoch.current();
         let live = match (&self.prompt, self.turn) {
             (Some(_), Some(parked)) => self.epoch.check(parked).is_ok(),
@@ -332,7 +387,10 @@ impl Pending {
     /// explicitly not cleanup proof, and 02.10b's release reports this prior
     /// loss plus its own cleanup result.
     fn settle_loss(&mut self, reason: &str, raw: &str) -> LossSettlement {
-        if self.lost {
+        // 02.10b: a loss report after Close is late by definition — no bump,
+        // no take, no send — so a racing pump stream-end or supervisor report
+        // can never change the released outcome or emit a post-release `lost`.
+        if self.is_lost() || self.is_released() {
             return LossSettlement {
                 first: false,
                 prompt: None,
@@ -374,12 +432,12 @@ struct LossSettlement {
     epoch: u64,
 }
 /// The per-session control lock. Answer (client response), Stop (addressed
-/// cancel), and — in 02.10b — Close all serialize through this one mutex,
-/// reusing the 02.2b session/turn identity: an answer claims its ask and a
-/// cancel settles the turn under the same guard, so a queued answer can never
-/// bypass an in-flight cancel settlement. 02.10b routes Close through this
-/// same guard (cancel-settle, then bounded teardown); this slice builds the
-/// Answer/Stop half only.
+/// cancel), and Close (02.10b release) all serialize through this one mutex,
+/// reusing the 02.2b session/turn identity: an answer claims its ask, a cancel
+/// settles the turn, and a Close settle-then-marks-released under the same
+/// guard, so a queued answer or Close can never bypass an in-flight cancel
+/// settlement and a racing terminal or loss report after the mark settles
+/// nothing.
 type PendingState = Arc<Mutex<Pending>>;
 
 /// One independently owned session runtime. Each entry in the registry owns its
@@ -408,14 +466,15 @@ struct SessionRuntime {
     /// claim instead of clashing with it.
     claim: SessionClaim,
     /// The runtime owns its pump task; closing the session aborts and reaps it
-    /// (bounded teardown of the release path itself is 02.10b).
+    /// on the bounded release path.
     pump: JoinHandle<()>,
     /// 02.10a pump-death supervisor, off the shared routing loop. It holds no
     /// pump handle: the pump holds a done-sender and this task awaits its
     /// disconnect, so a panicked or silently-exited pump still reports `lost`
     /// exactly once while idle, without polling the loop. Aborted with the
-    /// pump on close, so shutdown never reports loss. No teardown runs here;
-    /// 02.10b owns bounded release.
+    /// pump on release/shutdown — after the handle is marked released under
+    /// the control lock — so teardown never reports loss. No teardown runs
+    /// here; bounded release (`begin_release`) owns it.
     supervisor: JoinHandle<()>,
 }
 
@@ -516,7 +575,45 @@ struct Server {
     /// exits promptly; the task's report then fails and its pieces drop.
     completion: WeakSender<Incoming>,
     on_session_end: Option<SessionEndHook>,
+    /// 02.10b background release tasks (explicit release, load replacement,
+    /// and the shutdown sweep). The routing loop never awaits teardown: it
+    /// spawns here and moves on, so a held hook or MCP teardown cannot stall
+    /// peer cancel/permission routing. Shutdown drains this set, so a release
+    /// already in flight still reports its outcome instead of being dropped.
+    release_tasks: JoinSet<()>,
+    /// 02.10b terminal release outcomes by session id, shared with the
+    /// background tasks that record them. A re-release re-answers the recorded
+    /// outcome — success stays idempotent, a failed teardown stays honestly
+    /// failed — instead of claiming a new release over a dropped claim.
+    /// `InFlight` covers the window between the routing-entry drop and the
+    /// background task's report.
+    release_records: ReleaseRecords,
 }
+
+/// Terminal release outcome for one session id. Shared between the routing
+/// loop (which files `InFlight` when it drops the entry and reads records
+/// for re-releases) and the background task (which replaces it with `Done`).
+#[derive(Debug, Clone)]
+enum ReleaseRecord {
+    InFlight {
+        epoch: u64,
+    },
+    Done {
+        epoch: u64,
+        failure: Option<ReleaseFailure>,
+    },
+}
+
+/// Which bounded teardown stage failed, and the verbatim cause. Reported
+/// distinctly from success: the release response is an error and the
+/// lifecycle frame is `release_failed`, never `released`.
+#[derive(Debug, Clone)]
+struct ReleaseFailure {
+    stage: &'static str,
+    raw: String,
+}
+
+type ReleaseRecords = Arc<Mutex<HashMap<String, ReleaseRecord>>>;
 
 impl Server {
     /// Look up the runtime a request addresses. A miss rejects without
@@ -587,6 +684,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         starter: production_starter(),
         completion: in_tx.downgrade(),
         on_session_end: params.on_session_end.clone(),
+        release_tasks: JoinSet::new(),
+        release_records: ReleaseRecords::default(),
     };
 
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
@@ -728,9 +827,10 @@ async fn handle_request(
     // slow work. Activate validates synchronously and defers the result: the
     // dedicated task settles it exactly once on completion, so slow provider
     // and MCP startup never blocks this loop. Addressed cancel (02.9a)
-    // settles synchronously through the turn epoch and answers at once; only
-    // active-session (bounded) release is still the 02.10b seam answering
-    // -32601.
+    // settles synchronously through the turn epoch and answers at once.
+    // Active-session release (02.10b) settles synchronously through the same
+    // control lock and defers only the answer: the background task reports the
+    // bounded teardown outcome, so slow hooks/MCP never block this loop.
     if method == extension::ALLOCATE_METHOD {
         let result = handle_allocate(srv, raw, params);
         srv.respond_value(id, result);
@@ -743,8 +843,10 @@ async fn handle_request(
         return;
     }
     if method == extension::RELEASE_METHOD {
-        let result = handle_release(srv, raw);
-        srv.respond_value(id, result);
+        // `None` means the background release task owns the answer now.
+        if let Some(result) = handle_release(srv, raw, id.clone()) {
+            srv.respond_value(id, result);
+        }
         return;
     }
     if method == extension::CANCEL_METHOD {
@@ -770,17 +872,10 @@ async fn handle_request(
         "session/set_mode" => handle_set_mode(srv, raw),
         "session/set_config_option" => handle_set_config(srv, raw),
         // Reserved 04.1/05.2 names keep answering -32601 through the
-        // catch-all below, as does active-session release (02.10b).
+        // catch-all below.
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
-}
-
-/// Marks a fork extension method as a seam for its owning slice. The answer
-/// stays -32601, identical to an unknown method, so capability probing keeps
-/// reporting "unsupported" until that slice lands.
-fn extension_seam(_method: &str, _owner: &str) -> AcpError {
-    AcpError::method_not_found()
 }
 
 /// Production slow half of activation: resolve trust, start MCP, then spawn
@@ -1126,25 +1221,353 @@ fn settle_activation(srv: &mut Server, key: String, id: RequestId, outcome: Acti
 struct ReleaseParams {
     #[serde(rename = "sessionId")]
     session_id: String,
+    /// Free-form client note, echoed in the lifecycle frame. Absent on older
+    /// clients; defaults to `client_done`.
+    reason: Option<String>,
 }
 
-/// Releases an unactivated allocation: the lease drops, the id is forgotten.
-/// Releasing an id with startup in flight is rejected (that race belongs to
-/// cancel scoping, 02.9a); releasing an active session is still the 02.10b
-/// seam; releasing anything else is `resource_not_found`.
-fn handle_release(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
-    let req: ReleaseParams = parse_params(raw)?;
+/// 02.10b failed-teardown error: which bounded stage gave up and why, plus
+/// usability. Never `released`: a failed teardown leaves the runtime failed
+/// and non-resumable, and re-releases re-answer this error honestly instead
+/// of claiming a success that never happened.
+fn release_failed_error(session_id: &str, stage: &str, raw: &str) -> AcpError {
+    AcpError::internal_error().data(serde_json::json!({
+        "reason": "release_failed",
+        "stage": stage,
+        "rawReason": raw,
+        "usable": false,
+        "sessionId": session_id,
+    }))
+}
+
+/// A duplicate release racing the background task: the routing entry is
+/// already gone but the outcome is not recorded yet. Rejects instead of
+/// answering a second receipt for one release.
+fn release_in_progress(session_id: &str, epoch: u64) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": "release_in_progress",
+        "sessionId": session_id,
+        "turnEpoch": epoch,
+    }))
+}
+
+/// Releases one session. An unactivated allocation drops its lease at once;
+/// an id with startup in flight is rejected; an unknown id is
+/// `resource_not_found`. An active session settles synchronously through the
+/// per-session control lock — Close queues behind an in-flight Answer/Stop,
+/// cancels the addressed turn and retires its asks through the 02.9a path —
+/// then tears down on a background task and answers there, so slow hooks or
+/// MCP shutdown never block the routing loop (`None` = the task owns the
+/// answer now). A supervised-dead handle reports its prior loss plus the
+/// cleanup result and is never revived. Re-releases re-answer the recorded
+/// outcome: success stays idempotent, failure stays honestly failed.
+fn handle_release(srv: &mut Server, raw: &Value, id: RequestId) -> Option<Result<Value, AcpError>> {
+    let req: ReleaseParams = match parse_params(raw) {
+        Ok(req) => req,
+        Err(e) => return Some(Err(e)),
+    };
     if let Some(allocation) = srv.allocations.remove(&req.session_id) {
         release_lease(allocation.claim);
-        return Ok(methods::release_allocation_result(&req.session_id));
+        return Some(Ok(methods::release_allocation_result(&req.session_id)));
     }
     if srv.activating.contains_key(&req.session_id) {
-        return Err(activation_in_progress(&req.session_id));
+        return Some(Err(activation_in_progress(&req.session_id)));
     }
-    if srv.sessions.contains_key(&req.session_id) {
-        return Err(extension_seam(extension::RELEASE_METHOD, "02.10b"));
+    if let Some(record) = srv.release_records.lock().unwrap().get(&req.session_id) {
+        let record = record.clone();
+        return Some(match record {
+            ReleaseRecord::InFlight { epoch } => Err(release_in_progress(&req.session_id, epoch)),
+            ReleaseRecord::Done { epoch, failure } => match failure {
+                None => Ok(methods::release_result(&req.session_id, epoch)),
+                Some(f) => Err(release_failed_error(&req.session_id, f.stage, &f.raw)),
+            },
+        });
     }
-    Err(unknown_session(&req.session_id))
+    let Some(runtime) = srv.sessions.remove(&req.session_id) else {
+        return Some(Err(unknown_session(&req.session_id)));
+    };
+    let hook = srv.on_session_end.clone();
+    let reason = req.reason.unwrap_or_else(|| "client_done".to_owned());
+    // Explicit release closes the session the client is done with.
+    begin_release(
+        srv,
+        runtime,
+        req.session_id,
+        reason,
+        Some(id),
+        hook,
+        SessionEndReason::Delete,
+    );
+    None
+}
+
+/// What the release prologue settled, decided under the control lock.
+struct ReleasePrologue {
+    /// Post-release epoch: the ack and lifecycle report it, and a racing
+    /// terminal lands stale against it.
+    epoch: u64,
+    /// Owed prompt and its turn, taken exactly once when a live turn settled.
+    prompt: Option<RequestId>,
+    turn: Option<u64>,
+    cancelled: bool,
+    /// Recorded supervised loss, when the handle was already dead. The
+    /// release reports it alongside its own cleanup result and never revives
+    /// the handle.
+    prior_loss: Option<(String, String)>,
+}
+
+/// Starts an individual bounded release. The caller already dropped the
+/// routing entry, so new input rejects as `resource_not_found` from here on.
+/// The prologue below is prompt (control-lock settle/snapshot, prompt answer,
+/// run signal, handle aborts — microseconds, no awaits); the spawned task
+/// owns the slow teardown and the answer (when `id` is set), then drops the
+/// claim as its runtime falls out of scope.
+fn begin_release(
+    srv: &mut Server,
+    runtime: SessionRuntime,
+    key: String,
+    reason: String,
+    id: Option<RequestId>,
+    hook: Option<SessionEndHook>,
+    end_reason: SessionEndReason,
+) {
+    let prologue = {
+        let mut guard = runtime.pending.lock().unwrap();
+        let settled = if guard.is_lost() {
+            // Supervised-dead: no cancel settle (that would bump again and
+            // mark cleanup-awaited on a dead handle) — snapshot the recorded
+            // loss for the report instead.
+            ReleasePrologue {
+                epoch: guard.epoch.current(),
+                prompt: None,
+                turn: None,
+                cancelled: false,
+                prior_loss: Some((
+                    guard.loss_reason.clone().unwrap_or_default(),
+                    guard.loss_raw.clone().unwrap_or_default(),
+                )),
+            }
+        } else {
+            let settlement = guard.settle_cancel();
+            ReleasePrologue {
+                epoch: settlement.epoch,
+                prompt: settlement.prompt,
+                turn: settlement.turn,
+                cancelled: settlement.cancelled,
+                prior_loss: None,
+            }
+        };
+        guard.mark_released();
+        settled
+    };
+    // The 02.9a-cancel shape: a settled prompt answers `cancelled` with its
+    // turn, raw reason, and usability, so the client never hangs on it.
+    if let (Some(prompt_id), Some(turn)) = (prologue.prompt.clone(), prologue.turn) {
+        let reason = DoneReason::Cancelled;
+        let raw = reason.to_string();
+        let resp = PromptResponse::new(StopReason::Cancelled).meta(extension::terminal_meta(
+            turn,
+            &raw,
+            reason.usable(),
+        ));
+        send(
+            &srv.out_tx,
+            Response::<AgentResponse, AcpError>::new(
+                prompt_id,
+                Ok(AgentResponse::PromptResponse(resp)),
+            ),
+        );
+    }
+    // Only the addressed run is signalled — never the shared Maki process,
+    // which outlives every per-session release.
+    if prologue.cancelled {
+        let _ = runtime.handle.cancel_tx.try_send(());
+    }
+    // Instant: stopping the work now keeps the read-after-close consistent
+    // for load replacement and stops spend before the hook runs. The spawned
+    // task reaps the handles.
+    runtime.handle.task.abort();
+    runtime.supervisor.abort();
+    runtime.pump.abort();
+    srv.release_records.lock().unwrap().insert(
+        key.clone(),
+        ReleaseRecord::InFlight {
+            epoch: prologue.epoch,
+        },
+    );
+    let out_tx = srv.out_tx.clone();
+    let records = Arc::clone(&srv.release_records);
+    let job = ReleaseJob {
+        runtime,
+        key,
+        prologue,
+        reason,
+        id,
+        hook,
+        end_reason,
+    };
+    srv.release_tasks.spawn(async move {
+        run_release(out_tx, records, job).await;
+    });
+}
+
+/// Everything the background release task owns: the removed runtime plus the
+/// prologue outcome and reporting addresses. Bundled so the loop hands the
+/// slow half over in one move and never waits on it.
+struct ReleaseJob {
+    runtime: SessionRuntime,
+    key: String,
+    prologue: ReleasePrologue,
+    reason: String,
+    id: Option<RequestId>,
+    hook: Option<SessionEndHook>,
+    end_reason: SessionEndReason,
+}
+
+/// Slow half of an individual release, off the shared routing loop. Best
+/// effort through every stage — a failed hook must not skip MCP shutdown —
+/// each bounded, then one report: the deferred answer plus a `released` or
+/// `release_failed` lifecycle frame, the terminal outcome recorded for
+/// re-releases, and the claim dropped as the runtime falls out of scope.
+///
+/// Teardown targets are the per-session handles in the 02.5a inventory: the
+/// session task (its Lua VM, TaskCells, and `JobOwner::Session` jobs die with
+/// the abort), its event pump and loss supervisor, its MCP handle, and one
+/// session-end hook invocation. Process-global hooks/MCP that cannot be
+/// scoped — plugin-global `SlotHook` slot chains, autocmd stores, provider
+/// hooks — are not touched here; they stand as recorded blockers, not
+/// silently skipped work.
+async fn run_release(out_tx: Sender<Value>, records: ReleaseRecords, job: ReleaseJob) {
+    let ReleaseJob {
+        runtime,
+        key,
+        prologue,
+        reason,
+        id,
+        hook,
+        end_reason,
+    } = job;
+    let stages = async {
+        let mut failure: Option<ReleaseFailure> = None;
+        // The end hook first, like the legacy close path: the bill it saves
+        // is complete. Bounded with panics contained: a wedged or panicking
+        // hook reports `release_failed` instead of stalling peers.
+        if let Some(cb) = hook {
+            let mut hook_task = tokio::spawn(cb(runtime.handle.session_id.id(), end_reason));
+            match timeout(RELEASE_HOOK_TIMEOUT, &mut hook_task).await {
+                Ok(Ok(())) => {}
+                // Cancelled: only the abort below cancels it, after recording.
+                Ok(Err(join)) if !join.is_cancelled() => {
+                    failure = failure.or(Some(ReleaseFailure {
+                        stage: "hook",
+                        raw: "hook_panicked".to_owned(),
+                    }));
+                }
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    hook_task.abort();
+                    failure = failure.or(Some(ReleaseFailure {
+                        stage: "hook",
+                        raw: "hook_timeout".to_owned(),
+                    }));
+                }
+            }
+        }
+        // Aborted in the prologue, so these reaps are prompt: a wedged task
+        // cannot stall release, and the process is never killed to close one
+        // session. Join errors are discarded — a dead handle's panic is its
+        // recorded prior loss, not a new cleanup failure.
+        let _ = runtime.handle.task.await;
+        let _ = runtime.supervisor.await;
+        let _ = runtime.pump.await;
+        // The per-session MCP handle from the 02.5a inventory. Internally
+        // bounded (2s) with this outer cap as backstop; an unacked shutdown
+        // reports `release_failed` instead of hanging the release — or
+        // claiming a clean shutdown that never confirmed.
+        if let Some(mcp) = &runtime.mcp
+            && !matches!(timeout(RELEASE_MCP_TIMEOUT, mcp.shutdown()).await, Ok(true))
+        {
+            warn!(session = %key, "MCP shutdown unconfirmed");
+            failure = failure.or(Some(ReleaseFailure {
+                stage: "mcp",
+                raw: "mcp_shutdown_timeout".to_owned(),
+            }));
+        }
+        failure
+    };
+    // Backstop over the whole teardown: even a join that never resolves
+    // reports instead of leaking the release.
+    let failure: Option<ReleaseFailure> = match timeout(RELEASE_TIMEOUT, stages).await {
+        Ok(failure) => failure,
+        Err(_) => Some(ReleaseFailure {
+            stage: "release",
+            raw: "release_timeout".to_owned(),
+        }),
+    };
+    let prior = prologue
+        .prior_loss
+        .as_ref()
+        .map(|(reason, raw)| (reason.as_str(), raw.as_str()));
+    match &failure {
+        None => {
+            info!(session = %key, epoch = prologue.epoch, "session released");
+            if let Some(id) = id {
+                send(
+                    &out_tx,
+                    Response::<Value, AcpError>::new(
+                        id,
+                        Ok(methods::release_result(&key, prologue.epoch)),
+                    ),
+                );
+            }
+            send(
+                &out_tx,
+                Notification {
+                    method: Arc::from(extension::LIFECYCLE_NOTIFICATION),
+                    params: Some(methods::lifecycle_released_params(
+                        &key,
+                        prologue.epoch,
+                        &reason,
+                        prior,
+                    )),
+                },
+            );
+        }
+        Some(f) => {
+            warn!(session = %key, stage = f.stage, raw = %f.raw, "session release failed");
+            if let Some(id) = id {
+                send(
+                    &out_tx,
+                    Response::<Value, AcpError>::new(
+                        id,
+                        Err(release_failed_error(&key, f.stage, &f.raw)),
+                    ),
+                );
+            }
+            send(
+                &out_tx,
+                Notification {
+                    method: Arc::from(extension::LIFECYCLE_NOTIFICATION),
+                    params: Some(methods::lifecycle_release_failed_params(
+                        &key,
+                        prologue.epoch,
+                        &reason,
+                        f.stage,
+                        &f.raw,
+                        prior,
+                    )),
+                },
+            );
+        }
+    }
+    records.lock().unwrap().insert(
+        key,
+        ReleaseRecord::Done {
+            epoch: prologue.epoch,
+            failure,
+        },
+    );
+    // `runtime` — and the storage claim it holds — drops here.
 }
 
 #[derive(Debug, Deserialize)]
@@ -1729,73 +2152,53 @@ fn trusted_project_config(
     decision.project_config
 }
 
-/// Drops one addressed runtime: the only entry `session/load` replaces, and
-/// the unit 02.10b's background release will reap. A miss is a no-op, so a
-/// `session/load` for a stored-but-not-live session only adds its runtime.
+/// Drops one addressed runtime: the only entry `session/load` replaces. The
+/// release runs on a background task — aborting the handles is prompt, so
+/// the load's read-after-close still finds a stopped run — and a miss is a
+/// no-op, so a `session/load` for a stored-but-not-live session only adds
+/// its runtime.
 async fn close_one_session(srv: &mut Server, key: &str, reason: SessionEndReason) {
-    let Some(state) = srv.sessions.remove(key) else {
+    let Some(runtime) = srv.sessions.remove(key) else {
         return;
     };
-    close_runtime(srv, state, reason).await;
+    let hook = srv.on_session_end.clone();
+    // No request id to answer: replacement reports through the lifecycle
+    // frame, and the load result answers the client.
+    begin_release(
+        srv,
+        runtime,
+        key.to_owned(),
+        reason.to_string(),
+        None,
+        hook,
+        reason,
+    );
 }
 
-/// Drops every runtime, for end of input and stop. Sequential reaps are a
-/// shutdown path, not steady-state serialization: live pumps never wait on
-/// each other.
+/// Drops every runtime, for end of input and stop. Each release runs on its
+/// own background task — drained up front so one slow teardown cannot strand
+/// a peer — and this await collects every outcome, including replacements
+/// already in flight. Unactivated leases drop through the 02.3 helper;
+/// in-flight startups are aborted (their completions can never settle once
+/// the loop is gone, and each owns its claim in its task, so aborting drops
+/// the lease with the pieces). Cleanup failures surface as `release_failed`
+/// lifecycle frames, never silently discarded.
 async fn close_all_sessions(srv: &mut Server, reason: SessionEndReason) {
-    // Unactivated leases release first: a client that disappeared without
-    // explicit failure leaves nothing behind. In-flight startups are aborted
-    // next: their completions can never be settled once the loop is gone, and
-    // each owns its claim in its task, so aborting drops the lease with the
-    // pieces. Only then do the runtimes drain.
     close_all_allocations(srv);
     for (_, task) in srv.activating.drain() {
         task.abort();
         let _ = task.await;
     }
     // Drained up front so one slow teardown cannot strand a peer runtime.
-    let runtimes: Vec<SessionRuntime> = std::mem::take(&mut srv.sessions).into_values().collect();
-    for state in runtimes {
-        close_runtime(srv, state, reason).await;
+    let runtimes: Vec<(String, SessionRuntime)> =
+        std::mem::take(&mut srv.sessions).into_iter().collect();
+    for (key, runtime) in runtimes {
+        let hook = srv.on_session_end.clone();
+        begin_release(srv, runtime, key, reason.to_string(), None, hook, reason);
     }
-}
-
-/// Reaps a runtime the table no longer names. The end hook runs first so the
-/// bill it saves is complete; the owed prompt is answered so the client never
-/// hangs; then the run, its pump, its supervisor, and its MCP servers come
-/// down. 02.10a records the incomplete-teardown boundary explicitly: aborting
-/// a dead task/pump handle reaps it but proves no tool cleanup — a dropped
-/// handle is not cleanup proof. Bounded per-session release with visible
-/// cleanup results is 02.10b's.
-async fn close_runtime(srv: &Server, state: SessionRuntime, reason: SessionEndReason) {
-    if let Some(cb) = &srv.on_session_end {
-        cb(state.handle.session_id.id(), reason).await;
-    }
-    // The event pump dies with the session, so the prompt it owed an answer to
-    // has to be answered here or the client waits on it forever.
-    let owed = {
-        let mut guard = state.pending.lock().unwrap();
-        guard.turn = None;
-        guard.prompt.take()
-    };
-    if let Some(id) = owed {
-        let resp = PromptResponse::new(StopReason::Cancelled);
-        srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
-    }
-    // Only after the hook, which stops the session's background work, so the
-    // track this drops saves the full bill.
-    state.handle.task.abort();
-    let _ = state.handle.task.await;
-    // Aborted before the await: an orphaned pump would keep writing frames for
-    // a dropped id. Queued updates for a closing session are dropped with it.
-    // The supervisor aborts first so a closing pump never reports `lost`.
-    state.supervisor.abort();
-    let _ = state.supervisor.await;
-    state.pump.abort();
-    let _ = state.pump.await;
-    if let Some(mcp) = state.mcp {
-        mcp.shutdown().await;
-    }
+    // Every release — table entries above plus any replacement already in
+    // flight — reaps here, each bounded by its own `RELEASE_TIMEOUT`.
+    while srv.release_tasks.join_next().await.is_some() {}
 }
 
 #[derive(Debug)]
@@ -2381,8 +2784,9 @@ fn start_event_pump(
 /// that panics or silently exits still notifies `lost` exactly once while
 /// idle, without polling the loop. The first observer (pump stream-end vs.
 /// this supervisor) wins via `report_loss`; the loser sends nothing. Aborted
-/// with the pump on close/shutdown, so teardown reports no loss. No teardown
-/// runs here; 02.10b owns bounded release.
+/// with the pump on release/shutdown — after the handle is marked released
+/// under the control lock — so teardown reports no loss. No teardown
+/// runs here; bounded release (`begin_release`) owns it.
 fn start_loss_supervisor(
     pending: PendingState,
     out_tx: Sender<Value>,
@@ -2771,6 +3175,8 @@ mod tests {
             activating: HashMap::new(),
             starter: fixture_starter(&StarterHarness::default()),
             completion: completion_tx.downgrade(),
+            release_tasks: JoinSet::new(),
+            release_records: ReleaseRecords::default(),
         };
         (server, answer_rx, out_rx)
     }
@@ -5579,8 +5985,8 @@ mod tests {
     /// queued answer can never bypass an in-flight cancel settlement. Racing
     /// threads prove the invariant structurally: every wire id is claimed at
     /// most once, the prompt settles at most once, and a cross-session claim
-    /// never delivers. (02.10b routes Close through this same lock; only the
-    /// Answer/Stop half is built here.)
+    /// never delivers. (02.10b routes Close through this same lock; the
+    /// Close half is proven in `close_queues_behind_in_flight_cancel_settlement`.)
     #[test]
     fn concurrent_answers_never_bypass_in_flight_cancel_settlement() {
         use std::sync::Barrier;
@@ -5668,8 +6074,9 @@ mod tests {
 
     /// Answer handling never waits on another session's slow startup: while
     /// A's activation is parked on the gate, the peer's answer routes through
-    /// the same line path the loop uses. Release-time responsiveness is
-    /// 02.10b's, not built here.
+    /// the same line path the loop uses. The release-time half — peer work
+    /// while a hook/MCP teardown is held — is proven by the 02.10b release
+    /// tests.
     #[tokio::test]
     async fn peer_answer_routes_while_activation_is_held() {
         let harness = StarterHarness::default();
@@ -6527,6 +6934,8 @@ mod tests {
             activating: HashMap::new(),
             starter: fixture_starter(harness),
             completion: completion_tx.downgrade(),
+            release_tasks: JoinSet::new(),
+            release_records: ReleaseRecords::default(),
         };
         (server, out_rx, completion_rx, completion_tx)
     }
@@ -7291,7 +7700,8 @@ mod tests {
     }
 
     /// Explicit release forgets an unactivated allocation: the lease drops and
-    /// the id is unknown afterwards. Active sessions stay the 02.10b seam.
+    /// the id is unknown afterwards. Active-session release defers its answer
+    /// to the background task; see the 02.10b release tests.
     #[tokio::test]
     async fn release_forgets_an_unactivated_allocation() {
         let harness = StarterHarness::default();
@@ -7310,7 +7720,9 @@ mod tests {
         .await;
 
         let raw = serde_json::json!({ "params": { "sessionId": session } });
-        let result = handle_release(&mut srv, &raw).unwrap();
+        let result = handle_release(&mut srv, &raw, RequestId::Number(2))
+            .expect("allocation release answers synchronously")
+            .unwrap();
         assert_eq!(result["released"], true);
         assert_eq!(result["sessionId"], session);
         assert_eq!(result["turnEpoch"], 0);
@@ -7320,26 +7732,969 @@ mod tests {
             "release drops the lease"
         );
 
-        let repeat = handle_release(&mut srv, &raw).unwrap_err();
+        let repeat = handle_release(&mut srv, &raw, RequestId::Number(3))
+            .expect("repeat release answers synchronously")
+            .unwrap_err();
         assert_eq!(repeat.code, AcpError::resource_not_found(None).code);
         assert_eq!(repeat.data, Some(serde_json::json!({"sessionId": session})));
         let unknown =
             serde_json::json!({ "params": { "sessionId": MakiId::generate().to_string() } });
         assert_eq!(
-            handle_release(&mut srv, &unknown).unwrap_err().code,
+            handle_release(&mut srv, &unknown, RequestId::Number(4))
+                .expect("unknown release answers synchronously")
+                .unwrap_err()
+                .code,
             AcpError::resource_not_found(None).code
         );
     }
 
-    /// Releasing an active session is not the lease release above: bounded
-    /// teardown is 02.10b's, so the method keeps answering -32601 there.
+    /// 02.10b helpers: a release request plus the deferred-outcome collector.
+    /// The loop only does the fast prologue; the background task reports, so
+    /// every release test collects the answer and lifecycle off `out_rx` with
+    /// the deadlock bound instead of hanging on them.
+    const ASK_RELEASE_A: i64 = 2001;
+    const ASK_RELEASE_B: i64 = 2011;
+    const RELEASE_ID: i64 = 50;
+
+    fn release_request(session: &str) -> Value {
+        serde_json::json!({
+            "params": { "sessionId": session, "reason": "client_done" }
+        })
+    }
+
+    fn park_prompt_for(srv: &Server, key: &str, id: RequestId) {
+        let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+        guard.turn = Some(guard.epoch.current());
+        guard.prompt = Some(id);
+    }
+
+    fn park_permission_ask_for(srv: &Server, key: &str, wire_id: i64) -> flume::Receiver<String> {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let epoch = srv
+            .sessions
+            .get(key)
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .epoch
+            .current();
+        srv.sessions
+            .get(key)
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .asks
+            .insert(
+                wire_id,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: Some(answer_tx),
+                    session: key.to_owned(),
+                    epoch,
+                },
+            );
+        answer_rx
+    }
+
+    fn answer_for(wire_id: i64) -> Value {
+        serde_json::json!({
+            "id": wire_id,
+            "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+        })
+    }
+
+    /// Drains `out_rx` until the deferred release answer for `id` and the
+    /// first lifecycle frame for `session` both arrive. Returns every frame
+    /// seen, so tests can also assert what never arrived.
+    async fn await_release_outcome(
+        out_rx: &flume::Receiver<Value>,
+        id: RequestId,
+        session: &str,
+    ) -> Vec<Value> {
+        let want_id = serde_json::to_value(&id).unwrap();
+        let mut seen = Vec::new();
+        let mut answered = false;
+        let mut lifecycled = false;
+        timeout(STDIN_DEADLOCK_TIMEOUT, async {
+            while !answered || !lifecycled {
+                let frame = out_rx.recv_async().await.expect("release always reports");
+                if frame.get("id") == Some(&want_id) {
+                    answered = true;
+                }
+                if frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                    && frame["params"]["sessionId"] == *session
+                {
+                    lifecycled = true;
+                }
+                seen.push(frame);
+            }
+        })
+        .await
+        .expect("bounded teardown always reports");
+        seen
+    }
+
+    fn fixture_claims() -> StateDir {
+        StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf())
+    }
+
+    async fn await_claim_dropped(id: MakiId, storage: &StateDir) {
+        timeout(STDIN_DEADLOCK_TIMEOUT, async {
+            while SessionClaim::is_held(id, storage) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release drops the claim");
+    }
+
+    /// 02.10b acceptance, working session: Close on A while B continues under
+    /// the same PID. A's turn settles through the 02.9a cancel shape and its
+    /// asks retire; only A's runtime ends; slow teardown is bounded and off
+    /// the loop; the deferred answer and `released` lifecycle report exactly
+    /// once; the claim drops; B stays responsive throughout. No network,
+    /// keys, or providers are involved.
     #[tokio::test]
-    async fn release_of_an_active_session_stays_the_02_10b_seam() {
-        let (mut srv, ..) = test_server();
-        let key = session_key(&srv);
-        let raw = serde_json::json!({ "params": { "sessionId": key } });
-        let err = handle_release(&mut srv, &raw).unwrap_err();
-        assert_eq!(err.code, AcpError::method_not_found().code);
+    async fn release_working_session_cancels_retires_and_reports_while_peer_continues() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (_input_a_rx, cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        assert_ne!(key_a, key_b, "two sessions hold distinct ids");
+
+        // Both sessions work a turn; A also waits on a permission ask.
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        park_prompt_for(&srv, &key_b, RequestId::Number(8));
+        let answer_a_rx = park_permission_ask_for(&srv, &key_a, ASK_RELEASE_A);
+        let answer_b_rx = park_permission_ask_for(&srv, &key_b, ASK_RELEASE_B);
+        // A's run is wedged in background work: the abort in the prologue
+        // still reaps it promptly — no task ever stalls a release, and the
+        // shared process is never killed to close one session.
+        only_mut_addr(&mut srv, &key_a).handle.task =
+            AbortOnDropHandle::new(tokio::spawn(future::pending()));
+
+        // Close is deferred: the loop does the fast prologue and moves on.
+        let deferred = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID),
+        );
+        assert!(
+            deferred.is_none(),
+            "the background task owns the answer, not the loop"
+        );
+        assert!(
+            !srv.sessions.contains_key(&key_a),
+            "Close rejects new input at once"
+        );
+        assert!(
+            srv.sessions.contains_key(&key_b),
+            "only the addressed runtime ends"
+        );
+        assert!(
+            cancel_a_rx.try_recv().is_ok(),
+            "the addressed Close signals A's run, never the shared process"
+        );
+
+        let frames = await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID), &key_a).await;
+        let answer = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(PROMPT_ID)))
+            .expect("A's prompt settles once");
+        assert_eq!(answer["result"]["stopReason"], "cancelled");
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the answer settles the turn it ran under: {answer}"
+        );
+        assert_eq!(
+            answer["result"]["_meta"][extension::RAW_REASON_META_KEY],
+            "cancelled"
+        );
+        assert_eq!(answer["result"]["_meta"][extension::USABLE_META_KEY], false);
+        let result = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(RELEASE_ID)))
+            .expect("the deferred release answers");
+        assert_eq!(result["result"]["sessionId"], key_a);
+        assert_eq!(result["result"]["released"], true);
+        assert_eq!(result["result"]["turnEpoch"], 1);
+        let lifecycle = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+            })
+            .expect("teardown reports a lifecycle");
+        assert_eq!(lifecycle["params"]["sessionId"], key_a);
+        assert_eq!(lifecycle["params"]["state"], "released");
+        assert_eq!(lifecycle["params"]["turnEpoch"], 1);
+        assert_eq!(lifecycle["params"]["rawReason"], "client_done");
+        assert_eq!(lifecycle["params"]["usable"], false);
+        assert!(
+            lifecycle["params"].get("priorLoss").is_none(),
+            "a live release reports no prior loss: {lifecycle}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["params"]["state"] == "release_failed"),
+            "no failure is claimed on a clean teardown: {frames:?}"
+        );
+
+        // A late answer for the retired ask drops without reaching any agent.
+        handle_incoming_response(&srv, &answer_for(ASK_RELEASE_A));
+        assert!(answer_a_rx.is_empty(), "a late answer cannot revive A");
+        assert!(answer_b_rx.is_empty(), "nothing lands on the peer");
+        // New input for A rejects; re-release re-answers the recorded success.
+        for err in [
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&key_a, "retry"),
+                &RequestId::Number(51),
+            )
+            .unwrap_err(),
+            handle_cancel(
+                &srv,
+                &serde_json::json!({ "params": { "sessionId": key_a } }),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        }
+        let repeat = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID + 1),
+        )
+        .expect("recorded releases answer synchronously")
+        .unwrap();
+        assert_eq!(repeat["released"], true);
+        assert_eq!(repeat["turnEpoch"], 1);
+
+        let id_a: MakiId = key_a.parse().unwrap();
+        await_claim_dropped(id_a, &fixture_claims()).await;
+
+        // B runs undisturbed and settles under its own epoch.
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let settled = out_rx.try_recv().expect("B settles its own prompt");
+        assert_eq!(settled["id"], 8);
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays usable through a sibling's release");
+    }
+
+    /// 02.10b control serialization, structural half: Close's settle runs
+    /// through the same per-session lock as Answer claims and Stop settles.
+    /// Racing threads prove the invariant: every wire id claims at most once,
+    /// the prompt settles exactly once across the Stop and the Close, the
+    /// Close finds no live turn left, and every settle after the release mark
+    /// changes nothing — no bump, no take, no revival.
+    #[test]
+    fn close_queues_behind_in_flight_cancel_settlement() {
+        use std::sync::Barrier;
+
+        const ASKS: i64 = 32;
+        let pending = PendingState::default();
+        {
+            let mut guard = pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(PROMPT_ID));
+            for n in 0..ASKS {
+                guard.asks.insert(
+                    ANSWERED_ID + n,
+                    Ask::Permission {
+                        request_id: format!("toolu_{n}"),
+                        answer_tx: None,
+                        session: "s".to_owned(),
+                        epoch: 0,
+                    },
+                );
+            }
+            guard.asks.insert(
+                ANSWERED_ID + ASKS,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: "other".to_owned(),
+                    epoch: 0,
+                },
+            );
+        }
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let control = Arc::clone(&pending);
+            let gate = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                let mut won = Vec::new();
+                for n in 0..=ASKS {
+                    if control
+                        .lock()
+                        .unwrap()
+                        .claim_ask(ANSWERED_ID + n, "s")
+                        .is_some()
+                    {
+                        won.push(n);
+                    }
+                }
+                won
+            }));
+        }
+        barrier.wait();
+        // The Stop lands while answers race it; the Close queues behind the
+        // Stop on the same guard and marks released atomically with its own
+        // settle, exactly like the release prologue.
+        let (stop, close) = {
+            let mut guard = pending.lock().unwrap();
+            let stop = guard.settle_cancel();
+            let close = guard.settle_cancel();
+            guard.mark_released();
+            (stop, close)
+        };
+
+        let mut won: Vec<i64> = Vec::new();
+        for handle in handles {
+            won.extend(handle.join().expect("no control-lock deadlock"));
+        }
+        won.sort_unstable();
+        let mut dedup = won.clone();
+        dedup.dedup();
+        assert_eq!(
+            won, dedup,
+            "every wire id claims at most once, however raced"
+        );
+        assert!(
+            !won.contains(&ASKS),
+            "a cross-session ask never claims for this session"
+        );
+        assert!(stop.cancelled, "the first settle takes the live turn");
+        assert_eq!(stop.prompt, Some(RequestId::Number(PROMPT_ID)));
+        assert!(
+            !close.cancelled,
+            "the queued Close finds no live turn left to settle"
+        );
+        assert_eq!(close.prompt, None);
+        assert_eq!(stop.epoch, 1, "one Stop bumps exactly once");
+        assert_eq!(close.epoch, 2, "the queued Close bumps behind it");
+        assert!(pending.lock().unwrap().is_released());
+        assert!(pending.lock().unwrap().asks.is_empty());
+
+        // Everything after the mark is a late frame: no bump, no take, no
+        // revival — the released outcome can never change.
+        let epoch = pending.lock().unwrap().epoch.current();
+        let late_cancel = pending.lock().unwrap().settle_cancel();
+        assert!(!late_cancel.cancelled);
+        assert_eq!(late_cancel.prompt, None);
+        let late_loss = pending.lock().unwrap().settle_loss("task_dead", "x");
+        assert!(!late_loss.first);
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .claim_ask(ANSWERED_ID, "s")
+                .is_none()
+        );
+        assert_eq!(
+            pending.lock().unwrap().epoch.current(),
+            epoch,
+            "late settles never move the released epoch"
+        );
+        assert!(
+            !pending.lock().unwrap().is_resumable(),
+            "a released handle never reopens"
+        );
+    }
+
+    /// 02.10b hung-hook half: a session-end hook that never resolves bounds
+    /// the release instead of stalling it, and the failure is visible. Peers
+    /// prove the routing loop never waited: while A's teardown is held, B's
+    /// cancel routes and B's permission answer delivers — both land before
+    /// A's `release_failed` lifecycle does. No keys, network, or providers.
+    #[tokio::test]
+    async fn hung_hook_release_is_bounded_visible_and_peer_responsive() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let answer_a_rx = park_permission_ask_for(&srv, &key_a, ASK_RELEASE_A);
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        park_prompt_for(&srv, &key_b, RequestId::Number(8));
+        let answer_b_rx = park_permission_ask_for(&srv, &key_b, ASK_RELEASE_B);
+
+        let gate = Arc::new(Notify::new());
+        let held = Arc::clone(&gate);
+        srv.on_session_end = Some(Arc::new(move |_, _| {
+            let held = Arc::clone(&held);
+            Box::pin(async move {
+                held.notified().await;
+            })
+        }));
+
+        let deferred = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID),
+        );
+        assert!(deferred.is_none(), "teardown never runs on the loop");
+
+        // Peer work routes while the hook teardown is held: both land before
+        // A's lifecycle does (the release cannot finish before the hook
+        // bound, so an arrived lifecycle here would mean the loop stalled).
+        // The answer goes first: B's ask is bound to the current epoch and
+        // the cancel below bumps it.
+        handle_incoming_response(&srv, &answer_for(ASK_RELEASE_B));
+        assert_eq!(
+            answer_b_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode()),
+            "the peer answer delivers while A's teardown is held"
+        );
+        let cancel = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_b } }),
+        )
+        .unwrap();
+        assert_eq!(cancel["cancelled"], true);
+        // Drained, not dropped: B's cancel settled its prompt while held, and
+        // A's prompt answer (prologue) is in here too.
+        let drained: Vec<Value> = out_rx.try_iter().collect();
+        assert!(
+            drained
+                .iter()
+                .all(|frame| frame["params"]["state"] != "release_failed"),
+            "A's outcome cannot arrive before the hook bound"
+        );
+        let peer_settled = drained
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(8)))
+            .expect("B's prompt settles while A's teardown is held");
+        assert_eq!(peer_settled["result"]["stopReason"], "cancelled");
+        let owed = drained
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(PROMPT_ID)))
+            .expect("A's prompt is answered in the prologue");
+        assert_eq!(owed["result"]["stopReason"], "cancelled");
+
+        let frames = await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID), &key_a).await;
+        let result = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(RELEASE_ID)))
+            .expect("the deferred release answers with its failure");
+        assert_eq!(result["error"]["code"], -32603);
+        assert_eq!(result["error"]["data"]["reason"], "release_failed");
+        assert_eq!(result["error"]["data"]["stage"], "hook");
+        assert_eq!(result["error"]["data"]["rawReason"], "hook_timeout");
+        assert_eq!(result["error"]["data"]["usable"], false);
+        let lifecycle = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+            })
+            .expect("the failure is visible as a lifecycle");
+        assert_eq!(lifecycle["params"]["state"], "release_failed");
+        assert_eq!(lifecycle["params"]["stage"], "hook");
+        assert_eq!(lifecycle["params"]["usable"], false);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["params"]["state"] == "released"
+                    && frame["params"]["sessionId"] == key_a),
+            "no successful release is claimed after a failed teardown: {frames:?}"
+        );
+
+        // Late answers still drop; new input still rejects; re-release stays
+        // honestly failed instead of flipping to success.
+        handle_incoming_response(&srv, &answer_for(ASK_RELEASE_A));
+        assert!(answer_a_rx.is_empty(), "a late answer cannot revive A");
+        for err in [
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&key_a, "retry"),
+                &RequestId::Number(51),
+            )
+            .unwrap_err(),
+            handle_cancel(
+                &srv,
+                &serde_json::json!({ "params": { "sessionId": key_a } }),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        }
+        let repeat = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID + 1),
+        )
+        .expect("recorded releases answer synchronously")
+        .unwrap_err();
+        assert_eq!(repeat.data.unwrap()["reason"], "release_failed");
+
+        let id_a: MakiId = key_a.parse().unwrap();
+        await_claim_dropped(id_a, &fixture_claims()).await;
+        // B cancelled its own turn mid-test, so its 02.9b gate is undisturbed
+        // by the sibling's failed release: still held, still explicit.
+        let retry = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .unwrap_err();
+        assert_eq!(retry.data.unwrap()["reason"], "cleanup_unconfirmed");
+    }
+
+    /// 02.10b held-MCP half: an MCP `Shutdown` the server never acks bounds
+    /// the release at the MCP stage and reports it distinctly. The held
+    /// command proves the teardown targeted the per-session handle from the
+    /// 02.5a inventory, and peers stay responsive while it is held.
+    #[tokio::test]
+    async fn held_mcp_release_is_bounded_visible_and_peer_responsive() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let (held_mcp, cmd_rx) = maki_agent::mcp::test_support::held_handle();
+        only_mut(&mut srv).mcp = Some(held_mcp);
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        park_prompt_for(&srv, &key_b, RequestId::Number(8));
+        let answer_b_rx = park_permission_ask_for(&srv, &key_b, ASK_RELEASE_B);
+
+        let deferred = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID),
+        );
+        assert!(deferred.is_none(), "teardown never runs on the loop");
+
+        // The background task targets A's own MCP handle first (joins are
+        // prompt post-abort), while the peer keeps routing.
+        let cmd = timeout(STDIN_DEADLOCK_TIMEOUT, cmd_rx.recv_async())
+            .await
+            .expect("teardown targets the per-session MCP handle")
+            .expect("the command channel stays open");
+        assert!(
+            matches!(cmd, maki_agent::mcp::McpCommand::Shutdown { .. }),
+            "teardown shuts the session MCP down, nothing else"
+        );
+        // The peer answer goes first: its ask is bound to the current epoch
+        // and the cancel below bumps it.
+        handle_incoming_response(&srv, &answer_for(ASK_RELEASE_B));
+        assert!(
+            answer_b_rx.try_recv().is_ok(),
+            "the peer answer delivers while MCP teardown is held"
+        );
+        let cancel = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_b } }),
+        )
+        .unwrap();
+        assert_eq!(cancel["cancelled"], true);
+
+        let frames = await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID), &key_a).await;
+        let result = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(RELEASE_ID)))
+            .expect("the deferred release answers with its failure");
+        assert_eq!(result["error"]["data"]["reason"], "release_failed");
+        assert_eq!(result["error"]["data"]["stage"], "mcp");
+        assert_eq!(result["error"]["data"]["rawReason"], "mcp_shutdown_timeout");
+        let lifecycle = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+            })
+            .expect("the failure is visible as a lifecycle");
+        assert_eq!(lifecycle["params"]["state"], "release_failed");
+        assert_eq!(lifecycle["params"]["stage"], "mcp");
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["params"]["state"] == "released"
+                    && frame["params"]["sessionId"] == key_a),
+            "no successful release is claimed after a failed teardown: {frames:?}"
+        );
+
+        let repeat = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID + 1),
+        )
+        .expect("recorded releases answer synchronously")
+        .unwrap_err();
+        assert_eq!(repeat.data.unwrap()["reason"], "release_failed");
+        let id_a: MakiId = key_a.parse().unwrap();
+        await_claim_dropped(id_a, &fixture_claims()).await;
+    }
+
+    /// 02.10b late-frame rejection: after a clean release, permission answers
+    /// and terminal/loss events for the released session are dropped — they
+    /// cannot revive the handle, change its outcome, or affect the peer.
+    #[tokio::test]
+    async fn late_answers_and_terminals_are_rejected_after_release() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let answer_a_rx = park_permission_ask_for(&srv, &key_a, ASK_RELEASE_A);
+        let pending_a = Arc::clone(&srv.sessions.get(&key_a).unwrap().pending);
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        let epoch_before = pending_a.lock().unwrap().epoch.current();
+
+        assert!(
+            handle_release(
+                &mut srv,
+                &release_request(&key_a),
+                RequestId::Number(RELEASE_ID),
+            )
+            .is_none()
+        );
+        await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID), &key_a).await;
+        let framed = out_rx.try_iter().count();
+
+        // A late permission answer for the retired ask is dropped.
+        handle_incoming_response(&srv, &answer_for(ASK_RELEASE_A));
+        assert!(answer_a_rx.is_empty(), "late answers never reach an agent");
+        // Late terminal and loss events settle/send nothing.
+        assert_eq!(settle_prompt(&pending_a), None);
+        assert!(!report_loss(&pending_a, &srv.out_tx, &key_a, "task_dead"));
+        assert_eq!(
+            pending_a.lock().unwrap().epoch.current(),
+            epoch_before + 1,
+            "only the release prologue moved the epoch"
+        );
+        assert!(pending_a.lock().unwrap().is_released());
+        assert_eq!(
+            out_rx.try_iter().count(),
+            0,
+            "no late frame is emitted after release (had {framed} at release)"
+        );
+        // New addressed input rejects; the peer is untouched.
+        for err in [
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&key_a, "retry"),
+                &RequestId::Number(51),
+            )
+            .unwrap_err(),
+            handle_cancel(
+                &srv,
+                &serde_json::json!({ "params": { "sessionId": key_a } }),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        }
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays usable after a sibling's release");
+    }
+
+    /// 02.10b supervised-dead release: releasing a `lost` handle is bounded,
+    /// awaits the dead handles, and reports the prior loss plus the release
+    /// cleanup result — with the claim dropped and the handle never revived.
+    /// A second leg proves a failing MCP teardown on a dead handle still
+    /// reports the prior loss alongside its own failure.
+    #[tokio::test]
+    async fn supervised_dead_release_reports_prior_loss_and_cleanup() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        // Injected task death, observed pre-release like the 02.10a path.
+        let pending_a = Arc::clone(&srv.sessions.get(&key_a).unwrap().pending);
+        assert!(
+            report_loss(&pending_a, &srv.out_tx, &key_a, "task_dead"),
+            "the first loss observation reports"
+        );
+        let lost = out_rx.try_recv().expect("loss notifies `lost`");
+        assert_eq!(lost["params"]["state"], "lost");
+
+        assert!(
+            handle_release(
+                &mut srv,
+                &release_request(&key_a),
+                RequestId::Number(RELEASE_ID),
+            )
+            .is_none(),
+            "even a dead handle releases off-loop"
+        );
+        let frames = await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID), &key_a).await;
+        let result = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(RELEASE_ID)))
+            .expect("the deferred release answers");
+        assert_eq!(result["result"]["released"], true);
+        assert_eq!(result["result"]["turnEpoch"], 1);
+        let lifecycle = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                    && frame["params"]["state"] == "released"
+                    && frame["params"]["sessionId"] == key_a
+            })
+            .expect("release reports cleanup after the prior loss");
+        assert_eq!(lifecycle["params"]["turnEpoch"], 1);
+        assert_eq!(
+            lifecycle["params"]["priorLoss"],
+            serde_json::json!({"reason": "task_lost", "rawReason": "task_dead"}),
+            "the release carries the recorded prior loss: {lifecycle}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["params"]["state"] == "lost")
+                .count(),
+            0,
+            "no second `lost` is emitted by the release path (it predates it)"
+        );
+
+        // The handle stays failed/non-resumable: never revived, never reused.
+        assert!(!report_loss(
+            &pending_a,
+            &srv.out_tx,
+            &key_a,
+            "stream_ended"
+        ));
+        assert_eq!(settle_prompt(&pending_a), None);
+        assert!(pending_a.lock().unwrap().is_lost());
+        assert!(pending_a.lock().unwrap().is_released());
+        for err in [
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&key_a, "retry"),
+                &RequestId::Number(51),
+            )
+            .unwrap_err(),
+            handle_cancel(
+                &srv,
+                &serde_json::json!({ "params": { "sessionId": key_a } }),
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(err.code, AcpError::resource_not_found(None).code);
+        }
+        let repeat = handle_release(
+            &mut srv,
+            &release_request(&key_a),
+            RequestId::Number(RELEASE_ID + 1),
+        )
+        .expect("recorded releases answer synchronously")
+        .unwrap();
+        assert_eq!(repeat["released"], true, "success stays idempotent");
+        let id_a: MakiId = key_a.parse().unwrap();
+        await_claim_dropped(id_a, &fixture_claims()).await;
+
+        // Second leg: a dead handle whose MCP teardown also fails reports
+        // both — the prior loss and the cleanup failure, never `released`.
+        let (key_c, mut runtime_c) = fixture_runtime();
+        let (_held_c, cmd_c_rx) = maki_agent::mcp::test_support::held_handle();
+        runtime_c.mcp = Some(_held_c);
+        srv.sessions.insert(key_c.clone(), runtime_c);
+        let pending_c = Arc::clone(&srv.sessions.get(&key_c).unwrap().pending);
+        assert!(report_loss(&pending_c, &srv.out_tx, &key_c, "pump_dead"));
+        let lost_c = out_rx.try_recv().expect("loss notifies `lost`");
+        assert_eq!(lost_c["params"]["sessionId"], key_c);
+        assert!(
+            handle_release(
+                &mut srv,
+                &release_request(&key_c),
+                RequestId::Number(RELEASE_ID + 2),
+            )
+            .is_none()
+        );
+        let _ = timeout(STDIN_DEADLOCK_TIMEOUT, cmd_c_rx.recv_async())
+            .await
+            .expect("teardown targets the dead session's MCP handle");
+        let frames_c =
+            await_release_outcome(&out_rx, RequestId::Number(RELEASE_ID + 2), &key_c).await;
+        let failed = frames_c
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                    && frame["params"]["sessionId"] == key_c
+            })
+            .expect("a dead handle with failing cleanup still reports");
+        assert_eq!(failed["params"]["state"], "release_failed");
+        assert_eq!(failed["params"]["stage"], "mcp");
+        assert_eq!(
+            failed["params"]["priorLoss"],
+            serde_json::json!({"reason": "task_lost", "rawReason": "pump_dead"}),
+            "the failure still carries the prior loss: {failed}"
+        );
+
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays usable through dead-handle releases");
+    }
+
+    /// 02.10b shutdown: EOF releases everything — every runtime with a
+    /// visible per-session result, every unactivated lease through the 02.3
+    /// drop-claim helper, every in-flight startup aborted — and a slow
+    /// teardown on one session cannot strand its peer.
+    #[tokio::test]
+    async fn shutdown_releases_everything_with_visible_results() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let (key_b, runtime_b) = fixture_runtime();
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        // One unactivated lease plus one startup in flight, like a client
+        // that disappeared mid-activation.
+        let lease_storage = TempDir::new().unwrap();
+        let lease_state = StateDir::from_path(lease_storage.path().to_path_buf());
+        let lease_claim = SessionClaim::fresh(&lease_state);
+        let lease_id = lease_claim.id();
+        srv.allocations.insert(
+            "lease-id".to_owned(),
+            Allocation {
+                cwd: PathBuf::from("/project"),
+                claim: lease_claim,
+            },
+        );
+        srv.activating.insert(
+            "activating-id".to_owned(),
+            tokio::spawn(future::pending::<()>()),
+        );
+
+        timeout(
+            STDIN_DEADLOCK_TIMEOUT,
+            close_all_sessions(&mut srv, SessionEndReason::Shutdown),
+        )
+        .await
+        .expect("shutdown stays bounded");
+        assert!(srv.sessions.is_empty(), "every runtime is released");
+        assert!(srv.allocations.is_empty(), "every lease is released");
+        assert!(srv.activating.is_empty(), "every startup is aborted");
+        let id_a: MakiId = key_a.parse().unwrap();
+        let id_b: MakiId = key_b.parse().unwrap();
+        assert!(
+            !SessionClaim::is_held(id_a, &fixture_claims()),
+            "A's claim drops"
+        );
+        assert!(
+            !SessionClaim::is_held(id_b, &fixture_claims()),
+            "B's claim drops"
+        );
+        assert!(
+            !SessionClaim::is_held(lease_id, &lease_state),
+            "unactivated leases drop through the 02.3 helper"
+        );
+
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        for key in [&key_a, &key_b] {
+            let lifecycle = frames
+                .iter()
+                .find(|frame| {
+                    frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                        && frame["params"]["sessionId"] == *key
+                })
+                .unwrap_or_else(|| panic!("shutdown reports {key}: {frames:?}"));
+            assert_eq!(lifecycle["params"]["state"], "released", "{lifecycle}");
+            assert_eq!(lifecycle["params"]["rawReason"], "shutdown", "{lifecycle}");
+        }
+        let owed = frames
+            .iter()
+            .find(|frame| frame.get("id") == Some(&serde_json::json!(PROMPT_ID)))
+            .expect("the owed prompt is answered, never hung");
+        assert_eq!(owed["result"]["stopReason"], "cancelled");
+    }
+
+    /// 02.10b shutdown under fault: a hung hook plus a held MCP teardown on
+    /// one session bounds the whole sweep and stays visible per session — the
+    /// failed session reports `release_failed` while its peer still reports
+    /// `released`, and every claim still drops.
+    #[tokio::test]
+    async fn shutdown_with_held_teardown_is_bounded_and_visible() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        park_prompt_for(&srv, &key_a, RequestId::Number(PROMPT_ID));
+        let (held_mcp, _cmd_rx) = maki_agent::mcp::test_support::held_handle();
+        only_mut(&mut srv).mcp = Some(held_mcp);
+        let gate = Arc::new(Notify::new());
+        let held = Arc::clone(&gate);
+        // The hook hangs only the addressed session; the peer's own
+        // invocation returns at once. A global hook that hung for every
+        // session would fail every release — honestly, since it is part of
+        // each teardown — but this test needs the peer distinction.
+        let victim: MakiId = key_a.parse().unwrap();
+        srv.on_session_end = Some(Arc::new(move |id, _| {
+            let held = Arc::clone(&held);
+            Box::pin(async move {
+                if id == victim {
+                    held.notified().await;
+                }
+            })
+        }));
+        let (key_b, runtime_b) = fixture_runtime();
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        timeout(
+            STDIN_DEADLOCK_TIMEOUT,
+            close_all_sessions(&mut srv, SessionEndReason::Shutdown),
+        )
+        .await
+        .expect("a held teardown cannot stall shutdown");
+        assert!(srv.sessions.is_empty(), "every runtime is released");
+
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        let failed = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                    && frame["params"]["sessionId"] == key_a
+            })
+            .expect("the held session reports its failure");
+        assert_eq!(failed["params"]["state"], "release_failed", "{failed:?}");
+        assert_eq!(failed["params"]["stage"], "hook", "{failed:?}");
+        let peer = frames
+            .iter()
+            .find(|frame| {
+                frame.get("method") == Some(&Value::from(extension::LIFECYCLE_NOTIFICATION))
+                    && frame["params"]["sessionId"] == key_b
+            })
+            .expect("the peer still reports its own outcome");
+        assert_eq!(peer["params"]["state"], "released", "{peer:?}");
+        let id_a: MakiId = key_a.parse().unwrap();
+        let id_b: MakiId = key_b.parse().unwrap();
+        assert!(!SessionClaim::is_held(id_a, &fixture_claims()));
+        assert!(!SessionClaim::is_held(id_b, &fixture_claims()));
     }
 }
 

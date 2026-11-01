@@ -4,14 +4,15 @@
 //! Fake client only, and no prompt is ever sent to a live session: a prompt
 //! to an activated session would reach the provider, and fixtures use no
 //! keys, inference, or network. What this fixture proves at the wire:
-//! - `initialize` advertises allocate+activate+cancel (release stays the
-//!   -32601 seam for 02.10b);
+//! - `initialize` advertises allocate+activate+cancel+release;
 //! - allocate reserves distinct ids with no provider/task, and a prompt to
 //!   an unactivated allocation is rejected without creating either;
 //! - activate answers `{sessionId, turnEpoch: 0}` plus a usable `active`
 //!   lifecycle frame, with the requested model fixed per session;
 //! - failed activation, release of an unactivated allocation, and the lease
-//!   lifecycle behave as specified; the peer stays usable throughout.
+//!   lifecycle behave as specified; the peer stays usable throughout;
+//! - addressed cancel plus active release (02.9a/02.10b) answer over the
+//!   wire with the deferred release outcome and a `released` lifecycle.
 //!
 //! What it deliberately leaves for named later slices (not silent gaps):
 //! - construction-order instrumentation (which spec reached the first
@@ -66,9 +67,10 @@ async fn allocate_then_activate_two_sessions_with_distinct_models() {
         [
             extension::ALLOCATE_METHOD,
             extension::ACTIVATE_METHOD,
-            extension::CANCEL_METHOD
+            extension::CANCEL_METHOD,
+            extension::RELEASE_METHOD
         ],
-        "02.9a advertises cancel alongside what 02.3 answers: {methods:?}"
+        "02.10b advertises release alongside what 02.3/02.9a answer: {methods:?}"
     );
 
     let cwd_a = projects.a.to_string_lossy().into_owned();
@@ -209,12 +211,13 @@ async fn release_forgets_an_unactivated_allocation() {
     child.shutdown().await.unwrap();
 }
 
-/// 02.9a addressed cancel answers on a live activated session (idle here:
-/// no prompt is ever sent, so the provider wire stays untouched), while
-/// active-session release stays the 02.10b seam (-32601) and unknown ids
-/// answer `resource_not_found`.
+/// 02.9a addressed cancel plus 02.10b active release over the live wire:
+/// cancel answers on an idle activated session (no prompt is ever sent, so
+/// the provider wire stays untouched), then release settles the deferred
+/// outcome and reports `released` while the routing entry drops — and an
+/// unknown id answers `resource_not_found`.
 #[tokio::test]
-async fn cancel_answers_while_active_release_stays_a_seam() {
+async fn cancel_answers_and_active_release_reports() {
     let projects = ProjectPair::create().unwrap();
     let mut child = MakiChild::spawn().await.unwrap();
     child.initialize().await.unwrap();
@@ -239,10 +242,29 @@ async fn cancel_answers_while_active_release_stays_a_seam() {
     let mode = child.set_mode_raw(&session, "plan").await.unwrap();
     assert_eq!(mode["error"]["data"]["reason"], "fixed_at_activation");
 
-    // Release parses its params first: on the live session the method is
-    // still the 02.10b seam (-32601), on an unknown id it is -32002.
-    let seam = child.release_raw(&session).await.unwrap();
-    assert_eq!(seam["error"]["code"], -32601, "{seam}");
+    // Release settles off-loop and answers once teardown reports: the idle
+    // settle bumps the epoch once more, the entry drops, and the lifecycle
+    // carries the client's release note.
+    let released = child.release_raw(&session).await.unwrap();
+    assert_eq!(released["result"]["sessionId"], session, "{released}");
+    assert_eq!(released["result"]["released"], true, "{released}");
+    assert_eq!(released["result"]["turnEpoch"], 2, "{released}");
+    let frame = child
+        .expect_notification(|frame| {
+            frame["method"] == extension::LIFECYCLE_NOTIFICATION
+                && frame["params"]["sessionId"] == session
+        })
+        .await
+        .unwrap();
+    assert_eq!(frame["params"]["state"], "released", "{frame}");
+    assert_eq!(frame["params"]["turnEpoch"], 2, "{frame}");
+    assert_eq!(frame["params"]["rawReason"], "client_done", "{frame}");
+    assert_eq!(frame["params"]["usable"], false, "{frame}");
+
+    // Re-release re-answers the recorded success; an unknown id is -32002.
+    let repeat = child.release_raw(&session).await.unwrap();
+    assert_eq!(repeat["result"]["released"], true, "{repeat}");
+    assert_eq!(repeat["result"]["turnEpoch"], 2, "{repeat}");
     let unknown = format!("{session}-missing");
     let missing = child.release_raw(&unknown).await.unwrap();
     assert_eq!(missing["error"]["code"], -32002, "{missing}");

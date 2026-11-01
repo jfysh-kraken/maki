@@ -42,13 +42,13 @@ async fn initialize_correlates_both_id_shapes(id: serde_json::Value) {
     child.shutdown().await.unwrap();
 }
 
-/// 02.3 implements allocate/activate and 02.9a implements addressed cancel,
-/// so the capability is advertised with exactly those methods. Release
-/// (02.10b), owned deletion (05.2), and model discovery (04.1) stay specified
-/// but not implemented: every probe answers -32601 instead of hanging or
-/// answering success.
+/// 02.3 implements allocate/activate, 02.9a implements addressed cancel, and
+/// 02.10b implements bounded active-session release, so the capability is
+/// advertised with exactly those methods. Owned deletion (05.2) and model
+/// discovery (04.1) stay specified but not implemented: every probe answers
+/// -32601 instead of hanging or answering success.
 #[tokio::test]
-async fn extension_capability_advertises_allocate_activate_and_cancel_only() {
+async fn extension_capability_advertises_allocate_activate_cancel_and_release() {
     let mut child = MakiChild::spawn().await.unwrap();
     let initialize = child.initialize().await.unwrap();
     let advertised = &initialize["result"]["agentCapabilities"]["_meta"]["maki.multiSession"];
@@ -64,7 +64,8 @@ async fn extension_capability_advertises_allocate_activate_and_cancel_only() {
         [
             extension::ALLOCATE_METHOD,
             extension::ACTIVATE_METHOD,
-            extension::CANCEL_METHOD
+            extension::CANCEL_METHOD,
+            extension::RELEASE_METHOD
         ],
         "capability lists only what the server answers: {methods:?}"
     );
@@ -84,8 +85,7 @@ async fn extension_capability_advertises_allocate_activate_and_cancel_only() {
     }
     // Release parses before it routes: empty params fail parsing (-32602),
     // while an unknown id routes past parsing to `resource_not_found`.
-    // Releasing an active session stays the 02.10b seam (-32601); the
-    // unactivated-allocation half is proven in `allocation_activation.rs`.
+    // Active-session release itself is proven in `allocation_activation.rs`.
     let empty = child
         .probe_unsupported(extension::RELEASE_METHOD)
         .await

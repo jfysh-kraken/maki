@@ -690,14 +690,20 @@ impl McpHandle {
         transport.get_prompt(&raw_name, arguments).await
     }
 
-    pub async fn shutdown(&self) {
+    /// Drains every running transport and stops the loop, waiting for its ack
+    /// up to the shutdown bound. Returns whether the loop confirmed the
+    /// shutdown: `false` means the ack never arrived (wedged or gone loop),
+    /// so the caller — 02.10b release — must report the teardown as failed
+    /// rather than clean. Still bounded either way.
+    pub async fn shutdown(&self) -> bool {
         let (ack_tx, ack_rx) = flume::bounded(1);
         self.send(McpCommand::Shutdown { ack: ack_tx });
-        if timeout(MCP_SHUTDOWN_TIMEOUT, ack_rx.recv_async())
-            .await
-            .is_err()
-        {
-            warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
+        match timeout(MCP_SHUTDOWN_TIMEOUT, ack_rx.recv_async()).await {
+            Ok(Ok(())) => true,
+            _ => {
+                warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
+                false
+            }
         }
     }
 
@@ -1252,10 +1258,28 @@ pub mod test_support {
         )
     }
 
+    /// A handle whose command loop is whatever the caller does with the
+    /// returned receiver: a `Shutdown` the test never acks wedges teardown
+    /// past the shutdown bound, so 02.10b release tests can inject a
+    /// slow/failing MCP teardown without providers, keys, or network. Always
+    /// compiled, like [`stub_session`](self::stub_session).
+    pub fn held_handle() -> (McpHandle, flume::Receiver<super::McpCommand>) {
+        let (cmd_tx, cmd_rx) = flume::unbounded();
+        (
+            McpHandle {
+                cmd_tx,
+                index: Arc::new(ArcSwap::from_pointee(ToolIndex::default())),
+                snapshot: Arc::new(ArcSwap::from_pointee(McpSnapshot::default())),
+                defer_tools: 0,
+                ready_rx: flume::bounded(0).1,
+            },
+            cmd_rx,
+        )
+    }
+
     /// Fails every call with `UnknownTool`, which is how a test proves the call
     /// reached MCP at all.
     struct StubTransport;
-
     impl McpTransport for StubTransport {
         fn call_tool<'a>(
             &'a self,

@@ -22,8 +22,8 @@ pub fn initialize_response() -> InitializeResponse {
         .mcp_capabilities(McpCapabilities::new().http(true))
         .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()));
     // Fork extension: 02.3 advertises allocate+activate (see
-    // `extension::capability_meta`); 02.9a adds cancel, release joins in
-    // 02.10b. Stock clients ignore `_meta`, so this stays standard-compatible.
+    // `extension::capability_meta`); 02.9a adds cancel, 02.10b adds release.
+    // Stock clients ignore `_meta`, so this stays standard-compatible.
     capabilities.meta = Some(extension::capability_meta());
     InitializeResponse::new(ProtocolVersion::V1)
         .agent_capabilities(capabilities)
@@ -94,6 +94,18 @@ pub fn activate_result(session_id: &str) -> serde_json::Value {
     allocate_result(session_id)
 }
 
+/// 02.10b active-session release result, sent by the background release task
+/// once bounded teardown settles (the routing loop never waits on it). The
+/// epoch is the post-release one: the cancel settlement or loss snapshot in
+/// the release prologue bumps exactly once, so a racing terminal lands stale.
+pub fn release_result(session_id: &str, turn_epoch: u64) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "released": true,
+        "turnEpoch": turn_epoch,
+    })
+}
+
 /// Release of an unactivated allocation: the lease is gone, nothing ever ran.
 pub fn release_allocation_result(session_id: &str) -> serde_json::Value {
     serde_json::json!({
@@ -132,4 +144,64 @@ pub fn lifecycle_lost_params(
         "rawReason": raw_reason,
         "usable": false,
     })
+}
+
+/// 02.10b successful-release params. `rawReason` echoes the client's release
+/// note (`client_done` by default; `shutdown`/`replaced` on the close paths).
+/// `usable` is always false: the routing entry is gone and the claim is
+/// dropped. A release of a supervised-dead handle carries `priorLoss` with
+/// the recorded loss reason/raw, so one frame reports both the prior loss
+/// and the cleanup result without reviving the handle.
+pub fn lifecycle_released_params(
+    session_id: &str,
+    turn_epoch: u64,
+    reason: &str,
+    prior_loss: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "sessionId": session_id,
+        "state": "released",
+        "turnEpoch": turn_epoch,
+        "rawReason": reason,
+        "usable": false,
+    });
+    if let Some((loss_reason, loss_raw)) = prior_loss {
+        params["priorLoss"] = serde_json::json!({
+            "reason": loss_reason,
+            "rawReason": loss_raw,
+        });
+    }
+    params
+}
+
+/// 02.10b failed-teardown params. Same frame shape as success but `state` is
+/// `release_failed` and `stage` names the bounded stage that gave up
+/// (`hook`, `mcp`, or `release` for the overall cap) with the verbatim cause
+/// in `rawReason`. The entry is still dropped and the claim still released —
+/// the failure is reported, never retried here — but no `released` frame is
+/// ever sent for the session, so no successful release is claimed.
+pub fn lifecycle_release_failed_params(
+    session_id: &str,
+    turn_epoch: u64,
+    reason: &str,
+    stage: &str,
+    raw_reason: &str,
+    prior_loss: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "sessionId": session_id,
+        "state": "release_failed",
+        "turnEpoch": turn_epoch,
+        "rawReason": raw_reason,
+        "stage": stage,
+        "usable": false,
+        "releaseNote": reason,
+    });
+    if let Some((loss_reason, loss_raw)) = prior_loss {
+        params["priorLoss"] = serde_json::json!({
+            "reason": loss_reason,
+            "rawReason": loss_raw,
+        });
+    }
+    params
 }

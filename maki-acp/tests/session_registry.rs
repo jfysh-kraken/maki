@@ -12,8 +12,8 @@
 //!   is 02.3 (see `tests/allocation_activation.rs` and the `server.rs`
 //!   lease tests); addressed cancel scoping is 02.9a (wire shape proven
 //!   below, settlement/retirement at unit level in `server.rs`), bounded
-//!   release is 02.10b: the release probe must still answer -32601 (see
-//!   `extension_runtime_release_seam_still_rejects_clearly`).
+//!   release is 02.10b (wire shape in `tests/allocation_activation.rs`,
+//!   teardown bounds at unit level in `server.rs`).
 //!
 //! 02.2b changed the per-session observable used here: setup is fixed per
 //! session, so a mode change routes to its session and rejects with
@@ -89,10 +89,11 @@ async fn two_sessions_coexist_under_one_pid_with_independent_pumps() {
 /// server: an idle cancel reports `cancelled: false` with the bumped epoch
 /// and keeps the session usable, a stale pin rejects with the expected/got
 /// epochs and changes nothing, and an unknown session rejects without
-/// touching either runtime. Active-session release stays the 02.10b seam
-/// (-32601); allocate/activate moved out of the seam list in 02.3.
+/// touching either runtime. Active-session release is 02.10b (wire shape in
+/// `tests/allocation_activation.rs`); allocate/activate moved out of the
+/// seam list in 02.3.
 #[tokio::test]
-async fn addressed_cancel_answers_while_active_release_stays_a_seam() {
+async fn addressed_cancel_answers_on_both_live_sessions() {
     let mut shared = SharedSessions::establish().await.unwrap();
 
     let idle = shared.child.cancel_raw(&shared.a, None).await.unwrap();
