@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::UNIX_EPOCH;
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -44,6 +45,37 @@ const NEWER_LOG_FORMAT: &str = "written by a newer maki, log format";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
+/// Advisory lock serializing read-modify-write cycles on the shared
+/// `cwd_latest.json` index. flock lives on the open file description, so one
+/// holder's descriptor excludes other holders in the same process too;
+/// per-process `fcntl` locks would not, so they must not substitute.
+///
+/// Lock order: the session claim first, then this lock. Both live writers
+/// already hold their claim when they reach the index
+/// ([`SessionClaim::persist`] → `SessionLog::rewrite_claimed` →
+/// [`update_cwd_index`]; [`Session::delete_from`] → [`remove_from_cwd_index`]
+/// under a strict claim). Never await agent or network work while holding the
+/// index lock, and never hold it across an `.await`: every writer runs on a
+/// plain blocking thread (the TUI storage-writer thread, headless settle, the
+/// ACP delete handler), so the bounded blocking wait in
+/// [`acquire_cwd_index_lock`] never touches the async runtime.
+///
+/// Readers (`recorded_cwds`, `latest_id_in`) stay lock-free on purpose: the
+/// index file is always replaced by atomic rename, so a concurrent read sees
+/// the old or the new copy, never torn bytes, and both readers already fall
+/// back to a header rescan on anything surprising.
+///
+/// Old, unpatched Maki builds do not honour this lock. The index is a cache,
+/// not the session-ownership authority: a lost race degrades `--continue`,
+/// never the transcript, and repair/rescan rebuild the index from headers.
+const CWD_INDEX_LOCK_FILE: &str = "cwd_latest.lock";
+/// How long an index writer polls [`Lock::acquire`] before giving up as a
+/// loud save failure. Long enough for a competing read-modify-write
+/// (milliseconds of JSON), short enough that a stuck holder surfaces instead
+/// of hanging a save. This is not [`Lock::acquire_retrying`]'s ~250 ms
+/// fd-inheritance window: a genuine holder outlives that by design.
+const CWD_INDEX_LOCK_WAIT: Duration = Duration::from_secs(5);
+const CWD_INDEX_LOCK_POLL: Duration = Duration::from_millis(5);
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
@@ -1532,6 +1564,9 @@ fn session_time(session_id: &str) -> Option<(u64, u32)> {
 }
 
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
+    // The session claim is already held by every caller (see the lock-order
+    // note on `CWD_INDEX_LOCK_FILE`); the index lock below is taken second.
+    let _index_lock = acquire_cwd_index_lock(dir)?;
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
     if index.get(cwd).is_some_and(|v| *v == id_str) {
@@ -1597,6 +1632,8 @@ fn try_remove(path: &Path) -> Result<bool, StorageError> {
 }
 
 fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageError> {
+    // Same lock order as `update_cwd_index`: claim first, index lock second.
+    let _index_lock = acquire_cwd_index_lock(dir)?;
     let mut index = load_cwd_index(dir);
     let before = index.len();
     index.retain(|_, v| v.parse::<MakiId>() != Ok(session_id));
@@ -1604,6 +1641,37 @@ fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageEr
         atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)?;
     }
     Ok(())
+}
+
+fn cwd_index_lock_path(dir: &Path) -> PathBuf {
+    dir.join(CWD_INDEX_LOCK_FILE)
+}
+
+/// Takes the exclusive index lock, polling [`Lock::acquire`] until
+/// [`CWD_INDEX_LOCK_WAIT`]. Blocking: call only from a blocking thread, never
+/// the async runtime (see the lock-order note on [`CWD_INDEX_LOCK_FILE`]).
+///
+/// A holder past the deadline is a loud [`StorageError::IndexBusy`], never a
+/// silent skip: the caller reports it as a save failure, and the next save
+/// retries the whole read-modify-write. A locking I/O error is a loud
+/// [`StorageError::Io`] for the same reason.
+fn acquire_cwd_index_lock(dir: &Path) -> Result<Lock, StorageError> {
+    acquire_cwd_index_lock_for(dir, CWD_INDEX_LOCK_WAIT)
+}
+
+fn acquire_cwd_index_lock_for(dir: &Path, wait: Duration) -> Result<Lock, StorageError> {
+    let path = cwd_index_lock_path(dir);
+    let deadline = Instant::now() + wait;
+    loop {
+        match Lock::acquire(&path) {
+            Ok(lock) => return Ok(lock),
+            Err(LockError::Held { .. }) if Instant::now() < deadline => {
+                thread::sleep(CWD_INDEX_LOCK_POLL);
+            }
+            Err(LockError::Held { .. }) => return Err(StorageError::IndexBusy),
+            Err(LockError::Io { source, .. }) => return Err(StorageError::Io(source)),
+        }
+    }
 }
 
 // -- Header scanning for session list --
@@ -2393,8 +2461,9 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        TAIL_BUF, acquire_cwd_index_lock_for, cwd_index_lock_path, generate_title, json_path,
+        jsonl_path, load_cwd_index, lock_path, locks_dir, next_epoch, update_cwd_index,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, LOG_FORMAT_VERSION, NEWER_LOG_FORMAT, OLDEST_LOG_FORMAT_VERSION,
@@ -2404,6 +2473,7 @@ mod tests {
     use crate::StateDir;
     use crate::frame::PromptFacts;
     use crate::id::MakiId;
+    use crate::lock::{Lock, LockError};
     use crate::paths::session_task_logs_dir;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashMap};
@@ -2411,6 +2481,8 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3588,6 +3660,120 @@ mod tests {
         let index = load_cwd_index(dir);
         assert!(!index.values().any(|v| *v == s1.id.to_string()));
         assert_eq!(index.get("/other"), Some(&s2.id.to_string()));
+    }
+
+    // -- Shared cwd_latest.json index lock (05.3a) --
+    //
+    // Every test below is synchronous: no test holds the index lock across an
+    // await, and neither does any production writer (the lock lives and dies
+    // inside `update_cwd_index` / `remove_from_cwd_index` on a blocking
+    // thread). Lock order is session claim first, index lock second.
+
+    #[test]
+    fn index_lock_excludes_a_second_holder_in_the_same_process() {
+        let tmp = TempDir::new().unwrap();
+        let path = cwd_index_lock_path(tmp.path());
+
+        let _held = Lock::acquire(&path).unwrap();
+        let err =
+            Lock::acquire(&path).expect_err("flock is per open file description, not per process");
+        assert!(matches!(err, LockError::Held { .. }), "got: {err}");
+    }
+
+    /// Lock holder for [`index_lock_excludes_a_holder_in_another_process`].
+    /// Spawned as `current_exe --exact <this test>` with
+    /// `MAKI_STORAGE_INDEX_LOCK_CHILD` (lock path) and
+    /// `MAKI_STORAGE_INDEX_LOCK_READY` (readiness file) set; with neither
+    /// set it is a no-op so the normal suite stays green.
+    #[test]
+    fn index_lock_child_holds_lock_for_parent() {
+        let (Ok(lock_path), Ok(ready_path)) = (
+            std::env::var("MAKI_STORAGE_INDEX_LOCK_CHILD"),
+            std::env::var("MAKI_STORAGE_INDEX_LOCK_READY"),
+        ) else {
+            return;
+        };
+        let _held = Lock::acquire(Path::new(&lock_path)).expect("child takes index lock");
+        fs::write(&ready_path, b"ready").expect("child signals parent");
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn index_lock_excludes_a_holder_in_another_process() {
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let lock_path = cwd_index_lock_path(tmp.path());
+        let ready_path = tmp.path().join("child-ready");
+        let _child = KillOnDrop(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("sessions::tests::index_lock_child_holds_lock_for_parent")
+                .env("MAKI_STORAGE_INDEX_LOCK_CHILD", &lock_path)
+                .env("MAKI_STORAGE_INDEX_LOCK_READY", &ready_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn lock-holding child process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "lock-holding child never signalled readiness"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let err =
+            Lock::acquire(&lock_path).expect_err("a held index lock must exclude another process");
+        assert!(matches!(err, LockError::Held { .. }), "got: {err}");
+    }
+
+    #[test]
+    fn concurrent_index_writers_within_deadline_both_succeed() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let id_a = MakiId::generate();
+        let id_b = MakiId::generate();
+        let writer = |cwd: &'static str, id: MakiId| {
+            let dir = dir.clone();
+            thread::spawn(move || {
+                for _ in 0..20 {
+                    update_cwd_index(&dir, cwd, id).unwrap();
+                }
+            })
+        };
+        let a = writer("/project-a", id_a);
+        let b = writer("/project-b", id_b);
+        a.join().unwrap();
+        b.join().unwrap();
+        let index = load_cwd_index(&dir);
+        assert_eq!(index.get("/project-a"), Some(&id_a.to_string()));
+        assert_eq!(index.get("/project-b"), Some(&id_b.to_string()));
+    }
+
+    #[test]
+    fn index_holder_past_deadline_is_a_save_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let _held = Lock::acquire(&cwd_index_lock_path(&dir)).unwrap();
+        let waiter =
+            thread::spawn(move || acquire_cwd_index_lock_for(&dir, Duration::from_millis(50)));
+        let err = waiter
+            .join()
+            .unwrap()
+            .expect_err("a holder past the deadline must fail loudly");
+        assert!(
+            matches!(err, StorageError::IndexBusy),
+            "a silent skip is not an option, got: {err}"
+        );
     }
 
     /// Clones share one lock, so a snapshot still queued keeps its session

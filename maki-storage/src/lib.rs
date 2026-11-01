@@ -68,6 +68,14 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    /// Another Maki process kept the shared `cwd_latest.json` index lock past
+    /// the writer's deadline. The save or delete that needed the index failed
+    /// loudly with this instead of silently skipping the update; retrying the
+    /// operation retries the whole read-modify-write. The index is a cache,
+    /// not the session-ownership authority: repair and rescan rebuild it from
+    /// session headers.
+    #[error("shared session index is busy")]
+    IndexBusy,
     #[error("slug collision after max attempts")]
     SlugCollision,
 }
