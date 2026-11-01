@@ -481,6 +481,26 @@ impl MakiChild {
         self.expect_response(&id).await
     }
 
+    /// Addressed turn cancel (02.9a `_maki/session/cancel`). The reply is the
+    /// assertion surface: `{sessionId, cancelled, turnEpoch}` on success, a
+    /// JSON-RPC error otherwise. `turn_epoch` is the optional pin: omitted
+    /// cancels whatever turn runs. No prompt is ever sent here, so the
+    /// provider wire stays untouched: no inference, keys or network.
+    pub async fn cancel_raw(
+        &mut self,
+        session_id: &str,
+        turn_epoch: Option<u64>,
+    ) -> io::Result<Value> {
+        let id = self.fresh_id();
+        let mut params = serde_json::json!({"sessionId": session_id});
+        if let Some(epoch) = turn_epoch {
+            params["turnEpoch"] = Value::from(epoch);
+        }
+        self.send_request("_maki/session/cancel", id.clone(), params)
+            .await?;
+        self.expect_response(&id).await
+    }
+
     /// Fire a `session/cancel` notification. One-way: a notification carries
     /// no id to answer on, so there is no reply to correlate.
     pub async fn cancel_notify(&mut self, session_id: &str) -> io::Result<()> {

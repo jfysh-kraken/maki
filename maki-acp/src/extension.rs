@@ -47,16 +47,16 @@ pub const USABLE_META_KEY: &str = "maki.usable";
 
 /// Advertise the implemented slice of the extension. The contract names four
 /// methods, but the capability only lists what this binary actually answers:
-/// 02.3 implements allocate and activate; addressed cancel joins in 02.9a and
-/// release in 02.10b. Clients MUST probe any method they intend to call: an
-/// unlisted method answers `-32601`, which is the "unsupported" signal, not a
-/// failure.
+/// 02.3 implements allocate and activate, 02.9a adds addressed cancel;
+/// release stays probe-to--32601 until 02.10b lands. Clients MUST probe any
+/// method they intend to call: an unlisted method answers `-32601`, which is
+/// the "unsupported" signal, not a failure.
 pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
     agent_client_protocol_schema::v1::Meta::from_iter([(
         CAPABILITY_KEY.to_owned(),
         serde_json::json!({
             "version": CAPABILITY_VERSION,
-            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD],
+            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD, CANCEL_METHOD],
         }),
     )])
 }
@@ -247,8 +247,8 @@ mod tests {
     }
 
     /// 02.3 advertises exactly the methods it answers: allocate and activate.
-    /// Addressed cancel (02.9a) and release (02.10b) stay probe-to--32601 until
-    /// their slices land, so advertising them now would lie.
+    /// 02.9a adds addressed cancel; active-session release (02.10b) stays
+    /// probe-to--32601 until its slice lands, so advertising it now would lie.
     #[test]
     fn capability_advertises_only_the_implemented_methods() {
         let meta = super::capability_meta();
@@ -260,6 +260,13 @@ mod tests {
             .iter()
             .filter_map(|m| m.as_str())
             .collect();
-        assert_eq!(methods, [super::ALLOCATE_METHOD, super::ACTIVATE_METHOD]);
+        assert_eq!(
+            methods,
+            [
+                super::ALLOCATE_METHOD,
+                super::ACTIVATE_METHOD,
+                super::CANCEL_METHOD
+            ]
+        );
     }
 }

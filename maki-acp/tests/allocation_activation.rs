@@ -4,8 +4,8 @@
 //! Fake client only, and no prompt is ever sent to a live session: a prompt
 //! to an activated session would reach the provider, and fixtures use no
 //! keys, inference, or network. What this fixture proves at the wire:
-//! - `initialize` advertises exactly allocate+activate (cancel/release stay
-//!   -32601 seams for 02.9a/02.10b);
+//! - `initialize` advertises allocate+activate+cancel (release stays the
+//!   -32601 seam for 02.10b);
 //! - allocate reserves distinct ids with no provider/task, and a prompt to
 //!   an unactivated allocation is rejected without creating either;
 //! - activate answers `{sessionId, turnEpoch: 0}` plus a usable `active`
@@ -63,8 +63,12 @@ async fn allocate_then_activate_two_sessions_with_distinct_models() {
         .collect();
     assert_eq!(
         methods,
-        [extension::ALLOCATE_METHOD, extension::ACTIVATE_METHOD],
-        "02.3 advertises only what it answers: {methods:?}"
+        [
+            extension::ALLOCATE_METHOD,
+            extension::ACTIVATE_METHOD,
+            extension::CANCEL_METHOD
+        ],
+        "02.9a advertises cancel alongside what 02.3 answers: {methods:?}"
     );
 
     let cwd_a = projects.a.to_string_lossy().into_owned();
@@ -205,11 +209,12 @@ async fn release_forgets_an_unactivated_allocation() {
     child.shutdown().await.unwrap();
 }
 
-/// Addressed cancel and active-session release are not this slice: both keep
-/// answering -32601 on a live activated session, while unknown ids answer
-/// `resource_not_found`.
+/// 02.9a addressed cancel answers on a live activated session (idle here:
+/// no prompt is ever sent, so the provider wire stays untouched), while
+/// active-session release stays the 02.10b seam (-32601) and unknown ids
+/// answer `resource_not_found`.
 #[tokio::test]
-async fn cancel_and_active_release_stay_unimplemented_seams() {
+async fn cancel_answers_while_active_release_stays_a_seam() {
     let projects = ProjectPair::create().unwrap();
     let mut child = MakiChild::spawn().await.unwrap();
     child.initialize().await.unwrap();
@@ -225,10 +230,15 @@ async fn cancel_and_active_release_stay_unimplemented_seams() {
     assert!(active.get("error").is_none(), "{active}");
     lifecycle_active(&mut child, &session).await;
 
-    for method in [extension::CANCEL_METHOD] {
-        let probe = child.probe_unsupported(method).await.unwrap();
-        assert_eq!(probe["error"]["code"], -32601, "{method}: {probe}");
-    }
+    // Idle cancel: nothing runs, so `cancelled` is false but the epoch still
+    // bumps, and the session stays usable afterwards.
+    let idle = child.cancel_raw(&session, None).await.unwrap();
+    assert_eq!(idle["result"]["sessionId"], session, "{idle}");
+    assert_eq!(idle["result"]["cancelled"], false, "{idle}");
+    assert_eq!(idle["result"]["turnEpoch"], 1, "{idle}");
+    let mode = child.set_mode_raw(&session, "plan").await.unwrap();
+    assert_eq!(mode["error"]["data"]["reason"], "fixed_at_activation");
+
     // Release parses its params first: on the live session the method is
     // still the 02.10b seam (-32601), on an unknown id it is -32002.
     let seam = child.release_raw(&session).await.unwrap();

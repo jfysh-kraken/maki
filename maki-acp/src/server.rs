@@ -26,8 +26,8 @@ use maki_agent::session::{Resumed, StoredSession};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
 use maki_agent::{
-    AgentConfig, AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType,
-    ImageSource, InputSource, SessionEndReason, SessionEvents,
+    AgentConfig, AgentInput, AgentMode, CancelToken, CostTally, DoneReason, Envelope,
+    ImageMediaType, ImageSource, InputSource, SessionEndReason, SessionEvents,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
@@ -87,6 +87,12 @@ struct Pending {
     /// sessions retain: a moved call or a still-running child can be parked on
     /// an ask across the turn boundary.
     blocking: bool,
+    /// 02.9a: set when an addressed cancel settles a live turn. The session
+    /// accepts no further prompt while set (see `handle_prompt`): settlement
+    /// alone never reopens the session. 02.9b clears it after confirming tool
+    /// cleanup (`confirm_cleanup`, the gate interface left for that slice);
+    /// until then replacement prompts reject with `cleanup_unconfirmed`.
+    awaiting_cleanup: bool,
 }
 
 impl Default for Pending {
@@ -99,6 +105,7 @@ impl Default for Pending {
             epoch: TurnEpoch::default(),
             asks: HashMap::new(),
             blocking: true,
+            awaiting_cleanup: false,
         }
     }
 }
@@ -138,6 +145,93 @@ impl Ask {
     }
 }
 
+/// What one addressed cancel did, decided under the control lock. The prompt
+/// (if any) was taken exactly once and answers with `cancelled`; the epoch is
+/// always the post-cancel one, bumped even when idle so a racing terminal
+/// lands stale.
+struct CancelSettlement {
+    prompt: Option<RequestId>,
+    /// The epoch the settled turn ran under (pre-bump). `None` when idle.
+    turn: Option<u64>,
+    /// Whether a live turn was settled (and the run signalled + asks retired).
+    cancelled: bool,
+    epoch: u64,
+}
+
+impl Pending {
+    /// Whether the session accepts another prompt. False after an addressed
+    /// cancel settles a live turn, until 02.9b confirms tool cleanup.
+    fn is_resumable(&self) -> bool {
+        !self.awaiting_cleanup
+    }
+
+    /// 02.9b calls this after confirming the cancelled turn's tool cleanup;
+    /// until then the session stays non-resumable. No handler calls it yet:
+    /// positive retry/new-turn proof belongs to 02.9b, not this slice.
+    #[allow(dead_code)]
+    fn confirm_cleanup(&mut self) {
+        self.awaiting_cleanup = false;
+    }
+
+    /// Single control-lock claim for an incoming answer: remove-then-validate
+    /// under one guard, so a concurrent cancel settlement cannot slip between
+    /// the check and the take. Removes the ask either way (exactly-once: a
+    /// replay finds an unknown id), and returns it only when it is live for
+    /// `owner` under the current epoch. Anything else — unknown,
+    /// already-answered, cross-session, or stale-turn — is dropped by the
+    /// caller without reaching any agent.
+    fn claim_ask(&mut self, wire_id: i64, owner: &str) -> Option<Ask> {
+        let ask = self.asks.remove(&wire_id)?;
+        if ask.session() == owner && self.epoch.check(ask.epoch()).is_ok() {
+            Some(ask)
+        } else {
+            None
+        }
+    }
+
+    /// 02.9a addressed-cancel settlement through the 02.2b turn-epoch
+    /// primitive: the first taker of a live turn wins (a racing agent
+    /// terminal finds no prompt and drops), and the epoch always bumps once,
+    /// so a terminal racing the cancel lands stale either way. A settled turn
+    /// retires every outstanding ask in both modes — the run is stopped, so
+    /// unlike a terminally-settled detached turn nothing can outlive it — and
+    /// marks the session non-resumable until 02.9b confirms cleanup. Whether
+    /// the underlying tools actually died is 02.9b's confirmation, not
+    /// claimed here.
+    fn settle_cancel(&mut self) -> CancelSettlement {
+        let turn = self.epoch.current();
+        let live = match (&self.prompt, self.turn) {
+            (Some(_), Some(parked)) => self.epoch.check(parked).is_ok(),
+            _ => false,
+        };
+        let epoch = self.epoch.bump();
+        self.turn = None;
+        if live {
+            self.asks.clear();
+            self.awaiting_cleanup = true;
+            CancelSettlement {
+                prompt: self.prompt.take(),
+                turn: Some(turn),
+                cancelled: true,
+                epoch,
+            }
+        } else {
+            CancelSettlement {
+                prompt: None,
+                turn: None,
+                cancelled: false,
+                epoch,
+            }
+        }
+    }
+}
+/// The per-session control lock. Answer (client response), Stop (addressed
+/// cancel), and — in 02.10b — Close all serialize through this one mutex,
+/// reusing the 02.2b session/turn identity: an answer claims its ask and a
+/// cancel settles the turn under the same guard, so a queued answer can never
+/// bypass an in-flight cancel settlement. 02.10b routes Close through this
+/// same guard (cancel-settle, then bounded teardown); this slice builds the
+/// Answer/Stop half only.
 type PendingState = Arc<Mutex<Pending>>;
 
 /// One independently owned session runtime. Each entry in the registry owns its
@@ -478,9 +572,10 @@ async fn handle_request(
     // Allocate and release-of-allocation answer synchronously: neither does
     // slow work. Activate validates synchronously and defers the result: the
     // dedicated task settles it exactly once on completion, so slow provider
-    // and MCP startup never blocks this loop. Addressed cancel scoping is
-    // 02.9a, active-session (bounded) release is 02.10b; both keep answering
-    // -32601 until their slices land.
+    // and MCP startup never blocks this loop. Addressed cancel (02.9a)
+    // settles synchronously through the turn epoch and answers at once; only
+    // active-session (bounded) release is still the 02.10b seam answering
+    // -32601.
     if method == extension::ALLOCATE_METHOD {
         let result = handle_allocate(srv, raw, params);
         srv.respond_value(id, result);
@@ -494,6 +589,11 @@ async fn handle_request(
     }
     if method == extension::RELEASE_METHOD {
         let result = handle_release(srv, raw);
+        srv.respond_value(id, result);
+        return;
+    }
+    if method == extension::CANCEL_METHOD {
+        let result = handle_cancel(srv, raw);
         srv.respond_value(id, result);
         return;
     }
@@ -514,9 +614,8 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw),
         "session/set_config_option" => handle_set_config(srv, raw),
-        // Reserved 04.1/05.2 names keep answering -32601 through the catch-all
-        // below, as do addressed cancel and active-session release.
-        m if m == extension::CANCEL_METHOD => Err(extension_seam(m, "02.9a")),
+        // Reserved 04.1/05.2 names keep answering -32601 through the
+        // catch-all below, as does active-session release (02.10b).
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -606,6 +705,17 @@ fn activation_in_progress(session_id: &str) -> AcpError {
 fn not_activated(session_id: &str) -> AcpError {
     AcpError::invalid_params().data(serde_json::json!({
         "reason": "not_activated",
+        "sessionId": session_id,
+    }))
+}
+
+/// 02.9a: a session whose turn was cancelled stays non-resumable until 02.9b
+/// confirms tool cleanup. The gate interface 02.9b builds on is the
+/// `awaiting_cleanup` flag (`Pending::confirm_cleanup` clears it); until then
+/// every replacement prompt rejects here, before anything is queued.
+fn cleanup_unconfirmed(session_id: &str) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "reason": "cleanup_unconfirmed",
         "sessionId": session_id,
     }))
 }
@@ -816,6 +926,77 @@ fn handle_release(srv: &mut Server, raw: &Value) -> Result<Value, AcpError> {
         return Err(extension_seam(extension::RELEASE_METHOD, "02.10b"));
     }
     Err(unknown_session(&req.session_id))
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    /// Optional turn pin: when present and not equal to the session's current
+    /// epoch, the cancel is stale and changes nothing.
+    #[serde(rename = "turnEpoch")]
+    turn_epoch: Option<u64>,
+}
+
+/// 02.9a addressed cancel: session-scoped, optionally turn-pinned. Settles
+/// the outstanding prompt exactly once through the 02.2b turn-epoch
+/// primitive (`settle_cancel`: take the prompt, bump, retire every ask, mark
+/// non-resumable) and answers the settled prompt with `cancelled`, preserving
+/// reason/raw stop reason/usability. A racing agent terminal finds no prompt
+/// and drops; late answers find retired asks and drop without reaching any
+/// agent. The run is signalled through its own `cancel_tx` only — never the
+/// shared Maki process, which outlives every per-session stop. An idle
+/// session still bumps (so a racing terminal lands stale) but stays usable:
+/// nothing ran, so there is no cleanup to confirm. Settlement alone never
+/// reopens a cancelled session: replacement prompts reject with
+/// `cleanup_unconfirmed` until 02.9b confirms tool cleanup.
+fn handle_cancel(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
+    let req: CancelParams = parse_params(raw)?;
+    // No runtime exists behind a lease: the cancel names no turn to settle
+    // and no agent to signal, so it rejects like every other addressed op.
+    if srv.allocations.contains_key(&req.session_id) {
+        return Err(not_activated(&req.session_id));
+    }
+    if srv.activating.contains_key(&req.session_id) {
+        return Err(activation_in_progress(&req.session_id));
+    }
+    let session = srv.session(&SessionId::from(req.session_id.clone()))?;
+    // The pin is checked before anything moves: a stale cancel changes
+    // nothing — no signal, no bump, no settlement.
+    let current = session.pending.lock().unwrap().epoch.current();
+    if let Some(got) = req.turn_epoch
+        && got != current
+    {
+        return Err(AcpError::invalid_params().data(serde_json::json!({
+            "expectedEpoch": current,
+            "gotEpoch": got,
+        })));
+    }
+    let settlement = session.pending.lock().unwrap().settle_cancel();
+    // Only a settled turn names a run to stop. An idle cancel leaves the
+    // channel alone: a queued signal would be consumed by the next turn's
+    // stop task and cancel work the client never asked to stop.
+    if settlement.cancelled {
+        let _ = session.handle.cancel_tx.try_send(());
+    }
+    if let (Some(id), Some(turn)) = (settlement.prompt, settlement.turn) {
+        // `DoneReason::Cancelled` carries the preserved triple: the standard
+        // `cancelled` stop reason, the verbatim raw name, and no usability —
+        // a cancelled-awaiting-cleanup session banks nothing to build on.
+        let reason = DoneReason::Cancelled;
+        let raw = reason.to_string();
+        let resp = PromptResponse::new(StopReason::Cancelled).meta(extension::terminal_meta(
+            turn,
+            &raw,
+            reason.usable(),
+        ));
+        srv.respond(id, Ok(AgentResponse::PromptResponse(resp)));
+    }
+    Ok(serde_json::json!({
+        "sessionId": req.session_id,
+        "cancelled": settlement.cancelled,
+        "turnEpoch": settlement.epoch,
+    }))
 }
 
 /// Drops an allocation's storage claim, releasing the lease. The single
@@ -1435,6 +1616,12 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // unknown id rejects here, before anything is queued or any peer is
     // touched; duplicate and cross-session rejection keep the same shape.
     let session = srv.session(&req.session_id)?;
+    // 02.9a: a cancelled-awaiting-cleanup session accepts nothing until 02.9b
+    // confirms tool cleanup. Settlement alone never reopens it; the peer's
+    // slot is untouched by this rejection.
+    if !session.pending.lock().unwrap().is_resumable() {
+        return Err(cleanup_unconfirmed(&req.session_id.0));
+    }
     debug!(
         session = %req.session_id.0,
         epoch = session.pending.lock().unwrap().epoch.current(),
@@ -1524,21 +1711,27 @@ fn handle_set_config(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpErro
 fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
-            // Identity-check and dispatch only: the notification names its own
-            // session, a miss is dropped (no id to answer on), and a hit only
-            // signals the run. Session/turn scoping and settlement gating are
-            // 02.9a, so no epoch moves here; the run's terminal settles the
-            // prompt through `settle_prompt` as usual.
+            // Legacy best-effort Stop: identity-check and dispatch only. The
+            // notification names its own session, a miss is dropped (no id to
+            // answer on), and a hit only signals the run; the run's terminal
+            // settles the prompt through `settle_prompt` as usual, so no
+            // epoch moves here. Session/turn scoping with synchronous
+            // exactly-once settlement and ask retirement is the addressed
+            // `_maki/session/cancel` method (`handle_cancel`, 02.9a), which
+            // serializes through the same per-session control lock.
             let Ok(note) = parse_params::<CancelNotification>(raw) else {
                 return;
             };
-            // Asks stay: a moved call outlives the turn and may be parked on
-            // one, and a stale answer is tagged, so whoever waits next drops
-            // it. Retiring asks on this cancel path is 02.9a's, not built
-            // here: only agent-settled terminals (Done/Error through
-            // `settle_prompt`) retire asks, and only in blocking mode. An
-            // unactivated allocation or an unknown id names no run to signal,
-            // so the notification is dropped the same way.
+            // Asks stay on this legacy path: a moved call outlives the turn
+            // and may be parked on one, and a stale answer is tagged, so
+            // whoever waits next drops it. Retiring asks here is not built:
+            // only agent-settled terminals (Done/Error through
+            // `settle_prompt`) and addressed cancels (through
+            // `settle_cancel`) retire asks, and only agent terminal
+            // settlement honors the blocking/detached distinction (an
+            // addressed cancel stops the run, so it retires in both modes).
+            // An unactivated allocation or an unknown id names no run to
+            // signal, so the notification is dropped the same way.
             if let Ok(session) = srv.session(&note.session_id) {
                 let _ = session.handle.cancel_tx.try_send(());
             }
@@ -1554,37 +1747,35 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         return;
     };
     // Ask ids are minted from one process-wide counter, so the owning runtime
-    // is found by identity without touching peers.
+    // is found by identity without touching peers. The claim is
+    // remove-then-validate under that runtime's control guard — one critical
+    // section — so a cancel settling concurrently cannot slip between the
+    // check and the take: whichever holds the guard first wins, and the loser
+    // finds nothing to act on. A queued answer can never bypass an in-flight
+    // cancel settlement this way; 02.10b's Close joins through the same
+    // guard.
     let mut found = None;
     for (key, runtime) in srv.sessions.iter() {
-        if let Some(ask) = runtime.pending.lock().unwrap().asks.remove(&want) {
+        if let Some(ask) = runtime.pending.lock().unwrap().claim_ask(want, key) {
             found = Some((key.clone(), ask));
             break;
         }
     }
     let Some((owner, ask)) = found else {
-        warn!(%id, "response for an unknown request id");
+        warn!(%id, "response for an unknown, answered, or stale ask");
         return;
     };
     let Some(runtime) = srv.sessions.get(&owner) else {
         warn!(%id, owner, "response for a released session");
         return;
     };
-    // The ask is bound to the session and turn that issued it. A stale answer
-    // is dropped, never applied, so a stale allow can never green a later
-    // turn's tool call; a binding naming another session is dropped the same
-    // way (global ids make that structural, the check makes it explicit).
-    // Every ask is consumed exactly once on lookup, so a repeated answer for
-    // the same id finds nothing and is dropped; a terminal in blocking mode
-    // already retired every ask, so a late answer finds nothing either.
-    let live = {
-        let guard = runtime.pending.lock().unwrap();
-        ask.session() == owner && guard.epoch.check(ask.epoch()).is_ok()
-    };
-    if !live {
-        warn!(%id, owner, "dropping an answer that no longer belongs to the live turn");
-        return;
-    }
+    // The claim already validated the binding: the ask named this session and
+    // the live turn. Every ask is consumed exactly once on claim, so a
+    // repeated answer for the same id finds nothing and is dropped; a settled
+    // terminal (blocking mode) or an addressed cancel (both modes) already
+    // retired every ask, so a late answer finds nothing either. Nothing
+    // rejected here ever reaches an agent, so a stale allow can never green a
+    // later turn's tool call.
     let main_answer_tx = runtime.handle.answer_tx.clone();
     let (answer, answer_tx) = match &ask {
         Ask::Permission {
@@ -1860,9 +2051,10 @@ fn start_event_pump(
 /// no call can outlive a blocking turn, so a blocking terminal turn cannot
 /// retain unresolved asks and a stale response arriving later finds an
 /// unknown id, never a live ask to revive. Detached sessions keep their asks:
-/// a call moved to the background can still be parked on one. Retirement on
-/// the addressed-cancel (02.9a) and handle-loss (02.10a) paths is downstream
-/// debt, not built here.
+/// a call moved to the background can still be parked on one. Ask retirement
+/// on the addressed-cancel path is 02.9a's (`settle_cancel`, both modes: the
+/// run is stopped, so nothing outlives a cancelled turn); retirement on the
+/// handle-loss path (02.10a) is downstream debt, not built here.
 fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let mut guard = pending.lock().unwrap();
     let live = match (&guard.prompt, guard.turn) {
@@ -3721,6 +3913,402 @@ mod tests {
                 .epoch
                 .current(),
             1
+        );
+    }
+
+    /// 02.9a addressed-cancellation fixture: one PID owns a working session A
+    /// and a working session B. Cancelling A settles its outstanding prompt
+    /// exactly once through the turn epoch and retires all its asks, while B
+    /// continues untouched. Late answers and terminal events from the
+    /// cancelled turn change neither the settled outcome nor B; replacement
+    /// prompts for A reject until 02.9b confirms cleanup, while B stays
+    /// responsive. No prompt here reaches a provider: prompts park via
+    /// `handle_prompt` against rewired live channels, and interleaving is
+    /// driven with synthetic agent events.
+    #[tokio::test]
+    async fn addressed_cancel_settles_once_retires_asks_and_leaves_the_peer_alone() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        // A's channels are observable: answers land here, the cancel signal
+        // is read off the live cancel channel, and the prompt send has a live
+        // receiver so parking never fails on a dropped pipe.
+        let (answer_a_tx, answer_a_rx) = flume::unbounded();
+        srv.sessions.get_mut(&key_a).unwrap().handle.answer_tx = answer_a_tx;
+        let (_input_a_rx, cancel_a_rx) = rewire_live(srv.sessions.get_mut(&key_a).unwrap());
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (answer_b_tx, answer_b_rx) = flume::unbounded();
+        runtime_b.handle.answer_tx = answer_b_tx;
+        // B's input stays live so a later prompt proves the peer responsive.
+        let (_input_b_rx, _cancel_b_rx) = rewire_live(&mut runtime_b);
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        assert_ne!(key_a, key_b, "two sessions hold distinct ids");
+
+        // Both sessions work a turn; A also waits on two asks (permission +
+        // elicitation), B on one.
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+        let sid_a = srv
+            .sessions
+            .get(&key_a)
+            .unwrap()
+            .handle
+            .session_id
+            .to_string();
+        let sid_b = srv
+            .sessions
+            .get(&key_b)
+            .unwrap()
+            .handle
+            .session_id
+            .to_string();
+        {
+            let mut guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            guard.asks.insert(
+                ANSWERED_ID,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: sid_a.clone(),
+                    epoch: 0,
+                },
+            );
+            guard.asks.insert(
+                SECOND_ASK_ID,
+                Ask::Elicitation {
+                    session: sid_a.clone(),
+                    epoch: 0,
+                },
+            );
+        }
+        {
+            let mut guard = srv.sessions.get(&key_b).unwrap().pending.lock().unwrap();
+            guard.asks.insert(
+                THIRD_ASK_ID,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: sid_b.clone(),
+                    epoch: 0,
+                },
+            );
+        }
+
+        // Stop A, addressed, no pin: settles A's turn and retires its asks.
+        let result = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key_a } }),
+        )
+        .unwrap();
+        assert_eq!(result["sessionId"], key_a);
+        assert_eq!(result["cancelled"], true);
+        assert_eq!(result["turnEpoch"], 1);
+        assert!(
+            cancel_a_rx.try_recv().is_ok(),
+            "the addressed cancel signals A's run, never the shared process"
+        );
+
+        let answer = out_rx.try_recv().expect("A's prompt settles once");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "cancelled");
+        assert_eq!(
+            answer["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "the answer settles the turn it ran under: {answer}"
+        );
+        assert_eq!(
+            answer["result"]["_meta"][extension::RAW_REASON_META_KEY],
+            "cancelled",
+            "the verbatim reason survives: {answer}"
+        );
+        assert_eq!(
+            answer["result"]["_meta"][extension::USABLE_META_KEY],
+            false,
+            "a cancelled turn banks no usable output: {answer}"
+        );
+        {
+            let guard = srv.sessions.get(&key_a).unwrap().pending.lock().unwrap();
+            assert!(guard.prompt.is_none(), "A settled its own prompt");
+            assert!(guard.turn.is_none());
+            assert!(guard.asks.is_empty(), "A retired every ask on cancel");
+            assert_eq!(guard.epoch.current(), 1, "A bumped its own epoch");
+            assert!(!guard.is_resumable(), "settlement alone never reopens A");
+        }
+        {
+            let guard = srv.sessions.get(&key_b).unwrap().pending.lock().unwrap();
+            assert_eq!(guard.prompt, Some(RequestId::Number(8)));
+            assert_eq!(guard.asks.len(), 1, "B's ask stays put");
+            assert_eq!(guard.epoch.current(), 0, "B never moves");
+            assert!(guard.is_resumable());
+        }
+
+        // A late answer for a retired ask drops without reaching any agent.
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(answer_a_rx.is_empty(), "a late answer cannot revive A");
+        assert!(answer_b_rx.is_empty(), "nothing lands on the peer");
+
+        // A late terminal from the cancelled turn settles nothing: the prompt
+        // is gone and the epoch stands, so it can never settle a later turn.
+        assert_eq!(
+            settle_prompt(&srv.sessions.get(&key_a).unwrap().pending),
+            None,
+            "the stale terminal settles nothing"
+        );
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no second answer for the settled turn"
+        );
+
+        // B runs a full turn afterwards: its text and prompt answer carry its
+        // own epoch, and A's settled state stands.
+        drive_runtime(&srv, &key_b, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: TEXT_B.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let settled: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(
+            settled.len(),
+            2,
+            "B's text and B's prompt answer: {settled:?}"
+        );
+        assert_eq!(settled[1]["id"], 8);
+        assert_eq!(settled[1]["result"]["stopReason"], "end_turn");
+        assert_eq!(
+            settled[1]["result"]["_meta"][extension::TURN_EPOCH_META_KEY],
+            0,
+            "B settles the turn it ran under"
+        );
+        assert_eq!(
+            srv.sessions
+                .get(&key_b)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1
+        );
+        assert!(
+            !srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_resumable(),
+            "B settling never reopens A"
+        );
+
+        // Replacement prompts for A reject while cleanup is unconfirmed; B
+        // stays responsive on its next turn. Positive retry proof belongs to
+        // 02.9b, after its confirmation gate lands.
+        let err = handle_prompt(
+            &mut srv,
+            &prompt_request(&key_a, "again"),
+            &RequestId::Number(9),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AcpError::invalid_params().code);
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!({"reason": "cleanup_unconfirmed", "sessionId": key_a}))
+        );
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key_b, "b-next"),
+            &RequestId::Number(10),
+        )
+        .expect("the peer stays responsive");
+    }
+
+    /// A stale turn pin changes nothing: no signal, no bump, no settlement,
+    /// and the parked prompt stays for the live turn. The matching pin
+    /// settles; an unknown session rejects without touching the live one.
+    #[tokio::test]
+    async fn a_stale_cancel_pin_changes_nothing() {
+        let (srv, .., out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        let key = session_key(&srv);
+
+        let stale = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key, "turnEpoch": 99 } }),
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, AcpError::invalid_params().code);
+        assert_eq!(
+            stale.data,
+            Some(serde_json::json!({"expectedEpoch": 0, "gotEpoch": 99}))
+        );
+        {
+            let guard = pending(&srv).lock().unwrap();
+            assert_eq!(guard.prompt, Some(RequestId::Number(PROMPT_ID)));
+            assert_eq!(guard.epoch.current(), 0, "a stale cancel moves no epoch");
+        }
+        assert!(out_rx.is_empty(), "a stale cancel settles nothing");
+
+        let unknown = handle_cancel(
+            &srv,
+            &serde_json::json!({
+                "params": { "sessionId": MakiId::generate().to_string() }
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.code, AcpError::resource_not_found(None).code);
+        assert_eq!(
+            pending(&srv).lock().unwrap().prompt,
+            Some(RequestId::Number(PROMPT_ID))
+        );
+
+        let result = handle_cancel(
+            &srv,
+            &serde_json::json!({ "params": { "sessionId": key, "turnEpoch": 0 } }),
+        )
+        .unwrap();
+        assert_eq!(result["cancelled"], true);
+        assert_eq!(result["turnEpoch"], 1);
+        let answer = out_rx
+            .try_recv()
+            .expect("the pinned cancel settles the prompt");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "cancelled");
+    }
+
+    /// Cancelling an idle session still bumps the epoch, so a terminal racing
+    /// the cancel lands stale — but with no turn to clean up the session
+    /// stays usable and the next prompt starts a new turn under the bumped
+    /// epoch. No run is signalled for work that never started.
+    #[tokio::test]
+    async fn an_idle_cancel_bumps_without_blocking_the_next_turn() {
+        let (mut srv, key, _input_rx, out_rx) = server_with_live_input();
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        srv.sessions.get_mut(&key).unwrap().handle.cancel_tx = cancel_tx;
+
+        let result =
+            handle_cancel(&srv, &serde_json::json!({ "params": { "sessionId": key } })).unwrap();
+        assert_eq!(result["cancelled"], false);
+        assert_eq!(result["turnEpoch"], 1);
+        assert!(out_rx.is_empty(), "an idle cancel answers no prompt");
+        assert!(cancel_rx.is_empty(), "nothing runs, so no run is signalled");
+        assert!(pending(&srv).lock().unwrap().is_resumable());
+
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "next"),
+            &RequestId::Number(8),
+        )
+        .expect("an idle-cancelled session stays usable");
+        assert_eq!(
+            pending(&srv).lock().unwrap().turn,
+            Some(1),
+            "the next prompt starts a new turn under the bumped epoch"
+        );
+    }
+
+    /// Answer and Stop serialize through the one per-session control lock:
+    /// claims are remove-then-validate under a single guard, and the cancel
+    /// settle takes the prompt, bumps, and retires under the same guard, so a
+    /// queued answer can never bypass an in-flight cancel settlement. Racing
+    /// threads prove the invariant structurally: every wire id is claimed at
+    /// most once, the prompt settles at most once, and a cross-session claim
+    /// never delivers. (02.10b routes Close through this same lock; only the
+    /// Answer/Stop half is built here.)
+    #[test]
+    fn concurrent_answers_never_bypass_in_flight_cancel_settlement() {
+        use std::sync::Barrier;
+
+        const ASKS: i64 = 32;
+        let pending = PendingState::default();
+        {
+            let mut guard = pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(PROMPT_ID));
+            for n in 0..ASKS {
+                guard.asks.insert(
+                    ANSWERED_ID + n,
+                    Ask::Permission {
+                        request_id: format!("toolu_{n}"),
+                        answer_tx: None,
+                        session: "s".to_owned(),
+                        epoch: 0,
+                    },
+                );
+            }
+            // Bound to another session: a live id with the wrong owner that
+            // must never claim for this session, however raced.
+            guard.asks.insert(
+                ANSWERED_ID + ASKS,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session: "other".to_owned(),
+                    epoch: 0,
+                },
+            );
+        }
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let control = Arc::clone(&pending);
+            let gate = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                let mut won = Vec::new();
+                for n in 0..=ASKS {
+                    if control
+                        .lock()
+                        .unwrap()
+                        .claim_ask(ANSWERED_ID + n, "s")
+                        .is_some()
+                    {
+                        won.push(n);
+                    }
+                }
+                won
+            }));
+        }
+        barrier.wait();
+        // The Stop lands while answers race it: one guard, one settlement.
+        let settlement = pending.lock().unwrap().settle_cancel();
+
+        let mut won: Vec<i64> = Vec::new();
+        for handle in handles {
+            won.extend(handle.join().expect("no control-lock deadlock"));
+        }
+        won.sort_unstable();
+        let mut dedup = won.clone();
+        dedup.dedup();
+        assert_eq!(
+            won, dedup,
+            "every wire id claims at most once, however raced"
+        );
+        assert!(
+            !won.contains(&ASKS),
+            "a cross-session ask never claims for this session"
+        );
+        assert!(settlement.cancelled);
+        assert_eq!(settlement.epoch, 1, "one Stop bumps exactly once");
+        assert_eq!(settlement.prompt, Some(RequestId::Number(PROMPT_ID)));
+        assert!(pending.lock().unwrap().asks.is_empty());
+        assert_eq!(
+            settle_prompt(&pending),
+            None,
+            "the settled prompt never answers twice"
         );
     }
 

@@ -10,9 +10,10 @@
 //!   `tests/prompt_routing.rs` and the `server.rs` routing tests);
 //! - `_maki/session/allocate` and `_maki/session/activate` runtime behavior
 //!   is 02.3 (see `tests/allocation_activation.rs` and the `server.rs`
-//!   lease tests); addressed cancel scoping is 02.9a, bounded release is
-//!   02.10b: those two probes must still answer -32601 (see
-//!   `extension_runtime_seams_still_reject_clearly`).
+//!   lease tests); addressed cancel scoping is 02.9a (wire shape proven
+//!   below, settlement/retirement at unit level in `server.rs`), bounded
+//!   release is 02.10b: the release probe must still answer -32601 (see
+//!   `extension_runtime_release_seam_still_rejects_clearly`).
 //!
 //! 02.2b changed the per-session observable used here: setup is fixed per
 //! session, so a mode change routes to its session and rejects with
@@ -22,7 +23,6 @@
 
 mod support;
 
-use maki_acp::extension;
 use support::SharedSessions;
 
 /// Both runtimes coexist under the same Maki PID: opening the second session
@@ -85,30 +85,52 @@ async fn two_sessions_coexist_under_one_pid_with_independent_pumps() {
     shared.shutdown().await.unwrap();
 }
 
-/// Addressed cancel and active-session release stay specified but not
-/// implemented: the cancel probe answers -32601 like an unknown method, on a
-/// multi-session server too. A bare release probe fails param parsing first
-/// (see `extension_contract.rs`); the release seam itself — active sessions
-/// staying -32601 — is proven in `allocation_activation.rs`. Allocate and
-/// activate moved out of this list in 02.3.
+/// 02.9a addressed cancel answers over the wire on a live multi-session
+/// server: an idle cancel reports `cancelled: false` with the bumped epoch
+/// and keeps the session usable, a stale pin rejects with the expected/got
+/// epochs and changes nothing, and an unknown session rejects without
+/// touching either runtime. Active-session release stays the 02.10b seam
+/// (-32601); allocate/activate moved out of the seam list in 02.3.
 #[tokio::test]
-async fn extension_runtime_seams_still_reject_clearly() {
+async fn addressed_cancel_answers_while_active_release_stays_a_seam() {
     let mut shared = SharedSessions::establish().await.unwrap();
-    let reply = shared
-        .child
-        .probe_unsupported(extension::CANCEL_METHOD)
-        .await
-        .unwrap();
+
+    let idle = shared.child.cancel_raw(&shared.a, None).await.unwrap();
+    assert_eq!(idle["result"]["sessionId"], shared.a, "{idle}");
+    assert_eq!(idle["result"]["cancelled"], false, "{idle}");
+    assert_eq!(idle["result"]["turnEpoch"], 1, "{idle}");
+
+    // The idle cancel keeps the session usable: it still routes its next
+    // operation, and the peer is unaffected.
+    let again = shared.child.set_mode_raw(&shared.a, "plan").await.unwrap();
     assert_eq!(
-        reply["error"]["code"],
-        -32601,
-        "{} must reject as unknown, got: {reply}",
-        extension::CANCEL_METHOD
+        again["error"]["data"]["reason"], "fixed_at_activation",
+        "{again}"
     );
-    assert!(
-        reply.get("result").is_none(),
-        "{} must not answer success: {reply}",
-        extension::CANCEL_METHOD
-    );
+
+    // A stale pin rejects and moves nothing: the next unpinned cancel bumps
+    // from the epoch the idle cancel left, not from the stale value.
+    let stale = shared.child.cancel_raw(&shared.a, Some(0)).await.unwrap();
+    assert_eq!(stale["error"]["code"], -32602, "{stale}");
+    assert_eq!(stale["error"]["data"]["expectedEpoch"], 1, "{stale}");
+    assert_eq!(stale["error"]["data"]["gotEpoch"], 0, "{stale}");
+    let second = shared.child.cancel_raw(&shared.a, None).await.unwrap();
+    assert_eq!(second["result"]["turnEpoch"], 2, "{second}");
+
+    let unknown = format!("{}-missing", shared.a);
+    let missing = shared.child.cancel_raw(&unknown, None).await.unwrap();
+    assert_eq!(missing["error"]["code"], -32002, "{missing}");
+    assert_eq!(missing["error"]["data"]["sessionId"], unknown);
+
+    // Both sessions still route afterwards: neither the cancels nor the
+    // unknown id disturbed a peer.
+    for session in [&shared.a, &shared.b] {
+        let reply = shared.child.set_mode_raw(session, "plan").await.unwrap();
+        assert_eq!(
+            reply["error"]["data"]["reason"], "fixed_at_activation",
+            "{session} still routes: {reply}"
+        );
+    }
+
     shared.shutdown().await.unwrap();
 }

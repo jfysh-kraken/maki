@@ -22,8 +22,8 @@ pub fn initialize_response() -> InitializeResponse {
         .mcp_capabilities(McpCapabilities::new().http(true))
         .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()));
     // Fork extension: 02.3 advertises allocate+activate (see
-    // `extension::capability_meta`); 02.9a/02.10b extend the method list.
-    // Stock clients ignore `_meta`, so this stays standard-compatible.
+    // `extension::capability_meta`); 02.9a adds cancel, release joins in
+    // 02.10b. Stock clients ignore `_meta`, so this stays standard-compatible.
     capabilities.meta = Some(extension::capability_meta());
     InitializeResponse::new(ProtocolVersion::V1)
         .agent_capabilities(capabilities)

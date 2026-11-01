@@ -42,13 +42,13 @@ async fn initialize_correlates_both_id_shapes(id: serde_json::Value) {
     child.shutdown().await.unwrap();
 }
 
-/// 02.3 implements allocate/activate, so the capability is advertised with
-/// exactly those methods. Addressed cancel (02.9a), release (02.10b), owned
-/// deletion (05.2), and model discovery (04.1) stay specified but not
-/// implemented: every probe answers -32601 instead of hanging or answering
-/// success.
+/// 02.3 implements allocate/activate and 02.9a implements addressed cancel,
+/// so the capability is advertised with exactly those methods. Release
+/// (02.10b), owned deletion (05.2), and model discovery (04.1) stay specified
+/// but not implemented: every probe answers -32601 instead of hanging or
+/// answering success.
 #[tokio::test]
-async fn extension_capability_advertises_allocate_and_activate_only() {
+async fn extension_capability_advertises_allocate_activate_and_cancel_only() {
     let mut child = MakiChild::spawn().await.unwrap();
     let initialize = child.initialize().await.unwrap();
     let advertised = &initialize["result"]["agentCapabilities"]["_meta"]["maki.multiSession"];
@@ -61,11 +61,14 @@ async fn extension_capability_advertises_allocate_and_activate_only() {
         .collect();
     assert_eq!(
         methods,
-        [extension::ALLOCATE_METHOD, extension::ACTIVATE_METHOD],
+        [
+            extension::ALLOCATE_METHOD,
+            extension::ACTIVATE_METHOD,
+            extension::CANCEL_METHOD
+        ],
         "capability lists only what the server answers: {methods:?}"
     );
     for method in [
-        extension::CANCEL_METHOD,
         extension::OWNED_DELETION_METHOD,
         &format!("{}list_models", extension::MODEL_DISCOVERY_PREFIX),
     ] {

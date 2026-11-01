@@ -14,9 +14,10 @@
 //! - post-activation model/mode changes route, then reject with
 //!   `fixed_at_activation`, leaving the fixed setup and the peer alone;
 //! - an idle session stays usable after a cancel dispatch and a rejection;
-//! - the extension runtime seams stay -32601 (addressed cancel is 02.9a,
-//!   release is 02.10b; allocate/activate moved out of this list in 02.3,
-//!   see also `extension_runtime_seams_still_reject_clearly`).
+//! - addressed cancel answers over the wire (02.9a: idle shape, stale pin,
+//!   unknown session), while active-session release stays the -32601 seam
+//!   (02.10b; allocate/activate moved out of the seam list in 02.3, see
+//!   also `addressed_cancel_answers_while_active_release_stays_a_seam`).
 //!
 //! Every wait is a read-until-match with the frame bound, never a sleep:
 //! correlation itself is the interleaving proof, since peer traffic buffers
@@ -24,7 +25,6 @@
 
 mod support;
 
-use maki_acp::extension;
 use serde_json::json;
 use support::SharedSessions;
 
@@ -184,18 +184,27 @@ async fn post_activation_changes_route_then_reject() {
         assert_fixed(&mode, session);
     }
 
-    // The runtime seams stay specified-but-unimplemented: addressed cancel
-    // is 02.9a and active-session release is 02.10b, and routing must not
-    // have started answering them. Allocate/activate implement in 02.3 (a
-    // bare probe of release fails param parsing first; see
-    // `extension_contract.rs` and `allocation_activation.rs`).
-    let cancel = shared
-        .child
-        .probe_unsupported(extension::CANCEL_METHOD)
-        .await
-        .unwrap();
-    assert_eq!(cancel["error"]["code"], -32601, "{cancel}");
-    assert!(cancel.get("result").is_none());
+    // 02.9a: addressed cancel answers on the wire. The idle session reports
+    // `cancelled: false` with the bumped epoch and stays usable; a stale pin
+    // rejects with expected/got epochs; an unknown session rejects without
+    // touching either runtime. Active-session release stays the 02.10b seam
+    // (-32601); allocate/activate implement in 02.3 (a bare probe of release
+    // fails param parsing first; see `extension_contract.rs` and
+    // `allocation_activation.rs`).
+    let idle = shared.child.cancel_raw(&shared.a, None).await.unwrap();
+    assert_eq!(idle["result"]["sessionId"], shared.a, "{idle}");
+    assert_eq!(idle["result"]["cancelled"], false, "{idle}");
+    assert_eq!(idle["result"]["turnEpoch"], 1, "{idle}");
+
+    let stale = shared.child.cancel_raw(&shared.a, Some(7)).await.unwrap();
+    assert_eq!(stale["error"]["code"], -32602, "{stale}");
+    assert_eq!(stale["error"]["data"]["expectedEpoch"], 1, "{stale}");
+    assert_eq!(stale["error"]["data"]["gotEpoch"], 7, "{stale}");
+
+    let unknown = format!("{}-missing", shared.b);
+    let missing = shared.child.cancel_raw(&unknown, None).await.unwrap();
+    assert_eq!(missing["error"]["code"], -32002, "{missing}");
+    assert_eq!(missing["error"]["data"]["sessionId"], unknown);
 
     shared.shutdown().await.unwrap();
 }
