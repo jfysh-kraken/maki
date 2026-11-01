@@ -5,7 +5,12 @@ server answered every `_maki/` method with `-32601 Method not found`; slice
 02.2b wired prompt/event routing against this contract, slice 02.3 wired
 `_maki/session/allocate` and `_maki/session/activate` (runtime in
 `maki-acp/src/server.rs`, lease/model/failure/responsiveness fixtures in
-`server.rs` tests and `tests/allocation_activation.rs`). Addressed cancel
+ `server.rs` tests and `tests/allocation_activation.rs`), slice 02.7 wired
+ terminal reasons, and slice 02.8 wired concurrent permission routing
+ (several outstanding asks under globally unique ids, task delivery,
+ blocking-mode terminal retirement). Ask retirement on the
+ addressed-cancel (02.9a) and handle-loss (02.10a) paths is downstream debt,
+ not built here. Addressed cancel
 (02.9a) and release (02.10b) still answer `-32601`, as do the reserved 04.1
 and 05.2 names. This document stays normative; the one deliberate delta is
 the advertised method list: the capability only names the methods the binary
@@ -189,9 +194,14 @@ standard `PromptResponse.stopReason` keeps its standard values; `rawReason`
 
 ## Settlement: exactly-once prompts and the turn epoch
 
-One outstanding prompt per session. Settlement is exactly-once: the first
-terminal frame for the current epoch settles the prompt; every later frame
-for that epoch is dropped, never answered twice.
+ One outstanding prompt per session, several outstanding permission asks.
+ Settlement is exactly-once: the first terminal frame for the current epoch
+ settles the prompt; every later frame for that epoch is dropped, never
+ answered twice. A settling terminal also retires every outstanding ask in
+ blocking mode (see 02.8): the ask ids become unknown, so a late answer is
+ rejected rather than revived. Detached sessions retain their asks across
+ settlement; retirement on addressed cancel (02.9a) and handle loss (02.10a)
+ is downstream debt.
 
 `TurnEpoch` (`src/extension.rs`) is the single implementation all slices
 share:
@@ -247,8 +257,8 @@ itself only matches ids and epochs.
 
 02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
 ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
-02.7 terminal reasons, 02.8 permission routing, 02.9a–b cancel/cleanup,
-02.10a–b supervision/release bounds, 02.11 engine acceptance. None of the
-above is implemented here; the harness in `tests/` speaks standard ACP plus
-`-32601` probes so the same fixtures run against the extension once it
-lands.
+ 02.7 terminal reasons, 02.8 permission routing, 02.9a–b cancel/cleanup,
+ 02.10a–b supervision/release bounds, 02.11 engine acceptance. Of the above,
+ slices through 02.8 are implemented (02.9a+ still answer `-32601`); the
+ harness in `tests/` speaks standard ACP plus `-32601` probes so the same
+ fixtures run against the extension as each slice lands.

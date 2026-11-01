@@ -66,7 +66,13 @@ static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUE
 /// epoch lives here, under the same guard as the prompt it settles, so
 /// terminal settlement is check-and-bump in one lock: the single settlement
 /// contract (`EXTENSION.md`), with no second epoch mechanism anywhere.
-#[derive(Default)]
+///
+/// Asks are keyed by the globally unique outgoing request id
+/// (`NEXT_OUTGOING_REQUEST_ID`), never by session or turn slot, so replies
+/// route to the ask they answer even when several are outstanding or another
+/// session settled since. Each ask is bound to the session and turn that
+/// issued it; unknown, repeated, late, stale-turn and cross-session answers
+/// are dropped at routing, never applied.
 struct Pending {
     prompt: Option<RequestId>,
     /// Epoch the outstanding prompt runs under. `None` while idle; a terminal
@@ -74,13 +80,34 @@ struct Pending {
     turn: Option<u64>,
     epoch: TurnEpoch,
     asks: HashMap<i64, Ask>,
+    /// Whether a settling terminal retires every outstanding ask. Blocking
+    /// sessions (`--background-timeout 0`, the harness all fixtures run)
+    /// retire: no call can outlive the turn, so a terminal turn cannot retain
+    /// unresolved asks and a stale response can never revive one. Detached
+    /// sessions retain: a moved call or a still-running child can be parked on
+    /// an ask across the turn boundary.
+    blocking: bool,
+}
+
+impl Default for Pending {
+    /// Fixtures mirror the harness's blocking mode: no detached tools, so a
+    /// settling terminal retires every outstanding ask.
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            turn: None,
+            epoch: TurnEpoch::default(),
+            asks: HashMap::new(),
+            blocking: true,
+        }
+    }
 }
 
 /// How to read the answer and who gets it. A subagent's permission carries the
 /// channel its own agent waits on, everything else answers the main agent.
 /// Every ask is bound to the session and turn that issued it: stale answers
-/// are dropped, never applied, and the full concurrent-ask routing proof on
-/// top of this binding is 02.8.
+/// are dropped, never applied. Concurrent-ask routing on top of this binding
+/// (several outstanding, task delivery, terminal retirement) is 02.8.
 enum Ask {
     /// `request_id` is the agent-side id of the ask the tool is parked on, not
     /// the JSON-RPC id and not the client-facing tool call: the answer is
@@ -1071,6 +1098,13 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
     // stream and only writes frames addressed to this runtime's id, so pumps
     // never serialize against each other. Slow setup already happened in the
     // caller; the loop only files the finished runtime here.
+    // The run's blocking mode decides ask lifetime at settlement: a blocking
+    // turn cannot outlive its calls, so its terminal retires every ask, while
+    // a detached turn may still have moved calls parked on theirs.
+    let pending = Arc::new(Mutex::new(Pending {
+        blocking: !ctx.background,
+        ..Pending::default()
+    }));
     let pump = start_event_pump(
         events,
         session_ref.clone(),
@@ -1498,11 +1532,13 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
             let Ok(note) = parse_params::<CancelNotification>(raw) else {
                 return;
             };
-            // Asks stay: a call moved to the background outlives the turn
-            // and may be parked on one, and a stale answer is tagged, so
-            // whoever waits next drops it. An unactivated allocation or an
-            // unknown id names no run to signal, so the notification is
-            // dropped the same way.
+            // Asks stay: a moved call outlives the turn and may be parked on
+            // one, and a stale answer is tagged, so whoever waits next drops
+            // it. Retiring asks on this cancel path is 02.9a's, not built
+            // here: only agent-settled terminals (Done/Error through
+            // `settle_prompt`) retire asks, and only in blocking mode. An
+            // unactivated allocation or an unknown id names no run to signal,
+            // so the notification is dropped the same way.
             if let Ok(session) = srv.session(&note.session_id) {
                 let _ = session.handle.cancel_tx.try_send(());
             }
@@ -1538,7 +1574,9 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
     // is dropped, never applied, so a stale allow can never green a later
     // turn's tool call; a binding naming another session is dropped the same
     // way (global ids make that structural, the check makes it explicit).
-    // Full concurrent-ask routing on top of this binding is 02.8.
+    // Every ask is consumed exactly once on lookup, so a repeated answer for
+    // the same id finds nothing and is dropped; a terminal in blocking mode
+    // already retired every ask, so a late answer finds nothing either.
     let live = {
         let guard = runtime.pending.lock().unwrap();
         ask.session() == owner && guard.epoch.check(ask.epoch()).is_ok()
@@ -1816,8 +1854,15 @@ fn start_event_pump(
 /// first terminal for the live turn takes the prompt and bumps the epoch, and
 /// answers with the epoch the turn settled under. A terminal with no prompt
 /// outstanding, or one whose turn is no longer live, settles nothing and is
-/// dropped, so it can never settle the next turn instead. Asks stay until
-/// answered: a call moved to the background can still be parked on one.
+/// dropped, so it can never settle the next turn instead.
+///
+/// A settling terminal also retires every outstanding ask in blocking mode:
+/// no call can outlive a blocking turn, so a blocking terminal turn cannot
+/// retain unresolved asks and a stale response arriving later finds an
+/// unknown id, never a live ask to revive. Detached sessions keep their asks:
+/// a call moved to the background can still be parked on one. Retirement on
+/// the addressed-cancel (02.9a) and handle-loss (02.10a) paths is downstream
+/// debt, not built here.
 fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let mut guard = pending.lock().unwrap();
     let live = match (&guard.prompt, guard.turn) {
@@ -1830,6 +1875,9 @@ fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let turn = guard.epoch.current();
     guard.epoch.bump();
     guard.turn = None;
+    if guard.blocking {
+        guard.asks.clear();
+    }
     guard.prompt.take().map(|id| (id, turn))
 }
 
@@ -3275,6 +3323,498 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&forwarded).unwrap(),
             raw["result"]
+        );
+    }
+
+    /// 02.8 concurrent permission requests and answer routing. Asks keep
+    /// their request/session/turn identities under globally unique ids, so
+    /// answers route to the task that asked, never the currently active slot;
+    /// unknown, repeated, late, stale-turn and cross-session answers reject;
+    /// and a blocking terminal retires every outstanding ask. No prompt here
+    /// reaches a provider: interleaving is driven with synthetic agent events
+    /// plus the real pump, and no keys or network are involved.
+    const SECOND_ASK_ID: i64 = 1010;
+    const THIRD_ASK_ID: i64 = 1011;
+
+    fn done_with(reason: DoneReason) -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: CONTEXT_WINDOW,
+            num_turns: 1,
+            reason,
+            raw_stop_reason: None,
+        }
+    }
+
+    /// Every agent-settled terminal (the 02.7 sources) settles the prompt and
+    /// retires every outstanding ask in blocking mode: permission and
+    /// elicitation alike. A late answer afterwards finds an unknown id, never
+    /// a live ask to revive.
+    #[test_case(DoneReason::EndTurn ; "end_turn")]
+    #[test_case(DoneReason::MaxTokens ; "max_tokens")]
+    #[test_case(DoneReason::MaxTurns ; "max_turns")]
+    #[test_case(DoneReason::Cancelled ; "agent_decided_cancel")]
+    #[test_case(DoneReason::Refusal ; "refusal")]
+    #[test_case(DoneReason::Dropped ; "dropped")]
+    #[test_case(DoneReason::Compact ; "compact")]
+    #[tokio::test]
+    async fn terminal_settlement_retires_pending_asks(reason: DoneReason) {
+        let (srv, answer_rx, out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let main_ask = permission_ask(&srv, None);
+        let form_ask = elicitation_ask(&srv);
+        {
+            let mut guard = pending(&srv).lock().unwrap();
+            guard.asks.insert(ANSWERED_ID, main_ask);
+            guard.asks.insert(SECOND_ASK_ID, form_ask);
+        }
+        run_pump(&srv, None, |sender| {
+            sender.send(done_with(reason)).unwrap();
+        })
+        .await;
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(live_epoch(&srv), 1, "settling bumps exactly once");
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "no ask survives a blocking terminal: {reason:?}"
+        );
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a late answer cannot revive a retired ask"
+        );
+    }
+
+    /// A failed turn settles through the same path, so its asks retire the
+    /// same way.
+    #[tokio::test]
+    async fn error_settlement_retires_pending_asks() {
+        let (srv, answer_rx, out_rx) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let ask = permission_ask(&srv, None);
+        pending(&srv).lock().unwrap().asks.insert(ANSWERED_ID, ask);
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::Error {
+                    message: TURN_ERROR.to_owned(),
+                    auth: false,
+                    totals: RunTotals::default(),
+                })
+                .unwrap();
+        })
+        .await;
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["error"]["data"], TURN_ERROR);
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "no ask survives a failed turn"
+        );
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a late answer cannot revive a retired ask"
+        );
+    }
+
+    /// A repeated answer finds its ask consumed; after the terminal retires
+    /// the rest and the next turn starts, late answers still reject while the
+    /// next turn's own ask answers normally.
+    #[tokio::test]
+    async fn repeated_and_late_answers_reject_across_turns() {
+        let (srv, answer_rx, ..) = test_server();
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let first = permission_ask(&srv, None);
+        let second = permission_ask(&srv, None);
+        {
+            let mut guard = pending(&srv).lock().unwrap();
+            guard.asks.insert(ANSWERED_ID, first);
+            guard.asks.insert(SECOND_ASK_ID, second);
+        }
+
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode())
+        );
+        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a replayed answer cannot land on the next request"
+        );
+
+        assert!(
+            matches!(
+                settle_prompt(pending(&srv)),
+                Some((RequestId::Number(PROMPT_ID), 0))
+            ),
+            "the terminal settles the turn it ran under"
+        );
+        assert_eq!(live_epoch(&srv), 1);
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "settlement retires the still-outstanding ask"
+        );
+        handle_incoming_response(&srv, &allow_once(SECOND_ASK_ID));
+        assert!(
+            answer_rx.is_empty(),
+            "a late answer for a retired ask is dropped"
+        );
+
+        park_prompt(&srv, RequestId::Number(8));
+        // Built before the insert takes the guard (see above).
+        let next = permission_ask(&srv, None);
+        pending(&srv)
+            .lock()
+            .unwrap()
+            .asks
+            .insert(THIRD_ASK_ID, next);
+        handle_incoming_response(&srv, &allow_once(THIRD_ASK_ID));
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode()),
+            "retirement never poisons the next turn"
+        );
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "every ask is consumed exactly once"
+        );
+    }
+
+    /// Several outstanding asks keep their request/session/turn identities,
+    /// and answers arriving newest-first each reach their own task with their
+    /// own decision: nothing lands on the currently active slot instead.
+    #[tokio::test]
+    async fn out_of_order_answers_reach_their_own_tasks() {
+        let (srv, main_rx, ..) = test_server();
+        let (child0_tx, child0_rx) = flume::unbounded();
+        let (child1_tx, child1_rx) = flume::unbounded();
+        let session = session_key(&srv);
+        let epoch = live_epoch(&srv);
+        {
+            let mut guard = pending(&srv).lock().unwrap();
+            guard.asks.insert(
+                SECOND_ASK_ID,
+                Ask::Permission {
+                    request_id: CHILD_TOOL_USE_IDS[0].to_owned(),
+                    answer_tx: Some(child0_tx),
+                    session: session.clone(),
+                    epoch,
+                },
+            );
+            guard.asks.insert(
+                THIRD_ASK_ID,
+                Ask::Permission {
+                    request_id: CHILD_TOOL_USE_IDS[1].to_owned(),
+                    answer_tx: Some(child1_tx),
+                    session: session.clone(),
+                    epoch,
+                },
+            );
+            guard.asks.insert(
+                ANSWERED_ID,
+                Ask::Permission {
+                    request_id: PARENT_TOOL_USE_ID.to_owned(),
+                    answer_tx: None,
+                    session,
+                    epoch,
+                },
+            );
+        }
+
+        for (id, option) in [
+            (ANSWERED_ID, "allow_once"),
+            (THIRD_ASK_ID, "allow_always"),
+            (SECOND_ASK_ID, "reject_once"),
+        ] {
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({
+                    "id": id,
+                    "result": {"outcome": {"outcome": "selected", "optionId": option}},
+                }),
+            );
+        }
+
+        assert_eq!(
+            main_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode())
+        );
+        assert!(main_rx.is_empty(), "each answer is delivered only once");
+        assert_eq!(
+            child1_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(CHILD_TOOL_USE_IDS[1], PermissionAnswer::AllowSession).encode())
+        );
+        assert!(child1_rx.is_empty(), "each answer is delivered only once");
+        assert_eq!(
+            child0_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(CHILD_TOOL_USE_IDS[0], PermissionAnswer::Deny).encode())
+        );
+        assert!(child0_rx.is_empty(), "each answer is delivered only once");
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "every ask is consumed exactly once"
+        );
+    }
+
+    /// Detached sessions keep their asks across settlement: a moved call or a
+    /// still-running child can be parked on one past the turn boundary.
+    #[tokio::test]
+    async fn detached_sessions_keep_asks_across_settlement() {
+        let (srv, ..) = test_server();
+        pending(&srv).lock().unwrap().blocking = false;
+        park_prompt(&srv, RequestId::Number(PROMPT_ID));
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let ask = permission_ask(&srv, None);
+        pending(&srv).lock().unwrap().asks.insert(ANSWERED_ID, ask);
+
+        assert!(
+            matches!(
+                settle_prompt(pending(&srv)),
+                Some((RequestId::Number(PROMPT_ID), 0))
+            ),
+            "the terminal still settles the prompt"
+        );
+        assert_eq!(live_epoch(&srv), 1);
+        assert_eq!(
+            pending(&srv).lock().unwrap().asks.len(),
+            1,
+            "detached keeps asks for calls that outlive the turn"
+        );
+    }
+
+    /// 02.8 synchronised fixture: one PID owns a blocked session A and an
+    /// advancing session B. Each session's tool asks through its own pump, so
+    /// the frames name their session and carry globally unique ids from one
+    /// process-wide counter. B runs a full turn and settles without touching
+    /// A's parked prompt, ask, or epoch; then A's answer still routes to A,
+    /// and B's retired ask rejects.
+    #[tokio::test]
+    async fn blocked_session_stays_put_while_its_peer_advances() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (answer_a_tx, answer_a_rx) = flume::unbounded();
+        srv.sessions.get_mut(&key_a).unwrap().handle.answer_tx = answer_a_tx;
+        let (key_b, mut runtime_b) = fixture_runtime();
+        let (answer_b_tx, answer_b_rx) = flume::unbounded();
+        runtime_b.handle.answer_tx = answer_b_tx;
+        srv.sessions.insert(key_b.clone(), runtime_b);
+        assert_ne!(key_a, key_b, "two sessions hold distinct ids");
+
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        })
+        .await;
+        drive_runtime(&srv, &key_b, |sender| {
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        })
+        .await;
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "each pump asks through its own session");
+        let id_a = frames[0]["id"].clone();
+        let id_b = frames[1]["id"].clone();
+        assert_ne!(id_a, id_b, "ask ids are globally unique");
+        for (frame, key) in frames.iter().zip([&key_a, &key_b]) {
+            assert_eq!(frame["method"], "session/request_permission");
+            let sid = srv.sessions.get(key).unwrap().handle.session_id.to_string();
+            assert_eq!(frame["params"]["sessionId"], sid);
+        }
+
+        for (key, id) in [(&key_a, PROMPT_ID), (&key_b, 8)] {
+            let mut guard = srv.sessions.get(key).unwrap().pending.lock().unwrap();
+            guard.turn = Some(guard.epoch.current());
+            guard.prompt = Some(RequestId::Number(id));
+        }
+
+        drive_runtime(&srv, &key_b, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: TEXT_B.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let settled: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(
+            settled.len(),
+            2,
+            "B's text and B's prompt answer: {settled:?}"
+        );
+        assert_eq!(settled[1]["id"], 8);
+        assert_eq!(settled[1]["result"]["stopReason"], "end_turn");
+        {
+            let runtime_b = srv.sessions.get(&key_b).unwrap();
+            let guard = runtime_b.pending.lock().unwrap();
+            assert!(guard.prompt.is_none(), "B settled its own prompt");
+            assert!(guard.asks.is_empty(), "B retired its ask on settlement");
+            assert_eq!(guard.epoch.current(), 1, "B bumped its own epoch");
+        }
+        {
+            let runtime_a = srv.sessions.get(&key_a).unwrap();
+            let guard = runtime_a.pending.lock().unwrap();
+            assert_eq!(
+                guard.prompt,
+                Some(RequestId::Number(PROMPT_ID)),
+                "A's prompt stays parked while B settles"
+            );
+            assert_eq!(guard.asks.len(), 1, "A's blocked ask stays put");
+            assert_eq!(guard.epoch.current(), 0, "B never moves A's epoch");
+        }
+
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": id_a,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            }),
+        );
+        assert_eq!(
+            answer_a_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode()),
+            "A's answer still routes to A after B settled"
+        );
+        assert!(answer_b_rx.is_empty(), "nothing lands on the peer");
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": id_b,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+            }),
+        );
+        assert!(
+            answer_b_rx.is_empty(),
+            "B's retired ask rejects after B settled"
+        );
+
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx
+            .try_iter()
+            .find(|frame| frame.get("id").is_some() && frame["id"] == PROMPT_ID)
+            .expect("A still settles afterwards");
+        assert_eq!(answer["result"]["stopReason"], "end_turn");
+        assert_eq!(
+            srv.sessions
+                .get(&key_a)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+            1
+        );
+    }
+
+    /// Answer handling never waits on another session's slow startup: while
+    /// A's activation is parked on the gate, the peer's answer routes through
+    /// the same line path the loop uses. Release-time responsiveness is
+    /// 02.10b's, not built here.
+    #[tokio::test]
+    async fn peer_answer_routes_while_activation_is_held() {
+        let harness = StarterHarness::default();
+        harness.hold.store(true, Ordering::SeqCst);
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let params = acp_params(storage);
+        let session = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let output = project
+            .path()
+            .join("plan.md")
+            .to_string_lossy()
+            .into_owned();
+        let cwd = project.path().to_string_lossy().into_owned();
+        handle_request(
+            &mut srv,
+            extension::ACTIVATE_METHOD,
+            RequestId::Number(2),
+            &activate_request(&session, "openai/gpt-5", "build", &cwd, &output),
+            &params,
+        )
+        .await;
+        assert!(
+            srv.activating.contains_key(&session),
+            "startup is still held"
+        );
+
+        let (peer_key, mut peer) = fixture_runtime();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        peer.handle.answer_tx = answer_tx;
+        srv.sessions.insert(peer_key.clone(), peer);
+        // Built before the insert takes the guard: the mutex is not
+        // reentrant, so reading the epoch under a held guard would park here.
+        let ask = Ask::Permission {
+            request_id: PARENT_TOOL_USE_ID.to_owned(),
+            answer_tx: None,
+            session: peer_key.clone(),
+            epoch: srv
+                .sessions
+                .get(&peer_key)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .epoch
+                .current(),
+        };
+        srv.sessions
+            .get(&peer_key)
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .asks
+            .insert(ANSWERED_ID, ask);
+
+        let line = serde_json::to_string(&allow_once(ANSWERED_ID)).unwrap();
+        timeout(
+            STDIN_DEADLOCK_TIMEOUT,
+            handle_line(&mut srv, &line, &params),
+        )
+        .await
+        .expect("answer handling never waits on startup");
+        assert_eq!(
+            answer_rx.try_recv().ok(),
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode())
+        );
+        assert!(
+            srv.activating.contains_key(&session),
+            "startup is still held afterwards"
+        );
+
+        harness.gate.notify_one();
+        let (key, id, outcome) = next_completion(&completion_rx).await;
+        settle_activation(&mut srv, key.clone(), id, outcome);
+        assert!(
+            srv.sessions.contains_key(&key),
+            "the held activation still settles normally"
         );
     }
 
