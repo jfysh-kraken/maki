@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema::v1::{
-    AgentNotification, AgentRequest, AgentResponse, ConfigOptionUpdate, ContentBlock,
-    CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    AgentNotification, AgentRequest, AgentResponse, CancelNotification, ConfigOptionUpdate,
+    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
     InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
     Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
@@ -42,7 +42,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
-use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
+use crate::extension::TurnEpoch;
+use crate::{AcpParams, SessionEndHook, elicitation, extension, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// Turns already recorded were priced when they ran. `always_fast` is a live
@@ -81,7 +82,12 @@ enum Ask {
 
 type PendingState = Arc<Mutex<Pending>>;
 
-struct SessionState {
+/// One independently owned session runtime. Each entry in the registry owns its
+/// agent task, its event pump task, and its conversation context (run handle,
+/// storage claim, pending asks, turn epoch). Nothing here is shared between
+/// sessions except the outgoing wire sender, so no global serialization and no
+/// per-session process fallback exist.
+struct SessionRuntime {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
@@ -90,6 +96,13 @@ struct SessionState {
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
+    /// The single settlement contract (`EXTENSION.md`, 02.1). 02.2a owns one
+    /// epoch per runtime; 02.2b wires bump/check into terminals, cancels and
+    /// answers. No second epoch mechanism may appear.
+    epoch: TurnEpoch,
+    /// The runtime owns its pump task; closing the session aborts and reaps it
+    /// (bounded teardown of the release path itself is 02.10b).
+    pump: JoinHandle<()>,
 }
 
 struct Server {
@@ -98,8 +111,35 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     defaults: SessionDefaults,
-    session: Option<SessionState>,
+    /// ID-addressed runtime ownership. No current-session slot remains: every
+    /// handler resolves its session from the request's session id, and a miss
+    /// answers `resource_not_found` without touching peer runtimes. Prompt and
+    /// event routing proof on top of this table is 02.2b.
+    sessions: HashMap<String, SessionRuntime>,
     on_session_end: Option<SessionEndHook>,
+}
+
+impl Server {
+    /// Look up the runtime a request addresses. A miss rejects without
+    /// disturbing peers; there is no current-session fallback (02.2a).
+    /// Strict cross-session answer/event identity on top is 02.2b.
+    fn session(&self, id: &SessionId) -> Result<&SessionRuntime, AcpError> {
+        self.sessions
+            .get(&*id.0)
+            .ok_or_else(|| unknown_session(&id.0))
+    }
+
+    fn session_mut(&mut self, id: &SessionId) -> Result<&mut SessionRuntime, AcpError> {
+        self.sessions
+            .get_mut(&*id.0)
+            .ok_or_else(|| unknown_session(&id.0))
+    }
+}
+
+/// Unknown session id. The contract names the id in `data`; a notification
+/// carries no id to answer on, so its caller drops the frame instead.
+fn unknown_session(id: &str) -> AcpError {
+    AcpError::resource_not_found(None).data(serde_json::json!({"sessionId": id}))
 }
 
 impl Server {
@@ -133,7 +173,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
-        session: None,
+        sessions: HashMap::new(),
         on_session_end: params.on_session_end.clone(),
     };
 
@@ -149,7 +189,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
-    close_session(&mut server, SessionEndReason::Shutdown).await;
+    close_all_sessions(&mut server, SessionEndReason::Shutdown).await;
     drop(server);
     writer_task.await.context("stdout writer")?;
     // A stop leaves stdin open, so its read would never end.
@@ -212,14 +252,17 @@ fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     if srv.model_specs.len() == known {
         return;
     }
-    // Merged even with no session yet, since session/new builds its selector from this list.
-    let Some(session) = &srv.session else { return };
-    let option = methods::model_config_option(&session.current_model, &srv.model_specs);
-    session_update(
-        &srv.out_tx,
-        &SessionId::from(session.handle.session_id.to_string()),
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
-    );
+    // Merged into every live runtime, since each session builds its selector
+    // from this list. Per-session sends keep pumps independent: one slow or
+    // gone peer never blocks another's announcement.
+    for runtime in srv.sessions.values() {
+        let option = methods::model_config_option(&runtime.current_model, &srv.model_specs);
+        session_update(
+            &srv.out_tx,
+            &SessionId::from(runtime.handle.session_id.to_string()),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![option])),
+        );
+    }
 }
 
 async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
@@ -244,7 +287,7 @@ async fn handle_line(server: &mut Server, line: &str, params: &AcpParams) {
     } else if let Some(method) = raw.get("method").and_then(Value::as_str) {
         match id {
             Some(id) => handle_request(server, method, id, &raw, params).await,
-            None => handle_notification(server, method),
+            None => handle_notification(server, method, &raw),
         }
     } else if let Some(id) = id {
         server.respond(id, Err(AcpError::invalid_request()));
@@ -279,9 +322,25 @@ async fn handle_request(
         },
         "session/set_mode" => handle_set_mode(srv, raw),
         "session/set_config_option" => handle_set_config(srv, raw),
+        // Fork extension seams (`EXTENSION.md` is normative). Specified but not
+        // implemented on this slice: every probe answers -32601 "unsupported".
+        // Allocation-vs-activation ordering is 02.3, addressed cancel scoping
+        // is 02.9a, bounded release is 02.10b; reserved 04.1/05.2 names keep
+        // answering -32601 through the catch-all below.
+        m if m == extension::ALLOCATE_METHOD => Err(extension_seam(m, "02.3")),
+        m if m == extension::ACTIVATE_METHOD => Err(extension_seam(m, "02.3")),
+        m if m == extension::CANCEL_METHOD => Err(extension_seam(m, "02.9a")),
+        m if m == extension::RELEASE_METHOD => Err(extension_seam(m, "02.10b")),
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
+}
+
+/// Marks a fork extension method as a seam for its owning slice. The answer
+/// stays -32601, identical to an unknown method, so capability probing keeps
+/// reporting "unsupported" until that slice lands.
+fn extension_seam(_method: &str, _owner: &str) -> AcpError {
+    AcpError::method_not_found()
 }
 
 async fn new_session(
@@ -290,7 +349,10 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
-    close_session(srv, SessionEndReason::Replaced).await;
+    // Coexists with every live runtime: peers are never closed or disturbed.
+    // The standard ack stays synchronous for standard-client compatibility;
+    // the ack-from-loop plus background-setup rule applies to extension
+    // allocate/activate, whose ordering lands in 02.3.
     let project_config = trusted_project_config(
         &req.cwd,
         &params.storage,
@@ -327,23 +389,23 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    // Reloading the session we already run keeps its claim, so no other process
-    // slips in, and closes the run first so the read includes its last turn.
-    // Any other session is read first, so a failed load leaves the running one
-    // alone.
+    // Only the addressed entry is ever replaced. Reloading a session this
+    // server runs keeps its claim, so no other process slips in, and closes
+    // its run first so the read includes its last turn. Peers are untouched,
+    // and a load that fails leaves the whole table alone.
     let held = srv
-        .session
-        .as_ref()
-        .map(|state| state.claim.clone())
+        .sessions
+        .get(session_ref.as_str())
+        .map(|runtime| runtime.claim.clone())
         .filter(|claim| claim.id() == session_ref.id());
     let (restored, claim) = match held {
         Some(claim) => {
-            close_session(srv, SessionEndReason::Replaced).await;
+            close_one_session(srv, session_ref.as_str(), SessionEndReason::Replaced).await;
             (reload_history(&params.storage, &claim)?, claim)
         }
         None => {
             let loaded = claim_history(&params.storage, session_ref.id())?;
-            close_session(srv, SessionEndReason::Replaced).await;
+            close_one_session(srv, session_ref.as_str(), SessionEndReason::Replaced).await;
             loaded
         }
     };
@@ -441,9 +503,10 @@ fn iso_from_epoch(secs: u64) -> Option<String> {
         .map(|t| t.to_string())
 }
 
-/// Spawns a session and installs it as the server's current one. Spawning
-/// alone is not a useful state: the event stream has exactly one reader, so it
-/// must be handed to the pump here rather than travel any further.
+/// Spawns a session and files its runtime in the registry under its id.
+/// Spawning alone is not a useful state: the event stream has exactly one
+/// reader, so it must be handed to that session's own pump here rather than
+/// travel any further. Peer runtimes are not touched.
 #[allow(clippy::too_many_arguments)]
 fn start_session(
     srv: &mut Server,
@@ -495,11 +558,15 @@ fn start_session(
         // Results ride the next prompt. The client never asked for a turn,
         // so nothing wakes one.
         background: background_mode(params.background),
-        // `close_session` ends it, on a stop as on end of input.
+        // `close_all_sessions` ends it, on a stop as on end of input.
         stop: CancelToken::none(),
     });
     let session_ref = handle.session_id.clone();
-    start_event_pump(
+    // The pump is the session's own task: it only reads this runtime's event
+    // stream and only writes frames addressed to this runtime's id, so pumps
+    // never serialize against each other. Slow setup already happened in the
+    // caller; the loop only files the finished runtime here.
+    let pump = start_event_pump(
         events,
         session_ref.clone(),
         srv.out_tx.clone(),
@@ -509,14 +576,19 @@ fn start_session(
         project_trusted,
         initial_cost,
     );
-    srv.session = Some(SessionState {
-        handle,
-        mcp,
-        current_mode: AgentMode::Build,
-        current_model: params.model.spec(),
-        pending,
-        claim,
-    });
+    srv.sessions.insert(
+        session_ref.as_str().to_owned(),
+        SessionRuntime {
+            handle,
+            mcp,
+            current_mode: AgentMode::Build,
+            current_model: params.model.spec(),
+            pending,
+            claim,
+            epoch: TurnEpoch::initial(),
+            pump,
+        },
+    );
     session_ref
 }
 
@@ -686,12 +758,31 @@ fn trusted_project_config(
     decision.project_config
 }
 
-/// Stop the old session before the next one starts, so two generations of the
-/// same MCP servers never fight over a port or a lock file.
-async fn close_session(srv: &mut Server, reason: SessionEndReason) {
-    let Some(state) = srv.session.take() else {
+/// Drops one addressed runtime: the only entry `session/load` replaces, and
+/// the unit 02.10b's background release will reap. A miss is a no-op, so a
+/// `session/load` for a stored-but-not-live session only adds its runtime.
+async fn close_one_session(srv: &mut Server, key: &str, reason: SessionEndReason) {
+    let Some(state) = srv.sessions.remove(key) else {
         return;
     };
+    close_runtime(srv, state, reason).await;
+}
+
+/// Drops every runtime, for end of input and stop. Sequential reaps are a
+/// shutdown path, not steady-state serialization: live pumps never wait on
+/// each other.
+async fn close_all_sessions(srv: &mut Server, reason: SessionEndReason) {
+    // Drained up front so one slow teardown cannot strand a peer runtime.
+    let runtimes: Vec<SessionRuntime> = std::mem::take(&mut srv.sessions).into_values().collect();
+    for state in runtimes {
+        close_runtime(srv, state, reason).await;
+    }
+}
+
+/// Reaps a runtime the table no longer names. The end hook runs first so the
+/// bill it saves is complete; the owed prompt is answered so the client never
+/// hangs; then the run, its pump, and its MCP servers come down.
+async fn close_runtime(srv: &Server, state: SessionRuntime, reason: SessionEndReason) {
     if let Some(cb) = &srv.on_session_end {
         cb(state.handle.session_id.id(), reason).await;
     }
@@ -705,6 +796,10 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     // track this drops saves the full bill.
     state.handle.task.abort();
     let _ = state.handle.task.await;
+    // Aborted before the await: an orphaned pump would keep writing frames for
+    // a dropped id. Queued updates for a closing session are dropped with it.
+    state.pump.abort();
+    let _ = state.pump.await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
@@ -765,7 +860,15 @@ impl From<StoredSession> for Restored {
 
 fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    // Addressed to the request's own session; no current-session fallback.
+    // 02.2b proves the routing on top: interleaving, duplicate-prompt and
+    // cross-session rejection, and epoch settlement of terminals.
+    let session = srv.session(&req.session_id)?;
+    debug!(
+        session = %req.session_id.0,
+        epoch = session.epoch.current(),
+        "prompt addressed"
+    );
 
     let (message, images) = extract_prompt_content(&req.prompt);
     let input = AgentInput::from_defaults(
@@ -798,7 +901,15 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     let new_mode = methods::mode_id_to_agent_mode(&mode_str)
         .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
 
-    let session = srv.session.as_mut().ok_or_else(no_session)?;
+    // Per-session setup, changed only on the addressed runtime; the peer keeps
+    // its own. Fixed-at-activation rejection (route-then-reject with
+    // `fixed_at_activation`) is 02.2b: standard clients keep working here.
+    let session = srv.session_mut(&req.session_id)?;
+    debug!(
+        session = %req.session_id.0,
+        epoch = session.epoch.current(),
+        "mode addressed"
+    );
     session.handle.switch_mode(new_mode.clone());
     session.current_mode = new_mode;
 
@@ -830,7 +941,13 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
     let model =
         Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
-    let session = srv.session.as_mut().ok_or_else(no_session)?;
+    // Per-session, like the mode above; fixed-at-activation rejection is 02.2b.
+    let session = srv.session_mut(&req.session_id)?;
+    debug!(
+        session = %req.session_id.0,
+        epoch = session.epoch.current(),
+        "config addressed"
+    );
     session
         .handle
         .model_tx
@@ -846,13 +963,19 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
     ))
 }
 
-fn handle_notification(srv: &Server, method: &str) {
+fn handle_notification(srv: &Server, method: &str, raw: &Value) {
     match method {
         "session/cancel" => {
+            // Addressed to the notification's own session. A miss is dropped:
+            // a notification carries no id to answer on. Addressed cancel with
+            // an epoch pin (`_maki/session/cancel`) and turn scoping are 02.9a.
+            let Ok(note) = parse_params::<CancelNotification>(raw) else {
+                return;
+            };
             // Asks stay: a call moved to the background outlives the turn
             // and may be parked on one, and a stale answer is tagged, so
             // whoever waits next drops it.
-            if let Some(session) = &srv.session {
+            if let Ok(session) = srv.session(&note.session_id) {
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -861,10 +984,22 @@ fn handle_notification(srv: &Server, method: &str) {
 }
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
-    let Some(session) = &srv.session else { return };
     let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
-    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
-    let Some(ask) = ask else {
+    let Some(want) = ask_id(&id) else {
+        warn!(%id, "response for an id no ask can carry");
+        return;
+    };
+    // Ask ids are minted from one process-wide counter, so the owning runtime
+    // is found by identity without touching peers. Strict per-session answer
+    // identity (rejecting a frame that names another live session) is 02.2b.
+    let mut found = None;
+    for runtime in srv.sessions.values() {
+        if let Some(ask) = runtime.pending.lock().unwrap().asks.remove(&want) {
+            found = Some((ask, runtime.handle.answer_tx.clone()));
+            break;
+        }
+    }
+    let Some((ask, main_answer_tx)) = found else {
         warn!(%id, "response for an unknown request id");
         return;
     };
@@ -886,7 +1021,7 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
             None,
         ),
     };
-    let _ = answer_tx.unwrap_or(&session.handle.answer_tx).send(answer);
+    let _ = answer_tx.unwrap_or(&main_answer_tx).send(answer);
 }
 
 /// Our asks go out with a numeric id, but JSON-RPC ids are `string | number`
@@ -1137,10 +1272,6 @@ fn session_update(out_tx: &Sender<Value>, sid: &SessionId, update: SessionUpdate
             params: Some(notification),
         },
     );
-}
-
-fn no_session() -> AcpError {
-    AcpError::new(-32600, "no active session")
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(raw: &Value) -> Result<T, AcpError> {
@@ -1394,10 +1525,13 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
-        let (answer_tx, answer_rx) = flume::unbounded();
-        let (out_tx, out_rx) = flume::unbounded();
+    /// One live runtime for single-session fixtures. Its pump task is already
+    /// complete: these fixtures drive real pumps themselves via `run_pump`, so
+    /// the owned handle must exist but never run.
+    fn fixture_runtime() -> (String, SessionRuntime) {
+        let (answer_tx, _) = flume::unbounded();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
+        let key = SessionRef::from(claim.id()).as_str().to_owned();
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
@@ -1415,6 +1549,25 @@ mod tests {
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
             spend: Arc::default(),
         };
+        let runtime = SessionRuntime {
+            handle,
+            mcp: None,
+            current_mode: AgentMode::Build,
+            current_model: String::new(),
+            pending: Arc::default(),
+            claim,
+            epoch: TurnEpoch::initial(),
+            pump: tokio::spawn(async {}),
+        };
+        (key, runtime)
+    }
+
+    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let (out_tx, out_rx) = flume::unbounded();
+        let (key, mut runtime) = fixture_runtime();
+        // The answer channel under test is this runtime's own.
+        runtime.handle.answer_tx = answer_tx;
         let server = Server {
             out_tx,
             model_specs: Vec::new(),
@@ -1422,16 +1575,29 @@ mod tests {
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
-            session: Some(SessionState {
-                handle,
-                mcp: None,
-                current_mode: AgentMode::Build,
-                current_model: String::new(),
-                pending: Arc::default(),
-                claim,
-            }),
+            sessions: HashMap::from([(key, runtime)]),
         };
         (server, answer_rx, out_rx)
+    }
+
+    /// The single runtime single-session fixtures install. Multi-session
+    /// fixtures address entries by key instead.
+    fn only(srv: &Server) -> &SessionRuntime {
+        assert_eq!(
+            srv.sessions.len(),
+            1,
+            "single-session fixture holds one runtime"
+        );
+        srv.sessions.values().next().unwrap()
+    }
+
+    fn only_mut(srv: &mut Server) -> &mut SessionRuntime {
+        assert_eq!(
+            srv.sessions.len(),
+            1,
+            "single-session fixture holds one runtime"
+        );
+        srv.sessions.values_mut().next().unwrap()
     }
 
     fn acp_params(storage: StateDir) -> AcpParams {
@@ -1460,9 +1626,9 @@ mod tests {
         })
     }
 
-    /// A load that cannot happen must not take the running session down with
-    /// it: the client still holds that session, and every prompt it sends next
-    /// would otherwise answer "no active session".
+    /// A load that cannot happen must not take any live runtime down with
+    /// it: the client still holds those sessions, and every prompt they send
+    /// next must still find their runtimes.
     #[test_case(false ; "a session that does not exist")]
     #[test_case(true ; "a session another maki holds")]
     #[tokio::test]
@@ -1479,23 +1645,173 @@ mod tests {
             false => MakiId::generate(),
         };
         let (mut srv, _answer_rx, _out_rx) = test_server();
-        let running = srv.session.as_ref().unwrap().handle.session_id.clone();
+        let running = only(&srv).handle.session_id.clone();
 
         let result = load_session(&mut srv, &load_request(target), &acp_params(storage)).await;
 
         assert!(result.is_err());
+        assert_eq!(srv.sessions.len(), 1, "{FAILED_LOAD_KEEPS_SESSION}");
         assert_eq!(
-            srv.session.as_ref().map(|s| s.handle.session_id.clone()),
-            Some(running),
+            only(&srv).handle.session_id,
+            running,
             "{FAILED_LOAD_KEEPS_SESSION}"
         );
     }
 
-    fn pending(srv: &Server) -> &PendingState {
-        &srv.session
-            .as_ref()
-            .expect("a session is installed")
+    const TEXT_A: &str = "runtime A speaks";
+    const TEXT_B: &str = "runtime B speaks";
+
+    /// Drives one runtime's own pump over a fake stream. No prompts are sent,
+    /// so nothing here can reach a provider.
+    async fn drive_runtime(srv: &Server, key: &str, feed: impl FnOnce(&EventSender)) {
+        let runtime = srv
+            .sessions
+            .get(key)
+            .expect("the addressed runtime is live");
+        let (guard, events) = maki_agent::event_stream();
+        let pump = start_event_pump(
+            events,
+            runtime.handle.session_id.clone(),
+            srv.out_tx.clone(),
+            Arc::clone(&runtime.pending),
+            PathBuf::from(PUMP_CWD),
+            None,
+            PUMP_TRUSTED,
+            None,
+        );
+        let sender = guard.sender(0);
+        feed(&sender);
+        drop(guard);
+        pump.await.unwrap();
+    }
+
+    /// 02.2a acceptance, in-process half: two runtimes share one `Server` (one
+    /// PID), each with its own pump task and conversation context, and neither
+    /// disturbs the other. No prompts are sent and no inference runs: prompt
+    /// and event routing proof, with interleaving and settlement, is 02.2b.
+    /// The same-PID process half lives in `tests/session_registry.rs`.
+    #[tokio::test]
+    async fn two_runtimes_coexist_with_independent_pumps_and_contexts() {
+        let (mut srv, _answer_rx, _out_rx) = test_server();
+        let (out_tx, out_rx) = flume::unbounded();
+        srv.out_tx = out_tx;
+        let key_a: String = srv.sessions.keys().next().unwrap().clone();
+        let (key_b, runtime_b) = fixture_runtime();
+        srv.sessions.insert(key_b.clone(), runtime_b);
+
+        assert_ne!(key_a, key_b, "two runtimes hold distinct ids");
+        assert_eq!(srv.sessions.len(), 2, "one PID owns both runtimes");
+        let sid_a = srv.sessions.get(&key_a).unwrap().handle.session_id.clone();
+        let sid_b = srv.sessions.get(&key_b).unwrap().handle.session_id.clone();
+        assert_ne!(
+            sid_a, sid_b,
+            "two runtimes hold distinct conversation contexts"
+        );
+        assert_ne!(
+            srv.sessions.get(&key_a).unwrap().claim.id(),
+            srv.sessions.get(&key_b).unwrap().claim.id(),
+            "two runtimes hold distinct storage claims"
+        );
+
+        // Per-session fixed setup: each runtime keeps its own mode and model.
+        only_mut_addr(&mut srv, &key_a).current_model = SELECTED_SPEC.to_owned();
+        only_mut_addr(&mut srv, &key_b).current_model = "other-vendor/other-model".to_owned();
+
+        drive_runtime(&srv, &key_a, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: TEXT_A.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        drive_runtime(&srv, &key_b, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: TEXT_B.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+
+        let frames: Vec<Value> = out_rx.try_iter().collect();
+        assert_eq!(
+            frames.len(),
+            2,
+            "each pump forwards only its own stream: {frames:?}"
+        );
+        for (text, sid) in [(TEXT_A, sid_a.to_string()), (TEXT_B, sid_b.to_string())] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["params"]["sessionId"] == sid
+                        && frame["params"]["update"]["content"]["text"] == text),
+                "the {sid} pump addresses its own text: {frames:?}"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .filter(|frame| frame["params"]["sessionId"] == sid)
+                    .count()
+                    == 1,
+                "no pump writes for the peer: {frames:?}"
+            );
+        }
+
+        // Pending slots and epochs are per runtime: settling A leaves B alone.
+        srv.sessions
+            .get(&key_a)
+            .unwrap()
             .pending
+            .lock()
+            .unwrap()
+            .prompt = Some(RequestId::Number(PROMPT_ID));
+        drive_runtime(&srv, &key_a, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        let answer = out_rx.try_recv().expect("A settles its own prompt");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert!(
+            srv.sessions
+                .get(&key_b)
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .prompt
+                .is_none(),
+            "settling A never touches B's pending slot"
+        );
+
+        let bumped = only_mut_addr(&mut srv, &key_a).epoch.bump();
+        assert_eq!(bumped, 1);
+        assert!(
+            srv.sessions.get(&key_b).unwrap().epoch.check(0).is_ok(),
+            "bumping A never moves B's epoch"
+        );
+        assert_eq!(
+            srv.sessions.get(&key_a).unwrap().current_model,
+            SELECTED_SPEC,
+            "per-session setup survives the peer settling"
+        );
+        assert_eq!(
+            srv.sessions.get(&key_b).unwrap().current_model,
+            "other-vendor/other-model",
+            "per-session setup survives the peer settling"
+        );
+    }
+
+    fn only_mut_addr<'a>(srv: &'a mut Server, key: &str) -> &'a mut SessionRuntime {
+        srv.sessions
+            .get_mut(key)
+            .expect("the addressed runtime is live")
+    }
+
+    fn pending(srv: &Server) -> &PendingState {
+        &only(srv).pending
     }
 
     fn permission_ask(answer_tx: Option<Sender<String>>) -> Ask {
@@ -1544,7 +1860,7 @@ mod tests {
     /// of permission options.
     const PUMP_TRUSTED: bool = true;
     async fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
-        let session = srv.session.as_ref().expect("a session is installed");
+        let session = only(srv);
         let (guard, events) = maki_agent::event_stream();
         let pump = start_event_pump(
             events,
@@ -1670,7 +1986,10 @@ mod tests {
         }
 
         if cancel {
-            handle_notification(&srv, "session/cancel");
+            let raw = serde_json::json!({
+                "params": { "sessionId": only(&srv).handle.session_id.to_string() }
+            });
+            handle_notification(&srv, "session/cancel", &raw);
         }
         for (request, option) in requests
             .iter()
@@ -1735,7 +2054,7 @@ mod tests {
         answer_rx: &flume::Receiver<String>,
         request_id: &str,
     ) -> Result<(), PermissionError> {
-        let session = srv.session.as_ref().expect("a session is installed");
+        let session = only(srv);
         let (guard, _events) = maki_agent::event_stream();
         let event_tx = guard.sender(0);
         let rx = tokio::sync::Mutex::new(answer_rx.clone());
@@ -1760,7 +2079,7 @@ mod tests {
     }
 
     fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {
-        let session = srv.session.as_ref().expect("a session is installed");
+        let session = only(srv);
         session
             .handle
             .answer_tx
@@ -1769,7 +2088,7 @@ mod tests {
     }
 
     fn next_turn_is_allowed(srv: &Server) -> bool {
-        let session = srv.session.as_ref().expect("a session is installed");
+        let session = only(srv);
         matches!(
             session.handle.permissions.check(
                 &ToolKey::native(NEXT_TURN_TOOL),
@@ -1787,7 +2106,10 @@ mod tests {
     #[tokio::test]
     async fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
         let (srv, answer_rx, out_rx) = test_server();
-        handle_notification(&srv, "session/cancel");
+        let cancel = serde_json::json!({
+            "params": { "sessionId": only(&srv).handle.session_id.to_string() }
+        });
+        handle_notification(&srv, "session/cancel", &cancel);
         run_pump(&srv, None, |sender| {
             sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
         })
@@ -2138,12 +2460,11 @@ mod tests {
     #[tokio::test]
     async fn close_session_returns_at_once_with_background_work_out() {
         let (mut srv, ..) = test_server();
-        srv.session.as_mut().unwrap().handle.task =
-            AbortOnDropHandle::new(tokio::spawn(future::pending()));
+        only_mut(&mut srv).handle.task = AbortOnDropHandle::new(tokio::spawn(future::pending()));
 
         let closed = timeout(
             STDIN_DEADLOCK_TIMEOUT,
-            close_session(&mut srv, SessionEndReason::Shutdown),
+            close_all_sessions(&mut srv, SessionEndReason::Shutdown),
         )
         .await
         .is_ok();
@@ -2166,7 +2487,7 @@ mod tests {
     #[tokio::test]
     async fn close_session_awaits_the_session_end_hook() {
         let (mut srv, ..) = test_server();
-        let ended = srv.session.as_ref().unwrap().handle.session_id.id();
+        let ended = only(&srv).handle.session_id.id();
         let (ended_tx, ended_rx) = flume::bounded(1);
         srv.on_session_end = Some(Arc::new(move |id, reason| {
             let ended_tx = ended_tx.clone();
@@ -2175,13 +2496,13 @@ mod tests {
             })
         }));
 
-        close_session(&mut srv, SessionEndReason::Replaced).await;
+        close_all_sessions(&mut srv, SessionEndReason::Replaced).await;
 
         assert_eq!(
             ended_rx.try_recv().ok(),
             Some((ended, SessionEndReason::Replaced))
         );
-        assert!(srv.session.is_none(), "close must take the session");
+        assert!(srv.sessions.is_empty(), "close must take the session");
     }
 
     /// JSON-RPC ids are `string | number`, and a client is free to echo ours
@@ -2341,7 +2662,7 @@ mod tests {
             .unwrap();
 
         let (mut srv, _answer_rx, out_rx) = test_server();
-        srv.session = None;
+        srv.sessions.clear();
         let params = acp_params(storage);
         let raw = serde_json::json!({ "params": {} });
         handle_request(

@@ -19,6 +19,11 @@
 //!   by JSON-RPC id (numbers and strings); notifications buffer separately
 //!   so a peer session's traffic never unblocks the wrong waiter.
 
+// Shared across integration-test binaries where each uses a subset (02.1
+// fixtures use the two-PID helpers, 02.2a+ the single-PID ones), so
+// per-binary unused items are expected reuse surface, not dead code.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -475,10 +480,10 @@ impl SessionPeer {
     }
 }
 
-/// Two synchronised sessions for reuse by 02.2a-02.10b. On the current
-/// single-session server each session is its own child PID; once one
-/// process hosts both sessions the same struct fronts that wiring instead,
-/// and every fixture below keeps compiling unchanged.
+/// Two synchronised sessions for reuse by 02.2a-02.10b. Each session is its
+/// own child PID, so this struct also covers cross-process sync checks.
+/// Single-process coexistence (one PID owning both sessions, 02.2a onward)
+/// uses [`SharedSessions`] below instead.
 pub struct TwoSession {
     /// Distinct fixture project cwds backing the two sessions.
     pub projects: ProjectPair,
@@ -504,5 +509,52 @@ impl TwoSession {
     pub async fn shutdown(self) -> io::Result<()> {
         self.a.shutdown().await?;
         self.b.shutdown().await
+    }
+}
+
+/// Two synchronised sessions hosted by ONE child PID (02.2a registry): the
+/// child is initialized once and holds a session on each fixture project.
+/// No prompt is ever sent here, so the provider wire stays untouched: no
+/// inference, keys or network. Prompt/event routing proof is 02.2b.
+pub struct SharedSessions {
+    /// The single Maki child owning both sessions: one process by construction.
+    pub child: MakiChild,
+    /// Distinct fixture project cwds backing the two sessions.
+    pub projects: ProjectPair,
+    /// Fork-assigned id of the session on project A.
+    pub a: String,
+    /// Cwd backing session A.
+    pub cwd_a: String,
+    /// Fork-assigned id of the session on project B.
+    pub b: String,
+    /// Cwd backing session B.
+    pub cwd_b: String,
+}
+
+impl SharedSessions {
+    /// Bring both sessions up deterministically: initialize once, then open a
+    /// session per project before either proceeds, so no step depends on a
+    /// sleep or on the other's timing.
+    pub async fn establish() -> io::Result<Self> {
+        let projects = ProjectPair::create()?;
+        let mut child = MakiChild::spawn().await?;
+        child.initialize().await?;
+        let cwd_a = projects.a.to_string_lossy().into_owned();
+        let cwd_b = projects.b.to_string_lossy().into_owned();
+        let a = child.session_new(&cwd_a).await?;
+        let b = child.session_new(&cwd_b).await?;
+        assert_ne!(a, b, "two sessions must hold distinct ids");
+        Ok(Self {
+            child,
+            projects,
+            a,
+            cwd_a,
+            b,
+            cwd_b,
+        })
+    }
+
+    pub async fn shutdown(self) -> io::Result<()> {
+        self.child.shutdown().await
     }
 }
