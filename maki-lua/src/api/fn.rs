@@ -130,19 +130,29 @@ pub(crate) enum Redirect {
 }
 
 impl Redirect {
-    fn stdio(&self) -> Result<Stdio, String> {
+    fn stdio(&self, effective_cwd: Option<&Path>) -> Result<Stdio, String> {
         match self {
             Self::Capture => Ok(Stdio::piped()),
             Self::Discard => Ok(Stdio::null()),
-            // 02.5a inventory: a relative redirect path opens against the
-            // process cwd. 02.5c resolves it against the owning session's
-            // carried cwd.
-            Self::File(path) => File::options()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map(Stdio::from)
-                .map_err(|e| format!("cannot open {}: {e}", path.display())),
+            // 02.5c: a relative redirect path opens against the job's
+            // effective cwd (explicit `cwd` when given, else the owning
+            // session's directory), never the process cwd bare. `None`
+            // keeps the process-cwd fallback for contexts no session owns.
+            Self::File(path) => {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else if let Some(dir) = effective_cwd {
+                    dir.join(path)
+                } else {
+                    path.clone()
+                };
+                File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&resolved)
+                    .map(Stdio::from)
+                    .map_err(|e| format!("cannot open {}: {e}", resolved.display()))
+            }
         }
     }
 }
@@ -152,6 +162,12 @@ pub(crate) struct JobSpec {
     pub cmd: JobCommand,
     pub name: Option<String>,
     pub cwd: Option<String>,
+    /// The owning session's directory, captured from the task lineage at
+    /// `jobstart` (02.5c). `None` keeps the process-cwd fallback for
+    /// contexts no session owns (one-shots, detached spawns, direct
+    /// `JobStore` tests). Never `set_current_dir`, not even temporarily:
+    /// the value travels per task, so independent sessions stay concurrent.
+    pub session_cwd: Option<PathBuf>,
     pub env: Option<HashMap<String, String>>,
     pub stdout: Redirect,
     pub stderr: Redirect,
@@ -173,6 +189,7 @@ impl JobSpec {
             cmd: cmd.into(),
             name: None,
             cwd: None,
+            session_cwd: None,
             env: None,
             stdout: Redirect::Capture,
             stderr: Redirect::Capture,
@@ -314,6 +331,7 @@ impl JobStore {
             cmd,
             name,
             cwd,
+            session_cwd,
             env,
             stdout,
             stderr,
@@ -323,10 +341,27 @@ impl JobStore {
             ceiling,
             max_line_bytes,
         } = spec;
+        // 02.5c: the job's effective directory is the explicit `cwd` when
+        // given (relative against the owning session), else the owning
+        // session's directory, else the process inherit. Redirect files
+        // resolve against the same effective directory. Never
+        // `set_current_dir`, not even temporarily.
+        let explicit = cwd.as_deref().map(expand_tilde);
+        let explicit_resolved = explicit.map(|p| {
+            if p.is_absolute() {
+                p
+            } else if let Some(session) = session_cwd.as_deref() {
+                session.join(&p)
+            } else {
+                p
+            }
+        });
+        let effective_cwd: Option<PathBuf> =
+            explicit_resolved.clone().or_else(|| session_cwd.clone());
         let mut command = cmd.build();
         strip_provider_keys(&mut command)
-            .stdout(stdout.stdio()?)
-            .stderr(stderr.stdio()?)
+            .stdout(stdout.stdio(effective_cwd.as_deref())?)
+            .stderr(stderr.stdio(effective_cwd.as_deref())?)
             .stdin(Stdio::null());
 
         #[cfg(unix)]
@@ -341,15 +376,20 @@ impl JobStore {
             }
         }
 
-        if let Some(dir) = cwd.as_deref().map(expand_tilde) {
+        if let Some(dir) = explicit_resolved {
             if !dir.is_dir() {
                 return Err(format!("cwd is not a directory: {}", dir.display()));
             }
             command.current_dir(dir);
+        } else if let Some(session) = session_cwd.as_deref() {
+            // Default subprocess cwd: the owning session's directory.
+            if !session.is_dir() {
+                return Err(format!("cwd is not a directory: {}", session.display()));
+            }
+            command.current_dir(session);
         }
-        // 02.5a inventory: with no explicit `cwd` the child inherits the
-        // Maki process cwd. 02.5c defaults to the owning session's carried
-        // cwd instead. Never `set_current_dir`, not even temporarily.
+        // No explicit `cwd` and no owning session: the child inherits the
+        // Maki process cwd (one-shots, detached spawns, direct store uses).
         if let Some(ref env_map) = env {
             for (k, v) in env_map {
                 command.env(k, v);
@@ -1056,6 +1096,12 @@ fn jobstart(
         .transpose()?
         .unwrap_or(Value::Nil);
     let mut spec = JobSpec::new(parse_scope(lua, &plugin, scope)?, parse_command(cmd)?);
+    // 02.5c: default subprocess cwd is the owning session's directory,
+    // carried on the task lineage (02.5a) next to the session. `None` keeps
+    // the process-cwd inherit for session-less tasks (one-shots, detached
+    // spawns). Attached sessions inherit the parent cwd via 02.5b, so their
+    // children land in the parent project too. Never `set_current_dir`.
+    spec.session_cwd = crate::runtime::Lineage::current(lua).cwd;
     let mut tail = None;
 
     if let Some(ref opts) = opts {
@@ -2603,6 +2649,325 @@ mod tests {
             "exited session job must stay listed"
         );
         store.kill_session(&lua, session);
+    }
+
+    /// 02.5c: with no explicit `cwd` the child runs in the owning session's
+    /// directory. Real `pwd` through the real `JobStore` path, never mocked.
+    #[cfg(unix)]
+    #[test]
+    fn default_start_runs_in_the_session_cwd() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().canonicalize().unwrap();
+        assert_ne!(
+            dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        let mut store = make_store();
+        let mut spec = JobSpec::new(task_owner(1), "pwd");
+        spec.session_cwd = Some(dir.clone());
+        let id = store.start(spec).unwrap();
+
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        let stdout: String = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            matches!(events.last(), Some((_, JobEvent::Exit(0)))),
+            "pwd must exit 0"
+        );
+        assert_eq!(
+            stdout.trim(),
+            dir.to_string_lossy(),
+            "the default child cwd must be the owning session"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "spawning never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.5c: an explicit relative `cwd` resolves against the owning session,
+    /// not the process cwd. Real `pwd` through the real store path.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_relative_cwd_resolves_against_the_session() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("sub")).unwrap();
+        let dir = project.path().canonicalize().unwrap();
+
+        let mut store = make_store();
+        let mut spec = JobSpec::new(task_owner(1), "pwd");
+        spec.cwd = Some("sub".into());
+        spec.session_cwd = Some(dir.clone());
+        let id = store.start(spec).unwrap();
+
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        let stdout: String = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            stdout.trim(),
+            dir.join("sub").to_string_lossy(),
+            "explicit relative cwd must serve the session"
+        );
+    }
+
+    /// 02.5c: a relative `Redirect::File` opens against the job's effective
+    /// cwd (explicit when given, else the owning session), never the process
+    /// cwd bare. Real child output through the real store path.
+    #[cfg(unix)]
+    #[test]
+    fn relative_redirect_opens_against_the_session() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().canonicalize().unwrap();
+        assert_ne!(
+            dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        let mut store = make_store();
+        let id = store
+            .start(JobSpec {
+                stdout: Redirect::File(PathBuf::from("out.log")),
+                stderr: Redirect::Discard,
+                session_cwd: Some(dir.clone()),
+                ..JobSpec::new(task_owner(1), "echo hi")
+            })
+            .unwrap();
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        assert!(matches!(events.last(), Some((_, JobEvent::Exit(0)))));
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.log")).unwrap(),
+            "hi\n",
+            "the relative redirect must land in the session"
+        );
+        assert!(
+            !process_cwd.join("out.log").exists(),
+            "the redirect must not land in the process cwd"
+        );
+    }
+
+    /// 02.5c: with no owning session the child keeps the process inherit
+    /// (one-shots, detached spawns, direct store uses).
+    #[cfg(unix)]
+    #[test]
+    fn no_session_keeps_the_process_inherit() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let mut store = make_store();
+        let id = store.start(JobSpec::new(task_owner(1), "pwd")).unwrap();
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        let stdout: String = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            stdout.trim(),
+            process_cwd.canonicalize().unwrap().to_string_lossy(),
+            "no session keeps the process inherit"
+        );
+    }
+
+    /// 02.5c runtime-tool cwd proof (distinct from 02.4's initial-context
+    /// proof): interleaved default `pwd` subprocesses plus relative
+    /// `Redirect::File` opens in separate A/B fixture projects associate
+    /// with the correct session, through the real Lua `jobstart`/`jobwait`
+    /// path under the real task lineage — never a mocked layer — with the
+    /// process cwd unchanged throughout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interleaved_default_subprocesses_serve_their_own_session() {
+        use crate::runtime::{TaskCell, TaskScope};
+        use maki_agent::cancel::CancelToken;
+
+        struct Fixture {
+            _tmp: tempfile::TempDir,
+            dir: PathBuf,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dir = tmp.path().canonicalize().unwrap();
+                Self { _tmp: tmp, dir }
+            }
+        }
+
+        async fn session_pass(lua: &Lua, dir: &Path, plugin: &'static str) {
+            let grants = crate::plugin_permissions::PluginPermissions::trusted();
+            let table = create_fn_table(lua, Arc::from(plugin), &grants, grants.clone(), None)
+                .expect("fn table");
+            let jobstart: mlua::Function = table.get("jobstart").unwrap();
+            let jobwait: mlua::Function = table.get("jobwait").unwrap();
+
+            // Default cwd: no `cwd` key, so the child must inherit the
+            // session from the lineage `jobstart` stamps on the spec.
+            let opts = lua.create_table().unwrap();
+            let (id, err): (Option<u32>, Option<String>) =
+                jobstart.call_async(("pwd", opts)).await.unwrap();
+            assert_eq!(err, None, "{plugin}: jobstart must accept the default cwd");
+            let id = id.expect("{plugin}: jobstart must return an id");
+            tokio::task::yield_now().await;
+
+            let (result, err): (Option<Table>, Option<String>) =
+                jobwait.call_async((id, 10_000)).await.unwrap();
+            assert_eq!(err, None, "{plugin}: jobwait must answer");
+            let result = result.unwrap();
+            let stdout: String = result.get("stdout").unwrap();
+            let code: i32 = result.get("exit_code").unwrap();
+            assert_eq!(code, 0, "{plugin}: pwd must exit 0");
+            assert_eq!(
+                stdout.trim(),
+                dir.to_string_lossy(),
+                "{plugin}: the default child serves its own session"
+            );
+            tokio::task::yield_now().await;
+
+            // Relative redirect: no explicit dir, so the file must land in
+            // the session, never the process cwd.
+            let redirect_opts = lua.create_table().unwrap();
+            redirect_opts.set("stdout", "redirect-out.log").unwrap();
+            let (redirect_id, err): (Option<u32>, Option<String>) = jobstart
+                .call_async(("echo hi", redirect_opts))
+                .await
+                .unwrap();
+            assert_eq!(err, None, "{plugin}: redirect jobstart must start");
+            let redirect_id = redirect_id.unwrap();
+            let (result, err): (Option<Table>, Option<String>) =
+                jobwait.call_async((redirect_id, 10_000)).await.unwrap();
+            assert_eq!(err, None, "{plugin}: redirect jobwait must answer");
+            assert!(result.is_some());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("redirect-out.log")).unwrap(),
+                "hi\n",
+                "{plugin}: the relative redirect lands in the session"
+            );
+        }
+
+        async fn run_session(fixture: &Fixture, plugin: &'static str) {
+            let lua = Lua::new();
+            let mut cell = TaskCell::new(CancelToken::none(), None, None);
+            cell.lineage.session = Some(maki_storage::id::MakiId::generate());
+            cell.lineage.cwd = Some(fixture.dir.clone());
+            let scope = TaskScope::new(&lua, cell);
+            scope
+                .scope_future(session_pass(&lua, &fixture.dir, plugin))
+                .await;
+        }
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = Fixture::new();
+        let project_b = Fixture::new();
+        assert_ne!(project_a.dir, project_b.dir);
+        assert_ne!(project_a.dir, process_cwd.canonicalize().unwrap());
+        assert_ne!(project_b.dir, process_cwd.canonicalize().unwrap());
+
+        let ((), ()) = tokio::join!(
+            run_session(&project_a, "test-02-5c-a"),
+            run_session(&project_b, "test-02-5c-b"),
+        );
+
+        // The redirect files landed per session, never in the process cwd.
+        assert_eq!(
+            std::fs::read_to_string(project_a.dir.join("redirect-out.log")).unwrap(),
+            "hi\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_b.dir.join("redirect-out.log")).unwrap(),
+            "hi\n"
+        );
+        assert!(
+            !process_cwd.join("redirect-out.log").exists(),
+            "no redirect may land in the process cwd"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "subprocess resolution never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.5c attached-agent proof: a child session opened from a parent
+    /// inherits the parent cwd (02.5b propagation), so its default
+    /// subprocess runs in the parent project. Real `pwd` through the real
+    /// `JobStore` path under the child's lineage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_default_subprocess_retains_the_parent_cwd() {
+        use crate::runtime::{TaskCell, TaskScope};
+        use maki_agent::cancel::CancelToken;
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = tempfile::TempDir::new().unwrap();
+        let dir = project.path().canonicalize().unwrap();
+        assert_ne!(
+            dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        // 02.5b proves the attached open clones the parent permissions (hence
+        // cwd) into the child; the child's tool contexts and task lineage
+        // therefore carry the parent directory. Here the child lineage
+        // carries the parent project, and the default subprocess must run
+        // there — never in the process cwd or a peer.
+        let child_cwd = dir.clone();
+
+        // The child's default subprocess runs where the lineage says: the
+        // parent project, never the process cwd.
+        let mut store = make_store();
+        let mut spec = JobSpec::new(task_owner(1), "pwd");
+        spec.session_cwd = Some(child_cwd.clone());
+        let id = store.start(spec).unwrap();
+        let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+        let stdout: String = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                JobEvent::Stdout(line) => Some(line.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(stdout.trim(), dir.to_string_lossy());
+
+        // And the same lineage through a real `TaskScope` stamps the spec
+        // the way `jobstart` does on every dispatch.
+        let lua = Lua::new();
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.lineage.session = Some(maki_storage::id::MakiId::generate());
+        cell.lineage.cwd = Some(child_cwd);
+        let scope = TaskScope::new(&lua, cell);
+        scope
+            .scope_future(async {
+                let captured = crate::runtime::Lineage::current(&lua).cwd;
+                assert_eq!(captured.as_deref(), Some(dir.as_path()));
+            })
+            .await;
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "attached resolution never moves the Maki process cwd"
+        );
     }
 
     #[cfg(unix)]

@@ -602,18 +602,21 @@ impl UserData for LuaCtx {
                 let loaded = agent.loaded_instructions.clone();
                 let call = agent.call_instructions.clone();
                 let files = Arc::clone(&agent.instruction_files);
+                // 02.5c: later subdirectory-instruction discovery walks from
+                // the owning session's directory (`agent.cwd`, carried since
+                // 02.4 and resolved since 02.5b), not the process cwd or a
+                // peer project. Attached agents inherit the parent cwd via
+                // 02.5b propagation, so their walks land in the parent
+                // project too. The lineage is unreachable off the executor,
+                // so capture before the blocking thread takes over.
+                let session_cwd = agent.cwd.clone();
                 // Nothing may hold the ctx borrow across the wait: a cancel
                 // hook firing meanwhile needs `ctx:finish`, which takes it
                 // mutably.
                 drop(this);
                 let blocks = spawn_blocking(move || {
-                    // 02.5a inventory: later subdirectory-instruction
-                    // discovery walks from the process cwd. 02.5c walks from
-                    // the owning session's carried cwd (`agent.cwd` above)
-                    // instead, via the lineage in 02.5b.
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    let abs = resolve_abs_with_cwd(dir_path, &cwd);
-                    maki_agent::find_subdirectory_instructions(&abs, &cwd, &loaded, &files)
+                    let abs = resolve_abs_with_cwd(dir_path, &session_cwd);
+                    maki_agent::find_subdirectory_instructions(&abs, &session_cwd, &loaded, &files)
                 })
                 .await
                 .map_err(mlua::Error::external)?;
@@ -896,5 +899,174 @@ mod tests {
         );
         assert_eq!(LuaCtx::handler(&ctx).restore_reason(), None);
         assert_eq!(LuaCtx::start(&ctx).restore_reason(), None);
+    }
+
+    /// One fixture project per session, each with a subdirectory instruction
+    /// file the other lacks.
+    struct SessionProject {
+        _tmp: TempDir,
+        dir: PathBuf,
+        content: &'static str,
+    }
+
+    impl SessionProject {
+        fn new(content: &'static str) -> Self {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir(tmp.path().join("sub")).unwrap();
+            std::fs::write(tmp.path().join("sub").join("AGENTS.md"), content).unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            Self {
+                _tmp: tmp,
+                dir,
+                content,
+            }
+        }
+    }
+
+    fn session_tool_ctx(dir: &Path) -> ToolContext {
+        let mut ctx = populated_ctx();
+        ctx.cwd = dir.to_path_buf();
+        ctx.session_id = Some(session_ref());
+        ctx.loaded_instructions = maki_agent::agent::LoadedInstructions::new();
+        ctx.call_instructions = maki_agent::agent::CallInstructions::default();
+        ctx.instruction_files = Arc::new(maki_agent::agent::default_instruction_files());
+        ctx
+    }
+
+    /// 02.5c: `ctx:load_instructions` walks from the owning session's
+    /// directory, not the process cwd or a peer project. Real Lua
+    /// `ctx:load_instructions("sub")` through the real handler path.
+    #[tokio::test]
+    async fn load_instructions_walk_the_owning_session() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = SessionProject::new("session-instructions-here");
+        assert_ne!(
+            project.dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        let ctx = session_tool_ctx(&project.dir);
+        let lua = Lua::new();
+        let handler = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(r#"local ctx = ...; return ctx:load_instructions("sub")"#)
+            .call_async(handler)
+            .await
+            .unwrap();
+        assert_eq!(err, None, "later discovery must resolve");
+        assert_eq!(ok, Some(true));
+
+        let blocks = ctx.call_instructions.take();
+        assert!(
+            blocks.iter().any(|block| block.content == project.content),
+            "the session's subdirectory instructions must load, got {blocks:?}"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "instruction discovery never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.5c runtime-tool cwd proof, instruction half (distinct from 02.4's
+    /// initial-context proof): interleaved later subdirectory-instruction
+    /// loads in separate A/B fixture projects associate with the correct
+    /// session, with the process cwd unchanged throughout.
+    #[tokio::test]
+    async fn interleaved_later_instructions_serve_their_own_session() {
+        async fn run_session(project: &SessionProject, label: &'static str) -> Vec<String> {
+            let ctx = session_tool_ctx(&project.dir);
+            let lua = Lua::new();
+            let handler = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+            // Yield between sessions exactly like concurrent tool calls on
+            // the shared executor.
+            tokio::task::yield_now().await;
+            let (ok, err): (Option<bool>, Option<String>) = lua
+                .load(r#"local ctx = ...; return ctx:load_instructions("sub")"#)
+                .call_async(handler)
+                .await
+                .unwrap();
+            assert_eq!(err, None, "{label}: later discovery must resolve");
+            assert_eq!(ok, Some(true), "{label}: load must answer true");
+            tokio::task::yield_now().await;
+            let blocks = ctx.call_instructions.take();
+            assert!(
+                blocks.iter().any(|block| block.content == project.content),
+                "{label}: must load its own instructions, got {blocks:?}"
+            );
+            blocks.into_iter().map(|block| block.content).collect()
+        }
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = SessionProject::new("session-a-instructions");
+        let project_b = SessionProject::new("session-b-peer-instructions");
+        assert_ne!(project_a.dir, project_b.dir);
+
+        let (contents_a, contents_b) = tokio::join!(
+            run_session(&project_a, "session-a"),
+            run_session(&project_b, "session-b"),
+        );
+        assert!(
+            contents_a.iter().any(|c| c == project_a.content),
+            "session A loads A, got {contents_a:?}"
+        );
+        assert!(
+            contents_b.iter().any(|c| c == project_b.content),
+            "session B loads B, got {contents_b:?}"
+        );
+        assert!(
+            !contents_a.iter().any(|c| c == project_b.content),
+            "session A must not load B's instructions"
+        );
+        assert!(
+            !contents_b.iter().any(|c| c == project_a.content),
+            "session B must not load A's instructions"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "instruction discovery never moves the Maki process cwd"
+        );
+    }
+
+    /// 02.5c attached-agent proof: a child session opened from a parent
+    /// inherits the parent cwd (02.5b propagation), so its later
+    /// `ctx:load_instructions` walks the parent project. Real Lua handler
+    /// path under the child's tool context.
+    #[tokio::test]
+    async fn attached_later_instructions_retain_the_parent_cwd() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project = SessionProject::new("parent-project-instructions");
+        assert_ne!(
+            project.dir,
+            process_cwd.canonicalize().unwrap(),
+            "the fixture must not sit in the process cwd"
+        );
+
+        // The child's tool context carries the parent cwd the way a real
+        // activation builds attached permissions from the parent session
+        // (02.4 carries it, 02.5b resolves it, 02.5c walks instructions).
+        let ctx = session_tool_ctx(&project.dir);
+        let lua = Lua::new();
+        let handler = lua.create_userdata(LuaCtx::handler(&ctx)).unwrap();
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(r#"local ctx = ...; return ctx:load_instructions("sub")"#)
+            .call_async(handler)
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        assert_eq!(ok, Some(true));
+
+        let blocks = ctx.call_instructions.take();
+        assert!(
+            blocks.iter().any(|block| block.content == project.content),
+            "the attached walk must land in the parent project, got {blocks:?}"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "attached discovery never moves the Maki process cwd"
+        );
     }
 }
