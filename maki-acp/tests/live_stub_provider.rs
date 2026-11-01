@@ -13,7 +13,7 @@
 //! - mid-tool cancel of a running `sleep`, with the marker that must never
 //!   appear afterwards;
 //! - a provider refusal/filter code (`content_filter`) reaching ACP
-//!   `refusal` with the verbatim raw reason and `usable: false` (02.7,
+//!   `refusal` with the verbatim raw reason and a reusable handle (02.7,
 //!   live);
 //! - independent release of each session and EOF shutdown of the same PID.
 //!
@@ -773,7 +773,7 @@ async fn two_live_sessions_share_one_pid_with_independent_controls() {
     );
 
     // Phase 2: live refusal on B. The filtered turn carries the verbatim
-    // wire code and no usability; B stays usable for the very next turn.
+    // wire code; the healthy B handle stays usable for the very next turn.
     let refused = live
         .prompt_answer(&session_b, "REFUSAL_PROBE blocked text")
         .await
@@ -785,7 +785,7 @@ async fn two_live_sessions_share_one_pid_with_independent_controls() {
         "content_filter",
         "{refused}"
     );
-    assert_eq!(meta(&refused, "maki.usable"), false, "{refused}");
+    assert_eq!(meta(&refused, "maki.usable"), true, "{refused}");
     assert_eq!(meta(&refused, "maki.turnEpoch"), 1, "{refused}");
     let recovered = live
         .prompt_answer(&session_b, "TEXT_PROBE_B after refusal")

@@ -40,9 +40,9 @@ pub const TURN_EPOCH_META_KEY: &str = "maki.turnEpoch";
 /// provider named one, else the `Done` reason name. Never remapped, so later
 /// slices keep provider semantics without re-parsing display strings.
 pub const RAW_REASON_META_KEY: &str = "maki.rawReason";
-/// `_meta` key carrying task usability on a prompt response: whether the run
-/// banked output the client may build on. Refusals, cancellations and drops
-/// carry none; normal endings and limits do.
+/// `_meta` key carrying runtime usability, not usefulness of the answer.
+/// A refusal can leave a healthy session reusable; a cancelled turn stays
+/// unavailable until cleanup is confirmed.
 pub const USABLE_META_KEY: &str = "maki.usable";
 
 /// Advertise the implemented slice of the extension. The contract names four

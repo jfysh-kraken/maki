@@ -1,6 +1,6 @@
 # Maki multi-session ACP extension (fork contract, slice 02.1)
 
-Status: partially implemented on branch `nori/mvp`. The single-session
+Status: milestone 02 implemented on branch `nori/mvp`. The single-session
 server answered every `_maki/` method with `-32601 Method not found`; slice
 02.2b wired prompt/event routing against this contract, slice 02.3 wired
 `_maki/session/allocate` and `_maki/session/activate` (runtime in
@@ -33,9 +33,8 @@ reporting "unsupported".
 
 Scope: one patched Maki PID owns independent concurrent ACP sessions with
 separate cwd/model/plan context, permission routing and supervised lifecycle.
-Out of scope here: the runtime itself (02.2a onward), model discovery (04.1)
-and owned transcript deletion (05.2); both reserve names below and nothing
-else.
+Model discovery (04.1) and owned transcript deletion (05.2) reserve names below
+but are not implemented by milestone 02.
 
 ## Capability advertisement
 
@@ -143,10 +142,9 @@ is up. Unknown `sessionId` answers `resource_not_found` (`-32002`) with
 
 ### `_maki/session/cancel`
 
-Addressed cancel: session-scoped, optionally turn-pinned. This replaces the
-unaddressed `session/cancel` notification for fork clients; the standard
-notification is retained and applies to the most recently activated session,
-documented as best-effort legacy behavior.
+Addressed cancel: session-scoped, optionally turn-pinned. The standard
+`session/cancel` notification also addresses its explicit `sessionId`; it is
+retained as best-effort legacy behavior without a correlated result.
 
 Request params:
 
@@ -306,7 +304,8 @@ so when the run ends its blocking tools ended with it.
   "sessionId": ..., "uncertain": false}` before anything is queued; the peer
   is untouched. Runtime usability is the send itself: a dead run reports
   "session ended" instead of queueing onto it.
-- The cancelled run's `Done` terminal (whatever its reason) confirms cleanup:
+- The cancelled run's `Done` terminal (whatever its reason) confirms cleanup,
+  provided the cleanup grace has not elapsed and no failure was recorded:
   the run ended, so in blocking mode its tools stopped with it. The terminal
   answers nothing — the prompt already settled — and reopens the session for
   exactly one new turn. A duplicate terminal afterwards confirms nothing and
@@ -317,8 +316,8 @@ so when the run ends its blocking tools ended with it.
   `"uncertain": true`. Uncertainty never self-heals into retry.
 - Bounded wait: a cancelled run that reports no terminal within 30 seconds
   (held cleanup) flips the rejection to `"uncertain": true`. Overdue is a
-  report, not a verdict — a late terminal still confirms — and the session
-  stays non-resumable either way.
+  sticky uncertainty: a late terminal cannot reopen that handle. Detached-mode
+  terminals cannot confirm blocking-tool cleanup and never reopen it either.
 - Late answers for the cancelled turn's retired asks are rejected by the same
   epoch check as ever (stale-turn and cross-session answers never apply), so
   they cannot affect the replacement turn; the replacement's own terminal
@@ -381,14 +380,14 @@ itself only matches ids and epochs.
 - 05.2 owned transcript deletion: capability `_meta["maki.ownedDeletion"]`,
   method `_maki/session/delete`. Probing it today answers `-32601`.
 
-## Deferred to later slices
+## Implementation boundary
 
  02.2a registry/ownership, 02.2b routing, 02.3 allocation-vs-activation
   ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
   02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
   cancellation, 02.9b cleanup confirmation and retry, 02.10a task/pump
  supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance. Of the
- above, slices through 02.10b are implemented (only the reserved 04.1/05.2
+ above, slices through 02.11 are implemented (only the reserved 04.1/05.2
  names still answer `-32601`); the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

@@ -289,9 +289,10 @@ pub(crate) fn adopt_session(
 }
 
 impl Upstream {
-    fn send(&self, envelope: Envelope) {
+    fn send(&self, mut envelope: Envelope) {
         match self {
             Self::Parent { tx, .. } => {
+                envelope.run_id = tx.run_id();
                 let _ = tx.send_envelope(envelope);
             }
             Self::Chat {

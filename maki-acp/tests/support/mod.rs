@@ -717,8 +717,24 @@ impl SharedSessions {
         child.initialize().await?;
         let cwd_a = projects.a.to_string_lossy().into_owned();
         let cwd_b = projects.b.to_string_lossy().into_owned();
-        let a = child.session_new(&cwd_a).await?;
-        let b = child.session_new(&cwd_b).await?;
+        let mut ids = Vec::new();
+        for cwd in [&cwd_a, &cwd_b] {
+            let allocation = child.allocate_raw(cwd).await?;
+            let id = allocation["result"]["sessionId"]
+                .as_str()
+                .ok_or_else(|| io::Error::other(format!("allocation failed: {allocation}")))?
+                .to_owned();
+            let output = PathBuf::from(cwd).join("result.md");
+            let activation = child
+                .activate_raw(&id, MODEL_SPEC, "build", cwd, &output.to_string_lossy())
+                .await?;
+            if activation.get("error").is_some() {
+                return Err(io::Error::other(format!("activation failed: {activation}")));
+            }
+            ids.push(id);
+        }
+        let b = ids.pop().unwrap();
+        let a = ids.pop().unwrap();
         assert_ne!(a, b, "two sessions must hold distinct ids");
         Ok(Self {
             child,

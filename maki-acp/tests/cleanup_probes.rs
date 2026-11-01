@@ -72,6 +72,7 @@ fn spawn_grouped(argv0: &str, args: &[&str]) -> tokio::process::Child {
         });
     }
     tokio::process::Command::from(std_cmd)
+        .kill_on_drop(true)
         .spawn()
         .unwrap_or_else(|e| panic!("cannot spawn {argv0} for the cleanup probe: {e}"))
 }
@@ -102,11 +103,23 @@ async fn process_group_kill_reaps_a_grouped_child() {
 async fn a_setsid_escaped_grandchild_survives_the_group_kill() {
     let dir = tempfile::TempDir::new().expect("a probe scratch dir");
     let pidfile = dir.path().join("escaped.pid");
-    let script = format!(
-        "setsid sh -c 'echo $$; exec sleep 60' > {} ; wait",
-        pidfile.display()
-    );
-    let child = spawn_grouped("sh", &["-c", &script]);
+    let executable = std::env::current_exe().unwrap();
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["--ignored", "--exact", "escaped_child_helper"])
+        .env("MAKI_ESCAPE_PIDFILE", &pidfile)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    let child = tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     let pid = child.id().expect("a spawned shell has a pid");
 
     let escaped = {
@@ -141,4 +154,23 @@ async fn a_setsid_escaped_grandchild_survives_the_group_kill() {
     // Hygiene by direct pid: precise, and proves nothing about groups.
     kill_process(raw(escaped).expect("a live pid"), Signal::KILL).expect("kill the escapee");
     wait_for_death(escaped, "direct-killed escapee").await;
+}
+
+#[test]
+#[ignore = "subprocess helper for the escaped-child probe"]
+fn escaped_child_helper() {
+    let Some(path) = std::env::var_os("MAKI_ESCAPE_PIDFILE") else {
+        return;
+    };
+    let mut command = std::process::Command::new("sleep");
+    command.arg("60");
+    unsafe {
+        command.pre_exec(|| {
+            setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    std::fs::write(path, child.id().to_string()).unwrap();
+    let _ = child.wait();
 }

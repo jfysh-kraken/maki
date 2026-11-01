@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use agent_client_protocol_schema::v1::{
     AgentNotification, AgentRequest, AgentResponse, CancelNotification, ConfigOptionUpdate,
-    ContentBlock, EmbeddedResourceResource, Error as AcpError, ImageContent, InitializeRequest,
-    JsonRpcMessage, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, McpServer,
-    NewSessionRequest, Notification, PromptRequest, PromptResponse, Request, RequestId,
-    RequestPermissionRequest, RequestPermissionResponse, Response, SessionId, SessionInfo,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TextContent,
+    ContentBlock, CurrentModeUpdate, EmbeddedResourceResource, Error as AcpError, ImageContent,
+    InitializeRequest, JsonRpcMessage, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, McpServer, NewSessionRequest, Notification, PromptRequest, PromptResponse,
+    Request, RequestId, RequestPermissionRequest, RequestPermissionResponse, Response,
+    SessionConfigOptionValue, SessionId, SessionInfo, SessionModeId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
 use flume::{Sender, WeakSender};
@@ -98,6 +99,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(8);
 /// issued it; unknown, repeated, late, stale-turn and cross-session answers
 /// are dropped at routing, never applied.
 struct Pending {
+    next_run: u64,
+    active_run: Option<u64>,
+    cleanup_run: Option<u64>,
     prompt: Option<RequestId>,
     /// Epoch the outstanding prompt runs under. `None` while idle; a terminal
     /// with no turn outstanding settles nothing and is dropped.
@@ -151,6 +155,9 @@ impl Default for Pending {
     /// settling terminal retires every outstanding ask.
     fn default() -> Self {
         Self {
+            next_run: 0,
+            active_run: None,
+            cleanup_run: None,
             prompt: None,
             turn: None,
             epoch: TurnEpoch::default(),
@@ -281,6 +288,7 @@ impl Pending {
         self.awaiting_cleanup = false;
         self.cleanup_uncertain = false;
         self.awaiting_since = None;
+        self.cleanup_run = None;
     }
 
     /// 02.9b pump observation of the cancelled run's terminal, after
@@ -293,7 +301,11 @@ impl Pending {
     /// can never reopen a session or revive a failed one. Nothing is answered
     /// here: the prompt already settled through `settle_cancel`.
     fn note_run_ended(&mut self, failed: bool) {
-        if !self.awaiting_cleanup {
+        if !self.awaiting_cleanup
+            || !self.blocking
+            || self.cleanup_uncertain
+            || self.cleanup_overdue()
+        {
             return;
         }
         if failed {
@@ -358,6 +370,7 @@ impl Pending {
         self.turn = None;
         if live {
             self.asks.clear();
+            self.cleanup_run = self.active_run.take();
             self.awaiting_cleanup = true;
             self.awaiting_since = Some(Instant::now());
             CancelSettlement {
@@ -869,8 +882,8 @@ async fn handle_request(
             Ok(()) => return,
             Err(e) => Err(e),
         },
-        "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_mode" => configure_standard_session(srv, raw, params, true),
+        "session/set_config_option" => configure_standard_session(srv, raw, params, false),
         // Reserved 04.1/05.2 names keep answering -32601 through the
         // catch-all below.
         _ => Err(AcpError::method_not_found()),
@@ -1508,6 +1521,7 @@ async fn run_release(out_tx: Sender<Value>, records: ReleaseRecords, job: Releas
         .prior_loss
         .as_ref()
         .map(|(reason, raw)| (reason.as_str(), raw.as_str()));
+    drop(runtime.claim);
     match &failure {
         None => {
             info!(session = %key, epoch = prologue.epoch, "session released");
@@ -1611,7 +1625,8 @@ fn handle_cancel(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
     }
     // The pin is checked before anything moves: a stale cancel changes
     // nothing — no signal, no bump, no settlement.
-    let current = session.pending.lock().unwrap().epoch.current();
+    let mut guard = session.pending.lock().unwrap();
+    let current = guard.epoch.current();
     if let Some(got) = req.turn_epoch
         && got != current
     {
@@ -1620,7 +1635,8 @@ fn handle_cancel(srv: &Server, raw: &Value) -> Result<Value, AcpError> {
             "gotEpoch": got,
         })));
     }
-    let settlement = session.pending.lock().unwrap().settle_cancel();
+    let settlement = guard.settle_cancel();
+    drop(guard);
     // Only a settled turn names a run to stop. An idle cancel leaves the
     // channel alone: a queued signal would be consumed by the next turn's
     // stop task and cancel work the client never asked to stop.
@@ -1879,7 +1895,10 @@ fn start_session(
 /// requested model directly instead of starting a default session and
 /// switching it.
 fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
-    let pending = PendingState::default();
+    let pending = Arc::new(Mutex::new(Pending {
+        blocking: !ctx.background,
+        ..Pending::default()
+    }));
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
     // plain text instead.
@@ -1937,10 +1956,6 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
     // reports a silently-exited or panicked pump as `pump_dead`. Both run off
     // the shared routing loop and touch only this session, so peers stay
     // usable through a sibling's loss.
-    let pending = Arc::new(Mutex::new(Pending {
-        blocking: !ctx.background,
-        ..Pending::default()
-    }));
     let live_tx = handle.input_tx.clone();
     let is_live: Liveness = Arc::new(move || !live_tx.is_disconnected());
     let (pump_done_tx, pump_done_rx) = flume::bounded::<()>(1);
@@ -1993,7 +2008,15 @@ fn ask_client(
     request: AgentRequest,
 ) -> i64 {
     let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    pending.lock().unwrap().asks.insert(id, ask);
+    let mut guard = pending.lock().unwrap();
+    if guard.is_lost()
+        || guard.is_released()
+        || (guard.next_run > 0
+            && (!guard.is_resumable() || guard.epoch.check(ask.epoch()).is_err()))
+    {
+        return id;
+    }
+    guard.asks.insert(id, ask);
     send(
         out_tx,
         Request {
@@ -2309,6 +2332,12 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // Non-blocking and peer-free: one lock plus at most two wire sends for
     // this session only. The claim stays held for 02.10b's bounded release.
     let mut pending = session.pending.lock().unwrap();
+    if !pending.is_resumable() {
+        return Err(cleanup_unconfirmed(
+            &req.session_id.0,
+            pending.is_uncertain(),
+        ));
+    }
     if pending.prompt.is_some() {
         return Err(AcpError::new(-32603, "a prompt is already running"));
     }
@@ -2326,6 +2355,8 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         });
     }
     pending.turn = Some(pending.epoch.current());
+    pending.active_run = Some(pending.next_run);
+    pending.next_run += 1;
     pending.prompt = Some(id.clone());
     Ok(())
 }
@@ -2340,6 +2371,73 @@ fn fixed_at_activation() -> AcpError {
     AcpError::invalid_params().data(serde_json::json!({
         "reason": extension::FIXED_AT_ACTIVATION_REASON,
     }))
+}
+
+fn configure_standard_session(
+    srv: &mut Server,
+    raw: &Value,
+    params: &AcpParams,
+    mode: bool,
+) -> Result<AgentResponse, AcpError> {
+    let sid = if mode {
+        parse_params::<SetSessionModeRequest>(raw)?.session_id
+    } else {
+        parse_params::<SetSessionConfigOptionRequest>(raw)?.session_id
+    };
+    if srv
+        .session(&sid)
+        .is_ok_and(|session| session.output.is_none())
+    {
+        let session = srv.sessions.get_mut(&*sid.0).expect("session was found");
+        if session.pending.lock().unwrap().is_lost() {
+            return Err(unknown_session(&sid.0));
+        }
+        if mode {
+            let req: SetSessionModeRequest = parse_params(raw)?;
+            let name = req.mode_id.0.to_string();
+            let selected = methods::mode_id_to_agent_mode(&name)
+                .ok_or_else(|| AcpError::invalid_params().data(json_str(&"unknown mode")))?;
+            session.handle.switch_mode(selected.clone());
+            session.current_mode = selected;
+            let epoch = session.pending.lock().unwrap().epoch.current();
+            session_update(
+                &srv.out_tx,
+                &sid,
+                epoch,
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(name))),
+            );
+            return Ok(AgentResponse::SetSessionModeResponse(
+                SetSessionModeResponse::new(),
+            ));
+        }
+        let req: SetSessionConfigOptionRequest = parse_params(raw)?;
+        if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
+            return Err(AcpError::invalid_params().data(json_str(&"unknown config option")));
+        }
+        let SessionConfigOptionValue::ValueId { value } = req.value else {
+            return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
+        };
+        let spec = value.0.to_string();
+        let selected = Model::from_spec_with_policy(&spec, &params.model_policy)
+            .map_err(|error| AcpError::invalid_params().data(json_str(&error)))?;
+        session
+            .handle
+            .model_tx
+            .send(selected)
+            .map_err(|_| AcpError::new(-32603, "session ended"))?;
+        session.current_model = spec.clone();
+        return Ok(AgentResponse::SetSessionConfigOptionResponse(
+            SetSessionConfigOptionResponse::new(vec![methods::model_config_option(
+                &spec,
+                &srv.model_specs,
+            )]),
+        ));
+    }
+    if mode {
+        handle_set_mode(srv, raw)
+    } else {
+        handle_set_config(srv, raw)
+    }
 }
 
 fn handle_set_mode(srv: &Server, raw: &Value) -> Result<AgentResponse, AcpError> {
@@ -2581,9 +2679,29 @@ fn start_event_pump(
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
         while let Some(Envelope {
-            event, subagent, ..
+            event,
+            subagent,
+            run_id,
         }) = events.next().await
         {
+            let event_epoch = {
+                let guard = pending.lock().unwrap();
+                if guard.is_released() || guard.is_lost() {
+                    continue;
+                }
+                if guard.next_run > 0
+                    && guard.active_run != Some(run_id)
+                    && !(guard.awaiting_cleanup && guard.cleanup_run == Some(run_id))
+                {
+                    continue;
+                }
+                if guard.awaiting_cleanup
+                    && !matches!(event, AgentEvent::Done { .. } | AgentEvent::Error { .. })
+                {
+                    continue;
+                }
+                guard.epoch.current()
+            };
             // A subagent's turn spends session money even though its events
             // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
@@ -2636,7 +2754,7 @@ fn start_event_pump(
                     // The ask carries the session and turn that issued it, so the
                     // answer can be gated on the live epoch on the way back;
                     // the frame carries the turn for request/turn correlation.
-                    let epoch = pending.lock().unwrap().epoch.current();
+                    let epoch = event_epoch;
                     let request = AgentRequest::RequestPermissionRequest(
                         RequestPermissionRequest::new(
                             sid.clone(),
@@ -2690,14 +2808,14 @@ fn start_event_pump(
                 } => {
                     cost.settle(ledger);
                     tool_inputs.clear();
-                    if let Some((id, turn)) = settle_prompt(&pending) {
+                    if let Some((id, turn)) = settle_run(&pending, run_id) {
                         // The standard `stopReason` keeps its standard value;
                         // the verbatim wire code (or the `Done` name for
                         // agent-side endings) and task usability ride along as
                         // additive `_meta`, never remapped.
                         let raw = raw_stop_reason.unwrap_or_else(|| reason.to_string());
                         let resp = PromptResponse::new(translate::map_done_reason(reason))
-                            .meta(extension::terminal_meta(turn, &raw, reason.usable()));
+                            .meta(extension::terminal_meta(turn, &raw, is_live()));
                         send(
                             &out_tx,
                             Response::<AgentResponse>::new(
@@ -2714,7 +2832,10 @@ fn start_event_pump(
                         // tools stopped and reopens the session for exactly
                         // one new turn. Nothing is answered: the prompt
                         // already settled through `settle_cancel`.
-                        pending.lock().unwrap().note_run_ended(false);
+                        let mut guard = pending.lock().unwrap();
+                        if guard.next_run == 0 || guard.cleanup_run == Some(run_id) {
+                            guard.note_run_ended(false);
+                        }
                     }
                     continue;
                 }
@@ -2740,7 +2861,7 @@ fn start_event_pump(
                         report_loss(&pending, &out_tx, &session_key, &message);
                         continue;
                     }
-                    if let Some((id, _turn)) = settle_prompt(&pending) {
+                    if let Some((id, _turn)) = settle_run(&pending, run_id) {
                         let error = if auth {
                             AcpError::auth_required()
                         } else {
@@ -2756,14 +2877,19 @@ fn start_event_pump(
                         // rejection reports it. (Task/pump loss itself is
                         // 02.10a's; this arm only records the failed cleanup
                         // when the handle is still proved live.)
-                        pending.lock().unwrap().note_run_ended(true);
+                        let mut guard = pending.lock().unwrap();
+                        if guard.next_run == 0 || guard.cleanup_run == Some(run_id) {
+                            guard.note_run_ended(true);
+                        }
                     }
                     continue;
                 }
                 _ => continue,
             };
-            let epoch = pending.lock().unwrap().epoch.current();
-            session_update(&out_tx, &sid, epoch, update);
+            let guard = pending.lock().unwrap();
+            if !guard.is_lost() && !guard.is_released() && guard.epoch.check(event_epoch).is_ok() {
+                session_update(&out_tx, &sid, event_epoch, update);
+            }
         }
         // 02.10a: the event stream ends only when the task drops its guard
         // (return, panic, or provider-init failure that already sent its
@@ -2820,8 +2946,21 @@ fn start_loss_supervisor(
 /// run is stopped, so nothing outlives a cancelled turn); retirement on the
 /// handle-loss path is 02.10a's (`settle_loss`, both modes: the handle is
 /// dead, so nothing can outlive it).
+#[cfg(test)]
 fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let mut guard = pending.lock().unwrap();
+    settle_locked_prompt(&mut guard)
+}
+
+fn settle_run(pending: &PendingState, run_id: u64) -> Option<(RequestId, u64)> {
+    let mut guard = pending.lock().unwrap();
+    if guard.next_run > 0 && guard.active_run != Some(run_id) {
+        return None;
+    }
+    settle_locked_prompt(&mut guard)
+}
+
+fn settle_locked_prompt(guard: &mut Pending) -> Option<(RequestId, u64)> {
     let live = match (&guard.prompt, guard.turn) {
         (Some(_), Some(turn)) => guard.epoch.check(turn).is_ok(),
         _ => false,
@@ -2832,6 +2971,7 @@ fn settle_prompt(pending: &PendingState) -> Option<(RequestId, u64)> {
     let turn = guard.epoch.current();
     guard.epoch.bump();
     guard.turn = None;
+    guard.active_run = None;
     if guard.blocking {
         guard.asks.clear();
     }
@@ -3967,8 +4107,8 @@ mod tests {
         );
         assert_eq!(
             answer["result"]["_meta"][extension::USABLE_META_KEY],
-            false,
-            "a refusal banks no usable output: {answer}"
+            true,
+            "a refusal does not kill the session handle: {answer}"
         );
         assert!(pending(&srv).lock().unwrap().prompt.is_none());
         assert_eq!(live_epoch(&srv), 1, "one settlement bumps once");
@@ -5176,8 +5316,7 @@ mod tests {
 
     /// 02.9b held cleanup: with no terminal from the cancelled run the
     /// session stays non-resumable, the rejection reports the uncertainty
-    /// explicitly once the bounded wait lapses, and B stays responsive. A
-    /// late terminal still confirms: overdue is a report, not a verdict.
+    /// explicitly once the bounded wait lapses, and B stays responsive.
     #[tokio::test]
     async fn held_cleanup_prevents_retry_reports_uncertainty_and_leaves_the_peer_alive() {
         let (mut srv, _answer_rx, _out_rx) = test_server();
@@ -5259,14 +5398,13 @@ mod tests {
             "held cleanup reports uncertainty, still non-resumable"
         );
 
-        // A late terminal still confirms: the run ended, so in blocking mode
-        // its tools stopped with it — overdue never hardens into failure.
+        // Once cleanup is uncertain, a late terminal cannot reopen the handle.
         drive_runtime(&srv, &key_a, |sender| {
             sender.send(cancelled_done_event()).unwrap();
         })
         .await;
         assert!(
-            srv.sessions
+            !srv.sessions
                 .get(&key_a)
                 .unwrap()
                 .pending
@@ -5279,7 +5417,7 @@ mod tests {
             &prompt_request(&key_a, "late but confirmed"),
             &RequestId::Number(12),
         )
-        .expect("a late terminal confirms the held cleanup");
+        .expect_err("uncertainty stays non-resumable after a late terminal");
     }
 
     /// 02.9b failed cleanup: an `Error` terminal from the cancelled run is
@@ -6182,6 +6320,121 @@ mod tests {
                 "prompt": [{ "type": "text", "text": text }],
             }
         })
+    }
+
+    #[tokio::test]
+    async fn old_run_events_cannot_settle_or_authorize_a_replacement_turn() {
+        let (mut srv, key, _inputs, out_rx) = server_with_live_input();
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "first"),
+            &RequestId::Number(7),
+        )
+        .unwrap();
+        run_pump(&srv, None, |sender| {
+            sender.send(done_event()).unwrap();
+        })
+        .await;
+        assert_eq!(out_rx.try_recv().unwrap()["id"], 7);
+        handle_prompt(
+            &mut srv,
+            &prompt_request(&key, "second"),
+            &RequestId::Number(8),
+        )
+        .unwrap();
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: "stale".into(),
+                })
+                .unwrap();
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+            sender.send(done_event()).unwrap();
+            sender
+                .with_run_id(1)
+                .send(AgentEvent::TextDelta {
+                    text: "current".into(),
+                })
+                .unwrap();
+            sender.with_run_id(1).send(done_event()).unwrap();
+        })
+        .await;
+        let frames: Vec<_> = out_rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0]["params"]["update"]["content"]["text"], "current");
+        assert_eq!(frames[1]["id"], 8);
+        assert!(pending(&srv).lock().unwrap().asks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn question_tool_uses_the_runtime_pending_map() {
+        let (srv, answer_rx, out_rx) = test_server();
+        let session = only(&srv);
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+        ctx.session_id = Some(session.handle.session_id.clone());
+        ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
+        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&session.pending));
+        let question = (tool.handler)(
+            serde_json::json!({"questions": [{
+                "question": "Which?", "header": "Choice", "options": [
+                    {"label": "A", "description": "first"}, {"label": "B", "description": "second"}
+                ]
+            }]}),
+            ctx,
+        );
+        let answer = async {
+            let frame = out_rx.recv_async().await.unwrap();
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({
+                    "id": frame["id"], "result": {"action": "accept", "content": {"q1": "A"}}
+                }),
+            );
+        };
+        let (result, ()) = timeout(STDIN_DEADLOCK_TIMEOUT, async {
+            tokio::join!(question, answer)
+        })
+        .await
+        .expect("a question answer must not hang");
+        assert!(result.is_ok());
+        assert!(pending(&srv).lock().unwrap().asks.is_empty());
+    }
+
+    #[test]
+    fn failed_or_detached_cleanup_never_reopens_on_a_late_done() {
+        for blocking in [true, false] {
+            let mut pending = Pending {
+                awaiting_cleanup: true,
+                blocking,
+                ..Pending::default()
+            };
+            pending.note_run_ended(true);
+            pending.note_run_ended(false);
+            assert!(!pending.is_resumable());
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_session_setup_changes_reach_the_addressed_handle() {
+        let (mut srv, key, _inputs, out_rx) = server_with_live_input();
+        let (mode_tx, mode_rx) = flume::unbounded();
+        let (model_tx, model_rx) = flume::unbounded();
+        let session = srv.sessions.get_mut(&key).unwrap();
+        session.handle.mode_tx = mode_tx;
+        session.handle.model_tx = model_tx;
+        let state = TempDir::new().unwrap();
+        let params = acp_params(StateDir::from_path(state.path().to_path_buf()));
+        configure_standard_session(&mut srv, &mode_request(&key, "plan"), &params, true).unwrap();
+        assert!(matches!(mode_rx.try_recv().unwrap(), AgentMode::Plan(_)));
+        assert_eq!(out_rx.try_recv().unwrap()["params"]["sessionId"], key);
+        configure_standard_session(&mut srv, &config_request(&key), &params, false).unwrap();
+        assert_eq!(model_rx.try_recv().unwrap().spec(), OFFLINE_SPEC);
+        srv.sessions.get_mut(&key).unwrap().output = Some(PathBuf::from("/plan.md"));
+        assert!(
+            configure_standard_session(&mut srv, &mode_request(&key, "build"), &params, true)
+                .is_err()
+        );
+        assert!(mode_rx.is_empty());
     }
 
     fn mode_request(session: &str, mode: &str) -> Value {

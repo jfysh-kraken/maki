@@ -2603,10 +2603,11 @@ maki.api.register_tool({{
 
 #[test]
 fn nested_load_instructions_surface_once_on_model_call() {
-    // `find_subdirectory_instructions` only walks directories under cwd.
+    let session_cwd = std::env::current_dir().unwrap();
+    // `find_subdirectory_instructions` only walks directories under the session cwd.
     let sub = tempfile::Builder::new()
         .prefix(".load-instructions-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(&session_cwd)
         .unwrap();
     std::fs::write(sub.path().join("AGENTS.md"), INSTRUCTION_CONTENT).unwrap();
 
@@ -2638,6 +2639,7 @@ maki.api.register_tool({{
     );
     host.load_source("load_instructions", &src).unwrap();
     let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.cwd = session_cwd;
     ctx.registry = Arc::clone(&reg);
     let dispatch = || {
         runtime().block_on(maki_agent::agent::tool_dispatch::run(
