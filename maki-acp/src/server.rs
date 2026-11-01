@@ -878,6 +878,13 @@ async fn handle_request(
         srv.respond_value(id, Ok(methods::model_list_result(&models)));
         return;
     }
+    if method == extension::OWNED_DELETION_METHOD {
+        // 05.2 owned transcript deletion: in-process only, strictly the
+        // addressed transcript, under a protected exclusive claim.
+        let result = handle_delete(srv, raw, &params.storage);
+        srv.respond_value(id, result);
+        return;
+    }
     let result = match method {
         "initialize" => {
             srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
@@ -895,8 +902,7 @@ async fn handle_request(
         },
         "session/set_mode" => configure_standard_session(srv, raw, params, true),
         "session/set_config_option" => configure_standard_session(srv, raw, params, false),
-        // Reserved 05.2 names keep answering -32601 through the
-        // catch-all below.
+        // Unlisted methods answer -32601 through the catch-all below.
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -1593,6 +1599,102 @@ async fn run_release(out_tx: Sender<Value>, records: ReleaseRecords, job: Releas
         },
     );
     // `runtime` — and the storage claim it holds — drops here.
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+/// 05.2 owned transcript deletion: in-process, strictly the addressed
+/// transcript, under a protected exclusive claim held through the delete.
+///
+/// - A live routing entry in this process (allocation, activating startup,
+///   active runtime, or in-flight release) owns the transcript elsewhere:
+///   answers `{status: busy}` without touching the filesystem, so a resumed
+///   session is never deleted.
+/// - Otherwise [`SessionClaim::acquire_strict_in`] takes the exclusive claim:
+///   held lock reports `busy`, any locking I/O error reports `error`. The
+///   unprotected [`SessionClaim::acquire_in`] fallback is never used here,
+///   and neither a lock probe nor force removal substitutes.
+/// - A missing transcript is idempotent success (`absent`); a removed one is
+///   `deleted`. Primary-delete failures report `error` and stay retryable.
+///   Auxiliary archive/task-log sweep warnings stay in `detail`/stderr and
+///   never flip the primary status.
+fn handle_delete(srv: &Server, raw: &Value, storage: &StateDir) -> Result<Value, AcpError> {
+    let req: DeleteParams = parse_params(raw)?;
+    let id: MakiId = req.session_id.parse().map_err(|_| {
+        AcpError::invalid_params().data(serde_json::json!({"sessionId": req.session_id}))
+    })?;
+    if srv.allocations.contains_key(&req.session_id)
+        || srv.activating.contains_key(&req.session_id)
+        || srv.sessions.contains_key(&req.session_id)
+    {
+        return Ok(methods::delete_result(
+            &req.session_id,
+            "busy",
+            "session is live in this process",
+        ));
+    }
+    if matches!(
+        srv.release_records.lock().unwrap().get(&req.session_id),
+        Some(ReleaseRecord::InFlight { .. })
+    ) {
+        return Ok(methods::delete_result(
+            &req.session_id,
+            "busy",
+            "session release is in flight",
+        ));
+    }
+    let sessions_dir = storage
+        .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+        .map_err(|error| {
+            AcpError::internal_error().data(serde_json::json!({
+                "sessionId": req.session_id,
+                "reason": error.to_string(),
+            }))
+        })?;
+    let claim = match SessionClaim::acquire_strict_in(id, &sessions_dir) {
+        Ok(claim) => claim,
+        Err(SessionError::Busy { .. }) => {
+            return Ok(methods::delete_result(
+                &req.session_id,
+                "busy",
+                "session is held by another process",
+            ));
+        }
+        Err(error) => {
+            return Ok(methods::delete_result(
+                &req.session_id,
+                "error",
+                &format!("strict claim failed: {error}"),
+            ));
+        }
+    };
+    // The claim is held across the delete: no probe, no force path.
+    match StoredSession::delete(&claim, storage) {
+        Ok(()) => Ok(methods::delete_result(
+            &req.session_id,
+            "deleted",
+            "transcript deleted",
+        )),
+        Err(error) if error.is_not_found() => Ok(methods::delete_result(
+            &req.session_id,
+            "absent",
+            "no transcript for session",
+        )),
+        Err(SessionError::Busy { .. }) => Ok(methods::delete_result(
+            &req.session_id,
+            "busy",
+            "session is held by another process",
+        )),
+        Err(error) => Ok(methods::delete_result(
+            &req.session_id,
+            "error",
+            &format!("delete failed: {error}"),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -8010,6 +8112,150 @@ mod tests {
                 .code,
             AcpError::resource_not_found(None).code
         );
+    }
+
+    fn delete_request(session: &str) -> Value {
+        serde_json::json!({ "params": { "sessionId": session } })
+    }
+
+    fn stored_session_with_transcript(storage: &StateDir) -> MakiId {
+        let mut stored: Session<Message, TokenUsage, maki_agent::ToolOutput> =
+            Session::new(SELECTED_SPEC, "/project");
+        let id = stored.id;
+        let claim = SessionClaim::acquire(id, storage).expect("free id claims");
+        stored.save(&claim, storage).expect("transcript writes");
+        id
+    }
+
+    /// 05.2: deleting a tracked transcript removes it; a repeat is idempotent
+    /// absent. No live runtime, no peer, and no second transcript is touched.
+    #[test]
+    fn owned_delete_removes_the_tracked_transcript_idempotently() {
+        let harness = StarterHarness::default();
+        let (srv, _, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let id = stored_session_with_transcript(&storage);
+        let peer = stored_session_with_transcript(&storage);
+        let raw = delete_request(&id.to_string());
+
+        let first = handle_delete(&srv, &raw, &storage).expect("delete answers");
+        assert_eq!(first["status"], "deleted");
+        assert_eq!(first["sessionId"], id.to_string());
+
+        let sessions_dir = storage
+            .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+            .unwrap();
+        assert!(
+            maki_storage::sessions::Session::<
+                Message,
+                TokenUsage,
+                maki_agent::ToolOutput,
+            >::load_from(id, &sessions_dir)
+            .is_err(),
+            "deleted transcript stays gone"
+        );
+        assert!(
+            maki_storage::sessions::Session::<
+                Message,
+                TokenUsage,
+                maki_agent::ToolOutput,
+            >::load_from(peer, &sessions_dir)
+            .is_ok(),
+            "peer transcript survives"
+        );
+
+        let repeat = handle_delete(&srv, &delete_request(&id.to_string()), &storage)
+            .expect("repeat answers");
+        assert_eq!(repeat["status"], "absent");
+    }
+
+    /// 05.2: absent is idempotent success, malformed ids are invalid params.
+    #[test]
+    fn owned_delete_absent_and_malformed_ids() {
+        let harness = StarterHarness::default();
+        let (srv, _, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let absent = handle_delete(
+            &srv,
+            &delete_request(&MakiId::generate().to_string()),
+            &storage,
+        )
+        .expect("absent answers");
+        assert_eq!(absent["status"], "absent");
+
+        let malformed = handle_delete(&srv, &delete_request("not-an-id"), &storage).unwrap_err();
+        assert_eq!(
+            malformed.code,
+            AcpError::invalid_params().code,
+            "unparsable id rejects before touching storage"
+        );
+    }
+
+    /// 05.2: a live routing entry owns the transcript elsewhere: busy keeps
+    /// the transcript and never deletes through a probe or force path.
+    #[tokio::test]
+    async fn owned_delete_busy_while_live_or_held() {
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let params = acp_params(storage.clone());
+        let project = TempDir::new().unwrap();
+
+        // Live allocation lease in this process.
+        let live = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let busy_live =
+            handle_delete(&srv, &delete_request(&live), &storage).expect("busy answers");
+        assert_eq!(busy_live["status"], "busy");
+
+        // Held by another claim (another process): transcript survives.
+        let id = stored_session_with_transcript(&storage);
+        let sessions_dir = storage
+            .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+            .unwrap();
+        let _held =
+            SessionClaim::acquire_in(id, &sessions_dir).expect("another holder takes the claim");
+        let busy_held = handle_delete(&srv, &delete_request(&id.to_string()), &storage)
+            .expect("held answers busy");
+        assert_eq!(busy_held["status"], "busy");
+        assert!(
+            maki_storage::sessions::Session::<
+                Message,
+                TokenUsage,
+                maki_agent::ToolOutput,
+            >::load_from(id, &sessions_dir)
+            .is_ok(),
+            "held transcript is never deleted"
+        );
+    }
+
+    /// 05.2: a locking I/O error reports `error`, never an unprotected
+    /// delete. The transcript (or its absence) is unchanged and retryable.
+    #[test]
+    fn owned_delete_locking_io_reports_error_without_deleting() {
+        let harness = StarterHarness::default();
+        let (srv, _, _, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let sessions_dir = storage
+            .ensure_subdir(maki_storage::sessions::SESSIONS_DIR)
+            .unwrap();
+        std::fs::write(sessions_dir.join("locks"), b"not a directory").unwrap();
+        let id = MakiId::generate();
+
+        let result = handle_delete(&srv, &delete_request(&id.to_string()), &storage)
+            .expect("I/O failure answers with error status");
+        assert_eq!(result["status"], "error");
     }
 
     /// 02.10b helpers: a release request plus the deferred-outcome collector.

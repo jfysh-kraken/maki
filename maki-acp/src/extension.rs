@@ -30,10 +30,14 @@ pub const MODEL_DISCOVERY_PREFIX: &str = "_maki/model/";
 pub const MODEL_LIST_METHOD: &str = "_maki/model/list_models";
 /// Informational discovery capability version. Clients MUST NOT gate on it.
 pub const MODEL_DISCOVERY_VERSION: u32 = 1;
-/// Capability key 05.2 owned transcript deletion will advertise. Named only.
+/// Capability key 05.2 owned transcript deletion advertises. Present exactly
+/// while `_maki/session/delete` answers (it does, in process).
 pub const OWNED_DELETION_CAPABILITY: &str = "maki.ownedDeletion";
-/// Method 05.2 owned transcript deletion will own. Named only.
+/// Method 05.2 owned transcript deletion owns. In-process only: no second
+/// process, no global sweep, only the addressed transcript.
 pub const OWNED_DELETION_METHOD: &str = "_maki/session/delete";
+/// Informational deletion capability version. Clients MUST NOT gate on it.
+pub const OWNED_DELETION_VERSION: u32 = 1;
 /// `data.reason` answering a post-activation model/mode change. Setup is
 /// fixed per session; the client starts another session for a new setup.
 pub const FIXED_AT_ACTIVATION_REASON: &str = "fixed_at_activation";
@@ -56,9 +60,10 @@ pub const USABLE_META_KEY: &str = "maki.usable";
 /// 02.3 implements allocate and activate, 02.9a adds addressed cancel, and
 /// 02.10b adds bounded active-session release. 04.1a adds a second capability
 /// key (`maki.modelDiscovery`) for model discovery, advertised only because
-/// its method answers. Clients MUST probe any method they intend to call: an
-/// unlisted method answers `-32601`, which is the "unsupported" signal, not a
-/// failure.
+/// its method answers. 05.2 adds a third key (`maki.ownedDeletion`) for owned
+/// transcript deletion, advertised only because `_maki/session/delete`
+/// answers. Clients MUST probe any method they intend to call: an unlisted
+/// method answers `-32601`, which is the "unsupported" signal, not a failure.
 pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
     agent_client_protocol_schema::v1::Meta::from_iter([
         (
@@ -73,6 +78,13 @@ pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
             serde_json::json!({
                 "version": MODEL_DISCOVERY_VERSION,
                 "methods": [MODEL_LIST_METHOD],
+            }),
+        ),
+        (
+            OWNED_DELETION_CAPABILITY.to_owned(),
+            serde_json::json!({
+                "version": OWNED_DELETION_VERSION,
+                "methods": [OWNED_DELETION_METHOD],
             }),
         ),
     ])
@@ -269,7 +281,9 @@ mod tests {
     /// 02.9a adds addressed cancel, 02.10b adds bounded active-session
     /// release; advertising an unanswered method would lie, so each slice
     /// extends this list as it lands. 04.1a advertises model discovery under
-    /// its own key only because `_maki/model/list_models` answers.
+    /// its own key only because `_maki/model/list_models` answers. 05.2
+    /// advertises owned deletion under its own key only because
+    /// `_maki/session/delete` answers.
     #[test]
     fn capability_advertises_only_the_implemented_methods() {
         let meta = super::capability_meta();
@@ -301,5 +315,16 @@ mod tests {
             .filter_map(|m| m.as_str())
             .collect();
         assert_eq!(discovery_methods, [super::MODEL_LIST_METHOD]);
+        let deletion = meta
+            .get(super::OWNED_DELETION_CAPABILITY)
+            .expect("owned deletion keyed");
+        assert_eq!(deletion["version"], super::OWNED_DELETION_VERSION);
+        let deletion_methods: Vec<&str> = deletion["methods"]
+            .as_array()
+            .expect("methods is an array")
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert_eq!(deletion_methods, [super::OWNED_DELETION_METHOD]);
     }
 }

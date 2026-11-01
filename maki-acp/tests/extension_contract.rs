@@ -43,10 +43,9 @@ async fn initialize_correlates_both_id_shapes(id: serde_json::Value) {
 }
 
 /// 02.3 implements allocate/activate, 02.9a implements addressed cancel,
-/// 02.10b implements bounded active-session release, and 04.1a implements
-/// model discovery, so the capabilities are advertised with exactly those
-/// methods. Owned deletion (05.2) stays specified but not implemented: its
-/// probe answers -32601 instead of hanging or answering success.
+/// 02.10b implements bounded active-session release, 04.1a implements
+/// model discovery, and 05.2 implements owned transcript deletion, so the
+/// capabilities are advertised with exactly those methods.
 #[tokio::test]
 async fn extension_capability_advertises_allocate_activate_cancel_and_release() {
     let mut child = MakiChild::spawn().await.unwrap();
@@ -83,17 +82,20 @@ async fn extension_capability_advertises_allocate_activate_cancel_and_release() 
         [extension::MODEL_LIST_METHOD],
         "discovery is advertised only because its method answers: {discovery_methods:?}"
     );
-    for method in [extension::OWNED_DELETION_METHOD] {
-        let reply = child.probe_unsupported(method).await.unwrap();
-        assert_eq!(
-            reply["error"]["code"], -32601,
-            "{method} must reject as unknown, got: {reply}"
-        );
-        assert!(
-            reply.get("result").is_none(),
-            "{method} must not answer success: {reply}"
-        );
-    }
+    let deletion =
+        &initialize["result"]["agentCapabilities"]["_meta"][extension::OWNED_DELETION_CAPABILITY];
+    assert_eq!(deletion["version"], 1, "{deletion}");
+    let deletion_methods: Vec<&str> = deletion["methods"]
+        .as_array()
+        .expect("methods is an array")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert_eq!(
+        deletion_methods,
+        [extension::OWNED_DELETION_METHOD],
+        "owned deletion is advertised only because its method answers: {deletion_methods:?}"
+    );
     // Release parses before it routes: empty params fail parsing (-32602),
     // while an unknown id routes past parsing to `resource_not_found`.
     // Active-session release itself is proven in `allocation_activation.rs`.
@@ -105,6 +107,43 @@ async fn extension_capability_advertises_allocate_activate_cancel_and_release() 
     child.shutdown().await.unwrap();
 }
 
+/// 05.2 owned deletion answers in process: absent ids are idempotent
+/// success, malformed ids are invalid params, and nothing else is touched.
+/// No second process, no global sweep.
+#[tokio::test]
+async fn owned_deletion_answers_with_status_contract() {
+    let mut child = MakiChild::spawn().await.unwrap();
+    child.initialize().await.unwrap();
+    // Absent: a fresh id with no transcript is idempotent success.
+    let absent_id = child.fresh_id();
+    child
+        .send_request(
+            extension::OWNED_DELETION_METHOD,
+            absent_id.clone(),
+            json!({"sessionId": "01900000-0000-7000-8000-000000000000"}),
+        )
+        .await
+        .unwrap();
+    let absent = child.expect_response(&absent_id).await.unwrap();
+    assert!(
+        absent.get("error").is_none(),
+        "absent delete must answer, not reject: {absent}"
+    );
+    assert_eq!(absent["result"]["status"], "absent");
+    // Malformed id: invalid params before touching storage.
+    let bad_id = child.fresh_id();
+    child
+        .send_request(
+            extension::OWNED_DELETION_METHOD,
+            bad_id.clone(),
+            json!({"sessionId": "not-an-id"}),
+        )
+        .await
+        .unwrap();
+    let bad = child.expect_response(&bad_id).await.unwrap();
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    child.shutdown().await.unwrap();
+}
 /// 04.1a model discovery: `_maki/model/list_models` answers on the existing
 /// process with selectable full IDs before any session exists. No second
 /// process, no dummy session, no aliases or tiers.

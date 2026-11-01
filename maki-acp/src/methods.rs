@@ -124,6 +124,23 @@ pub fn model_list_result(models: &[String]) -> serde_json::Value {
     })
 }
 
+/// 05.2 owned transcript deletion result: `{sessionId, status, detail}` with
+/// `status` one of `deleted|absent|busy|error`. `deleted` means the tracked
+/// transcript is gone (auxiliary archive/task-log sweep warnings ride `detail`
+/// and stderr, never the status); `absent` means nothing was ever written for
+/// the id and is idempotent success; `busy` means a live runtime or a held
+/// claim owns the transcript elsewhere, so the caller keeps ownership and
+/// retries later; `error` means the strict claim or the primary delete
+/// failed, also retryable. Only the addressed transcript is ever touched: no
+/// global sweep, no second process, no unrelated deletion.
+pub fn delete_result(session_id: &str, status: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "status": status,
+        "detail": detail,
+    })
+}
+
 /// Lifecycle params for a session whose activation finished: `active` at epoch
 /// 0, usable for prompts. Failed activation sends no lifecycle frame: the
 /// activation error itself is the honest terminal, and the lease is gone.

@@ -28,8 +28,11 @@ tears down task/pump/hooks/MCP boundedly off the routing loop, and reports
   wires model discovery (`_maki/model/list_models` under capability
   `maki.modelDiscovery`, reading the existing process and provider catalogue;
   field contract in "Model discovery" below, fixtures in
-  `tests/extension_contract.rs`). The reserved 05.2 name still answers
-  `-32601`. This document
+  `tests/extension_contract.rs`), and slice 05.2 wires owned transcript
+  deletion (`_maki/session/delete` under capability `maki.ownedDeletion`,
+  in-process strict-claim delete of the addressed transcript only; field
+  contract in "Owned transcript deletion" below, fixtures in `server.rs`
+  tests). This document
   stays normative; the one deliberate delta is the advertised method list: each
   capability only names the methods the binary answers
   (allocate+activate+cancel+release plus the discovery list today), so probing
@@ -38,8 +41,8 @@ tears down task/pump/hooks/MCP boundedly off the routing loop, and reports
   Scope: one patched Maki PID owns independent concurrent ACP sessions with
   separate cwd/model/plan context, permission routing and supervised lifecycle.
   Model discovery (04.1a) reads the same process and provider catalogue that
-  activation uses; owned transcript deletion (05.2) reserves a name below but
-  is not implemented.
+  activation uses; owned transcript deletion (05.2) deletes only the addressed
+  transcript in process under a protected exclusive claim.
 
 ## Capability advertisement
 
@@ -66,6 +69,10 @@ answers `-32601`, which the client treats as "unsupported", not as a failure.
     "maki.modelDiscovery": {
       "version": 1,
       "methods": ["_maki/model/list_models"]
+    },
+    "maki.ownedDeletion": {
+      "version": 1,
+      "methods": ["_maki/session/delete"]
     }
   }
   ```
@@ -76,8 +83,8 @@ answers `-32601`, which the client treats as "unsupported", not as a failure.
   is informational; clients MUST NOT gate on it. The discovery key is present
   exactly while `_maki/model/list_models` answers: a build without the method
   omits the whole `maki.modelDiscovery` key, and probing the method answers
-  `-32601`. The reserved key `maki.ownedDeletion` (05.2) is absent until that
-  slice lands.
+  `-32601`. The owned-deletion key is present exactly while
+  `_maki/session/delete` answers, with the same rule.
 
 ## Identity
 
@@ -219,6 +226,40 @@ recorded failure. Releasing an unknown (never-allocated) id is
     unusable model still surfaces as an activation failure or a first-turn
     provider error.
 
+  ## Owned transcript deletion (05.2)
+
+  Capability `_meta["maki.ownedDeletion"]`, method `_maki/session/delete`.
+  In-process only: the addressed transcript is deleted under a protected
+  exclusive claim held through the delete. No second Maki process, no global
+  storage sweep, no unrelated-transcript deletion.
+
+  Request params:
+
+  ```json
+  { "sessionId": "CgbPLtxCvEPvJvwaGMUWo" }
+  ```
+
+  Result:
+
+  ```json
+  { "sessionId": "CgbPLtxCvEPvJvwaGMUWo", "status": "deleted", "detail": "transcript deleted" }
+  ```
+
+  - `status`: `deleted` (the tracked transcript is gone), `absent` (nothing
+    was ever written for the id; idempotent success), `busy` (a live runtime
+    or a held claim owns the transcript elsewhere: the caller keeps ownership
+    and retries later; a resumed session is never deleted), or `error` (the
+    strict claim or the primary delete failed; also retryable).
+  - `detail`: human-readable note (auxiliary archive/task-log sweep warnings
+    included, never flipping the primary status).
+  - Unknown `sessionId` shape answers `invalid_params`. A live routing entry
+    (allocation, activating startup, active runtime, in-flight release)
+    answers `busy` without touching the filesystem.
+  - The claim is `SessionClaim::acquire_strict_in`: held lock and any locking
+    I/O error both fail the delete. The `acquire_in` unprotected fallback
+    stays for its existing callers and is never used here; neither a lock
+    probe nor force removal substitutes.
+
   ## Lifecycle and lost handles
 
 Server-to-client notification `_maki/session/lifecycle`:
@@ -308,7 +349,7 @@ Error rules:
 
 | Condition | Answer |
 |---|---|
-  | Unknown method (incl. the reserved 05.2 name) | `-32601 Method not found`, id-correlated |
+  | Unknown method | `-32601 Method not found`, id-correlated |
 | Unknown `sessionId` | `-32002 Resource not found`, `data: {"sessionId"}` |
 | Answer/event naming another live session (cross-ID) | `-32602 Invalid params`, `data: {"expectedSession": ..., "gotSession": ...}`; the named session is unaffected |
 | Stale epoch on an answer | `-32602 Invalid params`, `data: {"expectedEpoch": ..., "gotEpoch": ...}`; nothing applied |
@@ -409,10 +450,11 @@ tasks, and release answers from its background task once bounded teardown
 settles, with readiness/outcome on `_maki/session/lifecycle`. The loop
 itself only matches ids and epochs.
 
-  ## Reservations (named only, not implemented)
+  ## Owned deletion (implemented 05.2)
 
   - 05.2 owned transcript deletion: capability `_meta["maki.ownedDeletion"]`,
-    method `_maki/session/delete`. Probing it today answers `-32601`.
+    method `_maki/session/delete` with the contract above. Probing it answers
+    the `{status, detail}` result; only unlisted methods answer `-32601`.
 
 ## Implementation boundary
 
@@ -421,7 +463,7 @@ itself only matches ids and epochs.
   02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
   cancellation, 02.9b cleanup confirmation and retry, 02.10a task/pump
   supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance, 04.1a
-  model discovery. Of the above, slices through 02.11 plus 04.1a are implemented
-  (only the reserved 05.2 name still answers `-32601`); the harness in `tests/`
+  model discovery. Of the above, slices through 02.11 plus 04.1a and 05.2 are
+  implemented; the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

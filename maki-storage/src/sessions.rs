@@ -215,6 +215,31 @@ impl SessionClaim {
         }
     }
 
+    /// Strict claim for owned transcript deletion (05.2). Fails on a held
+    /// lock and on any locking I/O error: deletion never proceeds through
+    /// the unprotected fallback that [`Self::acquire_in`] grants its
+    /// callers, and neither a lock probe nor force removal substitutes.
+    /// Uses the non-retrying primitive so the call never waits on a genuine
+    /// holder; a transient fd-inheritance hold reports busy and the purge
+    /// retries on a later pass.
+    pub fn acquire_strict_in(id: MakiId, dir: &Path) -> Result<Self, SessionError> {
+        match Lock::acquire(&lock_path(dir, id)) {
+            Ok(lock) => Ok(Self::new(id, dir.to_path_buf(), Some(lock))),
+            Err(LockError::Held { .. }) => Err(SessionError::Busy { id }),
+            Err(LockError::Io { path, source }) => {
+                Err(SessionError::Storage(StorageError::Io(source))).map_err(|error| {
+                    warn!(
+                        path = %path.display(),
+                        session_id = %id,
+                        error = %error,
+                        "strict claim refused on locking I/O error"
+                    );
+                    error
+                })
+            }
+        }
+    }
+
     /// A claim on a newly minted id. Nobody else can hold an id nobody has seen,
     /// so this never fails.
     pub fn fresh(dir: &StateDir) -> Self {
@@ -3650,6 +3675,47 @@ mod tests {
         let err = TestSession::claim_and_load_from(session.id, dir).unwrap_err();
 
         assert!(err.is_busy(), "{err}");
+    }
+
+    /// 05.2: the strict claim fails on a held lock instead of falling back to
+    /// an unprotected claim. Deletion never proceeds unprotected.
+    #[test]
+    fn strict_claim_fails_on_a_held_lock() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let session: TestSession = Session::new("m", "/project");
+        let _elsewhere = claim_id(dir, session.id);
+
+        let err = SessionClaim::acquire_strict_in(session.id, dir).unwrap_err();
+
+        assert!(err.is_busy(), "{err}");
+    }
+
+    /// 05.2: any locking I/O error fails the strict claim. The existing
+    /// `acquire_in` fallback (unprotected claim + warning) stays for its
+    /// callers but must never serve deletion: deletion maps this to `error`,
+    /// never to an unprotected delete.
+    #[test]
+    fn strict_claim_fails_on_locking_io_error_without_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // A regular file where `locks/` should be: creating the lock file's
+        // parent fails with an I/O error (NotADirectory).
+        fs::write(dir.join(super::LOCKS_DIR), b"not a directory").unwrap();
+        let id = MakiId::generate();
+
+        let fallback = SessionClaim::acquire_in(id, dir).expect("fallback stays for callers");
+        assert!(
+            format!("{:?}", fallback).contains("locked: false"),
+            "existing callers keep the unprotected fallback"
+        );
+
+        let err = SessionClaim::acquire_strict_in(id, dir).unwrap_err();
+        assert!(!err.is_busy(), "I/O failure is not busyness: {err}");
+        assert!(
+            matches!(err, SessionError::Storage(_)),
+            "strict claim surfaces locking I/O as storage error: {err}"
+        );
     }
 
     #[test]
