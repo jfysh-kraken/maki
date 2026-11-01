@@ -1,4 +1,5 @@
 pub mod elicitation;
+pub mod extension;
 pub mod methods;
 pub mod permissions;
 pub mod server;

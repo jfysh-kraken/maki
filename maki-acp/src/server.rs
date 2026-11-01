@@ -494,11 +494,7 @@ fn start_session(
         local_tools,
         // Results ride the next prompt. The client never asked for a turn,
         // so nothing wakes one.
-        background: if params.background {
-            BackgroundMode::Detached
-        } else {
-            BackgroundMode::Blocking
-        },
+        background: background_mode(params.background),
         // `close_session` ends it, on a stop as on end of input.
         stop: CancelToken::none(),
     });
@@ -522,6 +518,16 @@ fn start_session(
         claim,
     });
     session_ref
+}
+
+/// `false` is a zero `--background-timeout`: no seed is published, so no
+/// tool call can move off its turn and every call blocks until it finishes.
+fn background_mode(background: bool) -> BackgroundMode {
+    if background {
+        BackgroundMode::Detached
+    } else {
+        BackgroundMode::Blocking
+    }
 }
 
 /// Registers each ask before sending so a response cannot race past it.
@@ -1198,6 +1204,7 @@ mod tests {
     const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
     const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
     const CLOSE_WAITED: &str = "closing a session must not wait for its background work";
+    const BLOCKING_MODE: &str = "a zero --background-timeout must leave every tool call blocking";
 
     /// Where fixture servers claim their placeholder session. One dir is enough,
     /// since fresh ids never collide and nothing is written under them.
@@ -2142,6 +2149,18 @@ mod tests {
         .is_ok();
 
         assert!(closed, "{CLOSE_WAITED}");
+    }
+
+    #[test]
+    fn blocking_mode_disables_detached_tools() {
+        assert!(
+            matches!(background_mode(false), BackgroundMode::Blocking),
+            "{BLOCKING_MODE}"
+        );
+        assert!(
+            matches!(background_mode(true), BackgroundMode::Detached),
+            "a nonzero timeout keeps the detached mode the harness forbids"
+        );
     }
 
     #[tokio::test]
