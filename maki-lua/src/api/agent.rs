@@ -2489,6 +2489,39 @@ mod tests {
             "the nested child keeps the grandparent cwd"
         );
 
+        let registry = Arc::new(maki_agent::tools::ToolRegistry::new());
+        let mut host = crate::PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_builtins(&maki_config::PluginsConfig::from_plugins(
+            std::collections::HashMap::new(),
+        ))
+        .unwrap();
+        for mode in [&child_mode, &nested_mode] {
+            let mut write_ctx = stub_ctx_with(mode, None, None);
+            write_ctx.cwd = dir.clone();
+            write_ctx.permissions = Arc::clone(&child_permissions);
+            write_ctx.registry = Arc::clone(&registry);
+            for (target, allowed) in [(&plan, true), (&dir.join("other.md"), false)] {
+                let done = maki_agent::agent::tool_dispatch::run(
+                    "plan-inheritance-write".into(),
+                    "write",
+                    &serde_json::json!({"path": target, "content": "inherited plan write"}),
+                    &write_ctx,
+                    maki_agent::tools::CallOrigin::Model,
+                )
+                .await;
+                let result = maki_agent::tools::interpreter_bridge::flatten(&done);
+                assert_eq!(result.is_ok(), allowed, "{target:?}: {result:?}");
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&plan).unwrap(),
+            "inherited plan write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("other.md")).unwrap(),
+            "untouchable"
+        );
+
         // Build default still works: a Build parent begets a Build child.
         let mut build_ctx = stub_ctx_with(&maki_agent::AgentMode::Build, None, None);
         build_ctx.cwd = dir.clone();
