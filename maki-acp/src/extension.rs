@@ -20,10 +20,16 @@ pub const CANCEL_METHOD: &str = "_maki/session/cancel";
 pub const RELEASE_METHOD: &str = "_maki/session/release";
 /// Server-to-client lifecycle notification (`allocated|active|released|lost`).
 pub const LIFECYCLE_NOTIFICATION: &str = "_maki/session/lifecycle";
-/// Capability key 04.1 model discovery will advertise. Named only.
+/// Capability key for 04.1 model discovery. Advertised only while the
+/// server answers its methods.
 pub const MODEL_DISCOVERY_CAPABILITY: &str = "maki.modelDiscovery";
-/// Method-prefix 04.1 model discovery will own. Named only.
+/// Method-prefix 04.1 model discovery owns.
 pub const MODEL_DISCOVERY_PREFIX: &str = "_maki/model/";
+/// 04.1 model discovery: full selectable model IDs from the existing process
+/// and provider catalogue. No second process, no dummy session.
+pub const MODEL_LIST_METHOD: &str = "_maki/model/list_models";
+/// Informational discovery capability version. Clients MUST NOT gate on it.
+pub const MODEL_DISCOVERY_VERSION: u32 = 1;
 /// Capability key 05.2 owned transcript deletion will advertise. Named only.
 pub const OWNED_DELETION_CAPABILITY: &str = "maki.ownedDeletion";
 /// Method 05.2 owned transcript deletion will own. Named only.
@@ -46,19 +52,30 @@ pub const RAW_REASON_META_KEY: &str = "maki.rawReason";
 pub const USABLE_META_KEY: &str = "maki.usable";
 
 /// Advertise the implemented slice of the extension. The contract names four
-/// methods, and the capability lists what this binary actually answers:
+/// session methods, and the capability lists what this binary actually answers:
 /// 02.3 implements allocate and activate, 02.9a adds addressed cancel, and
-/// 02.10b adds bounded active-session release. Clients MUST probe any method
-/// they intend to call: an unlisted method answers `-32601`, which is the
-/// "unsupported" signal, not a failure.
+/// 02.10b adds bounded active-session release. 04.1a adds a second capability
+/// key (`maki.modelDiscovery`) for model discovery, advertised only because
+/// its method answers. Clients MUST probe any method they intend to call: an
+/// unlisted method answers `-32601`, which is the "unsupported" signal, not a
+/// failure.
 pub fn capability_meta() -> agent_client_protocol_schema::v1::Meta {
-    agent_client_protocol_schema::v1::Meta::from_iter([(
-        CAPABILITY_KEY.to_owned(),
-        serde_json::json!({
-            "version": CAPABILITY_VERSION,
-            "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD, CANCEL_METHOD, RELEASE_METHOD],
-        }),
-    )])
+    agent_client_protocol_schema::v1::Meta::from_iter([
+        (
+            CAPABILITY_KEY.to_owned(),
+            serde_json::json!({
+                "version": CAPABILITY_VERSION,
+                "methods": [ALLOCATE_METHOD, ACTIVATE_METHOD, CANCEL_METHOD, RELEASE_METHOD],
+            }),
+        ),
+        (
+            MODEL_DISCOVERY_CAPABILITY.to_owned(),
+            serde_json::json!({
+                "version": MODEL_DISCOVERY_VERSION,
+                "methods": [MODEL_LIST_METHOD],
+            }),
+        ),
+    ])
 }
 
 /// Per-session turn epoch: 0 at allocate/activate, bumped on every terminal
@@ -243,13 +260,16 @@ mod tests {
             assert!(method.starts_with("_maki/session/"), "{method}");
         }
         assert!(MODEL_DISCOVERY_PREFIX.starts_with("_maki/"));
+        assert_eq!(MODEL_LIST_METHOD, "_maki/model/list_models");
+        assert!(MODEL_LIST_METHOD.starts_with(MODEL_DISCOVERY_PREFIX));
         assert_eq!(OWNED_DELETION_METHOD, "_maki/session/delete");
     }
 
     /// 02.3 advertises exactly the methods it answers: allocate and activate.
     /// 02.9a adds addressed cancel, 02.10b adds bounded active-session
     /// release; advertising an unanswered method would lie, so each slice
-    /// extends this list as it lands.
+    /// extends this list as it lands. 04.1a advertises model discovery under
+    /// its own key only because `_maki/model/list_models` answers.
     #[test]
     fn capability_advertises_only_the_implemented_methods() {
         let meta = super::capability_meta();
@@ -270,5 +290,16 @@ mod tests {
                 super::RELEASE_METHOD
             ]
         );
+        let discovery = meta
+            .get(super::MODEL_DISCOVERY_CAPABILITY)
+            .expect("discovery keyed");
+        assert_eq!(discovery["version"], super::MODEL_DISCOVERY_VERSION);
+        let discovery_methods: Vec<&str> = discovery["methods"]
+            .as_array()
+            .expect("methods is an array")
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert_eq!(discovery_methods, [super::MODEL_LIST_METHOD]);
     }
 }

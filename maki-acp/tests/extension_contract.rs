@@ -42,11 +42,11 @@ async fn initialize_correlates_both_id_shapes(id: serde_json::Value) {
     child.shutdown().await.unwrap();
 }
 
-/// 02.3 implements allocate/activate, 02.9a implements addressed cancel, and
-/// 02.10b implements bounded active-session release, so the capability is
-/// advertised with exactly those methods. Owned deletion (05.2) and model
-/// discovery (04.1) stay specified but not implemented: every probe answers
-/// -32601 instead of hanging or answering success.
+/// 02.3 implements allocate/activate, 02.9a implements addressed cancel,
+/// 02.10b implements bounded active-session release, and 04.1a implements
+/// model discovery, so the capabilities are advertised with exactly those
+/// methods. Owned deletion (05.2) stays specified but not implemented: its
+/// probe answers -32601 instead of hanging or answering success.
 #[tokio::test]
 async fn extension_capability_advertises_allocate_activate_cancel_and_release() {
     let mut child = MakiChild::spawn().await.unwrap();
@@ -69,10 +69,21 @@ async fn extension_capability_advertises_allocate_activate_cancel_and_release() 
         ],
         "capability lists only what the server answers: {methods:?}"
     );
-    for method in [
-        extension::OWNED_DELETION_METHOD,
-        &format!("{}list_models", extension::MODEL_DISCOVERY_PREFIX),
-    ] {
+    let discovery =
+        &initialize["result"]["agentCapabilities"]["_meta"][extension::MODEL_DISCOVERY_CAPABILITY];
+    assert_eq!(discovery["version"], 1, "{discovery}");
+    let discovery_methods: Vec<&str> = discovery["methods"]
+        .as_array()
+        .expect("methods is an array")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    assert_eq!(
+        discovery_methods,
+        [extension::MODEL_LIST_METHOD],
+        "discovery is advertised only because its method answers: {discovery_methods:?}"
+    );
+    for method in [extension::OWNED_DELETION_METHOD] {
         let reply = child.probe_unsupported(method).await.unwrap();
         assert_eq!(
             reply["error"]["code"], -32601,
@@ -91,6 +102,53 @@ async fn extension_capability_advertises_allocate_activate_cancel_and_release() 
         .await
         .unwrap();
     assert_eq!(empty["error"]["code"], -32602, "{empty}");
+    child.shutdown().await.unwrap();
+}
+
+/// 04.1a model discovery: `_maki/model/list_models` answers on the existing
+/// process with selectable full IDs before any session exists. No second
+/// process, no dummy session, no aliases or tiers.
+#[tokio::test]
+async fn model_discovery_lists_full_ids_without_a_session() {
+    let mut child = MakiChild::spawn().await.unwrap();
+    child.initialize().await.unwrap();
+    let reply = child
+        .probe_unsupported(extension::MODEL_LIST_METHOD)
+        .await
+        .unwrap();
+    assert!(
+        reply.get("error").is_none(),
+        "discovery must answer, not reject: {reply}"
+    );
+    let models = reply["result"]["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("discovery result needs a models array: {reply}"));
+    assert!(
+        !models.is_empty(),
+        "discovery must list at least one selectable model: {reply}"
+    );
+    let mut previous: Option<&str> = None;
+    for model in models {
+        let id = model
+            .as_str()
+            .unwrap_or_else(|| panic!("model IDs are strings: {model}"));
+        assert!(!id.is_empty(), "no empty model IDs");
+        assert!(
+            !id.chars().any(char::is_whitespace),
+            "full IDs carry no whitespace: {id}"
+        );
+        assert!(
+            id.contains('/'),
+            "selectable full IDs name provider and model: {id}"
+        );
+        if let Some(prev) = previous {
+            assert!(
+                prev <= id,
+                "discovery answers deterministically sorted: {prev} before {id}"
+            );
+        }
+        previous = Some(id);
+    }
     child.shutdown().await.unwrap();
 }
 

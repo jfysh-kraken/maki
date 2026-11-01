@@ -23,18 +23,23 @@ modes, `lost` lifecycle with the 02.1 reason/rawReason/usable fields;
 fixtures in `server.rs` tests), and slice 02.10b wires bounded individual
 release and shutdown (release settles through the per-session control lock,
 tears down task/pump/hooks/MCP boundedly off the routing loop, and reports
-`released`/`release_failed` with prior loss where recorded; fixtures in
-`server.rs` tests and `tests/allocation_activation.rs`). The reserved 04.1
-and 05.2 names still answer `-32601`. This document
-stays normative; the one deliberate delta is the advertised method list: the
-capability only names the methods the binary answers
-(allocate+activate+cancel+release today), so probing an unlisted method keeps
-reporting "unsupported".
+  `released`/`release_failed` with prior loss where recorded; fixtures in
+  `server.rs` tests and `tests/allocation_activation.rs`), and slice 04.1a
+  wires model discovery (`_maki/model/list_models` under capability
+  `maki.modelDiscovery`, reading the existing process and provider catalogue;
+  field contract in "Model discovery" below, fixtures in
+  `tests/extension_contract.rs`). The reserved 05.2 name still answers
+  `-32601`. This document
+  stays normative; the one deliberate delta is the advertised method list: each
+  capability only names the methods the binary answers
+  (allocate+activate+cancel+release plus the discovery list today), so probing
+  an unlisted method keeps reporting "unsupported".
 
-Scope: one patched Maki PID owns independent concurrent ACP sessions with
-separate cwd/model/plan context, permission routing and supervised lifecycle.
-Model discovery (04.1) and owned transcript deletion (05.2) reserve names below
-but are not implemented by milestone 02.
+  Scope: one patched Maki PID owns independent concurrent ACP sessions with
+  separate cwd/model/plan context, permission routing and supervised lifecycle.
+  Model discovery (04.1a) reads the same process and provider catalogue that
+  activation uses; owned transcript deletion (05.2) reserves a name below but
+  is not implemented.
 
 ## Capability advertisement
 
@@ -47,26 +52,32 @@ answers `-32601`, which the client treats as "unsupported", not as a failure.
 
 `initialize` result, `agentCapabilities._meta`:
 
-```json
-{
-  "maki.multiSession": {
-    "version": 1,
-    "methods": [
-      "_maki/session/allocate",
-      "_maki/session/activate",
-      "_maki/session/cancel",
-      "_maki/session/release"
-    ]
+  ```json
+  {
+    "maki.multiSession": {
+      "version": 1,
+      "methods": [
+        "_maki/session/allocate",
+        "_maki/session/activate",
+        "_maki/session/cancel",
+        "_maki/session/release"
+      ]
+    },
+    "maki.modelDiscovery": {
+      "version": 1,
+      "methods": ["_maki/model/list_models"]
+    }
   }
-}
-```
+  ```
 
 `_meta` is the ACP-sanctioned extension point
 (`agent-client-protocol-schema` types it as a free-form JSON map), so stock
-clients ignore the key while fork clients branch on its presence. `version`
-is informational; clients MUST NOT gate on it. Reserved keys
-`maki.modelDiscovery` (04.1) and `maki.ownedDeletion` (05.2) are absent until
-those slices land.
+  clients ignore the key while fork clients branch on its presence. `version`
+  is informational; clients MUST NOT gate on it. The discovery key is present
+  exactly while `_maki/model/list_models` answers: a build without the method
+  omits the whole `maki.modelDiscovery` key, and probing the method answers
+  `-32601`. The reserved key `maki.ownedDeletion` (05.2) is absent until that
+  slice lands.
 
 ## Identity
 
@@ -183,7 +194,32 @@ re-answers the recorded success, re-releasing a failed id re-answers the
 recorded failure. Releasing an unknown (never-allocated) id is
 `resource_not_found`.
 
-## Lifecycle and lost handles
+  ## Model discovery (04.1a)
+
+  Capability `_meta["maki.modelDiscovery"]`, methods under `_maki/model/`
+  (one method today: `_maki/model/list_models`). Discovery reads the existing
+  Maki process and provider catalogue: no second process is spawned and no
+  dummy session is created, so listing works before any session exists and
+  never reports another Maki PID or a discovery session.
+
+  Request params: `{}`. No params are read; extra params are ignored.
+
+  Result:
+
+  ```json
+  { "models": ["openai/gpt-5", "openrouter/deepseek/deepseek-chat"] }
+  ```
+
+  - `models`: array of selectable full `provider/model-id` specs, sorted for a
+    deterministic answer. Full IDs only: no aliases, no tiers, no display
+    names. The list merges the static provider specs with background catalogue
+    batches as they land (the same list activation validates against), so an
+    early answer may grow on a later call without ever shrinking.
+  - Listing a model is not proof an inference call succeeds: an unknown or
+    unusable model still surfaces as an activation failure or a first-turn
+    provider error.
+
+  ## Lifecycle and lost handles
 
 Server-to-client notification `_maki/session/lifecycle`:
 
@@ -272,7 +308,7 @@ Error rules:
 
 | Condition | Answer |
 |---|---|
-| Unknown method (incl. all `_maki/` on the current server, reserved 04.1/05.2 names) | `-32601 Method not found`, id-correlated |
+  | Unknown method (incl. the reserved 05.2 name) | `-32601 Method not found`, id-correlated |
 | Unknown `sessionId` | `-32002 Resource not found`, `data: {"sessionId"}` |
 | Answer/event naming another live session (cross-ID) | `-32602 Invalid params`, `data: {"expectedSession": ..., "gotSession": ...}`; the named session is unaffected |
 | Stale epoch on an answer | `-32602 Invalid params`, `data: {"expectedEpoch": ..., "gotEpoch": ...}`; nothing applied |
@@ -373,12 +409,10 @@ tasks, and release answers from its background task once bounded teardown
 settles, with readiness/outcome on `_maki/session/lifecycle`. The loop
 itself only matches ids and epochs.
 
-## Reservations (named only, not implemented)
+  ## Reservations (named only, not implemented)
 
-- 04.1 model discovery: capability `_meta["maki.modelDiscovery"]`, methods
-  under `_maki/model/`. Probing any of them today answers `-32601`.
-- 05.2 owned transcript deletion: capability `_meta["maki.ownedDeletion"]`,
-  method `_maki/session/delete`. Probing it today answers `-32601`.
+  - 05.2 owned transcript deletion: capability `_meta["maki.ownedDeletion"]`,
+    method `_maki/session/delete`. Probing it today answers `-32601`.
 
 ## Implementation boundary
 
@@ -386,8 +420,8 @@ itself only matches ids and epochs.
   ordering, 02.4 session context, 02.5a–c runtime cwd, 02.6 plan inheritance,
   02.7 terminal reasons, 02.8 permission routing, 02.9a addressed
   cancellation, 02.9b cleanup confirmation and retry, 02.10a task/pump
- supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance. Of the
- above, slices through 02.11 are implemented (only the reserved 04.1/05.2
- names still answer `-32601`); the harness in `tests/`
+  supervision, 02.10b release/shutdown bounds, 02.11 engine acceptance, 04.1a
+  model discovery. Of the above, slices through 02.11 plus 04.1a are implemented
+  (only the reserved 05.2 name still answers `-32601`); the harness in `tests/`
  speaks standard ACP plus `-32601` probes so the same fixtures run against
  the extension as each slice lands.

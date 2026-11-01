@@ -837,7 +837,8 @@ async fn handle_request(
 ) {
     // Fork extension methods with schema-less results (`EXTENSION.md`).
     // Allocate and release-of-allocation answer synchronously: neither does
-    // slow work. Activate validates synchronously and defers the result: the
+    // slow work. Model-list (04.1a) answers synchronously from the in-memory
+    // catalogue for the same reason. Activate validates synchronously and defers the result: the
     // dedicated task settles it exactly once on completion, so slow provider
     // and MCP startup never blocks this loop. Addressed cancel (02.9a)
     // settles synchronously through the turn epoch and answers at once.
@@ -867,6 +868,16 @@ async fn handle_request(
         srv.respond_value(id, result);
         return;
     }
+    if method == extension::MODEL_LIST_METHOD {
+        // 04.1a model discovery: reads the existing process and provider
+        // catalogue (`srv.model_specs`, static plus background batches). No
+        // second process, no dummy session; a sorted copy keeps the answer
+        // deterministic while the live list keeps growing in place.
+        let mut models = srv.model_specs.clone();
+        models.sort();
+        srv.respond_value(id, Ok(methods::model_list_result(&models)));
+        return;
+    }
     let result = match method {
         "initialize" => {
             srv.client_elicits_form = parse_params::<InitializeRequest>(raw)
@@ -884,7 +895,7 @@ async fn handle_request(
         },
         "session/set_mode" => configure_standard_session(srv, raw, params, true),
         "session/set_config_option" => configure_standard_session(srv, raw, params, false),
-        // Reserved 04.1/05.2 names keep answering -32601 through the
+        // Reserved 05.2 names keep answering -32601 through the
         // catch-all below.
         _ => Err(AcpError::method_not_found()),
     };

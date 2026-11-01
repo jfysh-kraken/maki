@@ -115,6 +115,15 @@ pub fn release_allocation_result(session_id: &str) -> serde_json::Value {
     })
 }
 
+/// 04.1a model discovery result: selectable full `provider/model-id` specs
+/// from the existing process and provider catalogue. No aliases or tiers;
+/// listing a model is not proof an inference call succeeds.
+pub fn model_list_result(models: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "models": models,
+    })
+}
+
 /// Lifecycle params for a session whose activation finished: `active` at epoch
 /// 0, usable for prompts. Failed activation sends no lifecycle frame: the
 /// activation error itself is the honest terminal, and the lease is gone.
