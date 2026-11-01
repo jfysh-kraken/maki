@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,21 @@ fn open_mailbox(resumed: &Resumed) -> SessionMailbox {
         mailbox.restore_lost(&session.meta.pending_background, session.messages());
     }
     mailbox
+}
+
+/// Initial environment + instructions for one session, built from its own
+/// requested cwd (02.4). The `{cwd}` template var, the stated `Environment`
+/// block, and the loaded project instruction files all name the session's
+/// directory, never the Maki process cwd. Model/mode/output selection stays
+/// where 02.3 put it (activation fixes them before any prompt); Lua/tool
+/// defaults are 02.5b's and later instruction discovery is 02.5c's.
+pub(crate) fn initial_session_context(
+    cwd: &Path,
+    config: &AgentConfig,
+) -> (template::Vars, agent::Instructions) {
+    let vars = template::env_vars_for_cwd(cwd);
+    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &config.instructions);
+    (vars, instructions)
 }
 
 /// The registry holds the seed weakly, so the caller keeps it for the
@@ -466,8 +481,11 @@ impl InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
-    let vars = template::env_vars();
-    let instructions = agent::load_instructions(&vars.apply("{cwd}"), &params.config.instructions);
+    // 02.4: the initial environment and project instructions reflect the
+    // requested session cwd, never the Maki process cwd. `initial_wd` is the
+    // session's own directory from activation (or the caller's cwd on the
+    // standard paths); nothing here reads the process cwd.
+    let (vars, instructions) = initial_session_context(&params.initial_wd, &params.config);
     let spec = ContextSpec {
         system_override: params.system_prompt_override,
         append_system: params.append_system_prompt,
@@ -839,6 +857,117 @@ mod tests {
     fn extract_tool_names_filters_valid_entries() {
         let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
+    }
+
+    /// 02.4: each session's initial environment and project instructions come
+    /// from its own requested cwd, never the Maki process cwd. Fixture
+    /// projects A/B carry distinct instruction markers, so a process-global
+    /// read could only produce one answer: two correct per-session answers
+    /// exclude the launch directory, the peer project, and any shared
+    /// default. The process cwd is unchanged throughout, and a session-owned
+    /// tool context (plus its attached-agent clones) retains the owning
+    /// session's cwd. No prompt is sent and no provider is contacted.
+    #[test]
+    fn initial_session_context_is_per_session_cwd() {
+        use crate::tools::{ToolContext, interpreter_ctx};
+
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        std::fs::write(project_a.path().join("AGENTS.md"), "alpha project rules").unwrap();
+        std::fs::write(project_b.path().join("AGENTS.md"), "beta project rules").unwrap();
+        // The launch directory carries its own marker: inheriting it would be
+        // visible here. (TempDirs live elsewhere, so the process cwd marker
+        // can only leak through a process-global read.)
+        assert!(
+            !process_cwd.starts_with(project_a.path())
+                && !process_cwd.starts_with(project_b.path()),
+            "the launch directory is neither fixture project"
+        );
+        let config = AgentConfig::default();
+
+        let (vars_a, instr_a) = initial_session_context(project_a.path(), &config);
+        let (vars_b, instr_b) = initial_session_context(project_b.path(), &config);
+
+        for (vars, instr, project, marker, peer) in [
+            (
+                &vars_a,
+                &instr_a,
+                &project_a,
+                "alpha project rules",
+                "beta project rules",
+            ),
+            (
+                &vars_b,
+                &instr_b,
+                &project_b,
+                "beta project rules",
+                "alpha project rules",
+            ),
+        ] {
+            let cwd = project.path().to_string_lossy().into_owned();
+            assert_eq!(
+                vars.apply("{cwd}").as_ref(),
+                cwd,
+                "the environment names the session's own directory"
+            );
+            let environment = vars.apply("{environment}").into_owned();
+            assert!(
+                environment.contains(&cwd),
+                "the stated environment names the session cwd: {environment}"
+            );
+            assert!(
+                instr.text.contains(marker),
+                "the session loads its own project instructions"
+            );
+            assert!(
+                !instr.text.contains(peer),
+                "the session never inherits its peer's instructions"
+            );
+        }
+
+        // The cwd survives into the session/tool context and its attached
+        // clones instead of the process cwd.
+        let (event_tx, _) = flume::unbounded::<crate::Envelope>();
+        let event_tx = EventSender::new(event_tx, 0);
+        for project in [&project_a, &project_b] {
+            let permissions = Arc::new(PermissionManager::new(
+                maki_config::PermissionsConfig::default(),
+                project.path().to_path_buf(),
+                ProjectConfig::for_project(project.path()),
+                Arc::default(),
+            ));
+            assert_eq!(permissions.cwd(), project.path());
+            let ctx = interpreter_ctx(
+                &AgentMode::Build,
+                &event_tx,
+                CancelToken::none(),
+                Arc::clone(&permissions),
+                FileAccess::fresh(),
+                None,
+                Arc::clone(ToolRegistry::global_arc()),
+            );
+            assert_eq!(
+                ctx.cwd,
+                project.path(),
+                "the tool context retains its session"
+            );
+            let attached = ToolContext {
+                tool_use_id: Some("toolu_attached".to_owned()),
+                ..ctx.clone()
+            };
+            assert_eq!(
+                attached.cwd,
+                project.path(),
+                "an attached agent serves its parent's session cwd"
+            );
+        }
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "building initial context never moves the process cwd"
+        );
     }
 
     #[test]

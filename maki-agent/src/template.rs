@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::path::Path;
 
 use jiff::Zoned;
 
@@ -14,10 +15,19 @@ pub fn env_vars() -> Vars {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
+    env_vars_for_cwd(Path::new(&cwd))
+}
+
+/// Session-scoped environment: the working directory is the session's own cwd,
+/// never the Maki process cwd. Every ACP activation builds its prompt from
+/// this, so two sessions in different projects describe different
+/// environments (02.4). Runtime tool resolution still owns its own fallback
+/// (02.5b/c); this only states the session's directory in the prompt.
+pub fn env_vars_for_cwd(cwd: &Path) -> Vars {
     let date = Zoned::now().strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{environment}", ENVIRONMENT)
-        .set("{cwd}", cwd)
+        .set("{cwd}", cwd.to_string_lossy().into_owned())
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
 }

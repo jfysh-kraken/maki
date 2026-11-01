@@ -1016,6 +1016,10 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            // The owning session's cwd, so tools and attached agents serve
+            // their own project. Cloned verbatim into every nested context;
+            // resolution behavior is 02.5b/c's, not this slice's.
+            cwd: self.permissions.cwd(),
             session_id: self.session_id.clone(),
             background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),

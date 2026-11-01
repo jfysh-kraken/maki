@@ -719,11 +719,31 @@ mod tests {
         let inner = agent.to_tool_context();
         assert_eq!(inner.tool_use_id, None);
         assert!(inner.live_sink.is_none(), "sink must not be inherited");
-        assert_eq!(agent.tool_use_id.as_deref(), Some(TOOL_USE_ID));
+        assert_eq!(
+            agent.tool_use_id.as_deref(),
+            Some(TOOL_USE_ID),
+            "dropping must not disturb the caller's own context"
+        );
         assert_eq!(
             inner.session_id,
             Some(session_ref()),
             "a dispatched child runs in the same session, unlike tool_use_id"
+        );
+    }
+
+    /// 02.4: the Lua handler context keeps the owning session's cwd through
+    /// every clone (nested calls, attached agents), never the process cwd.
+    /// Resolution behavior is 02.5b/c's; this only proves the value is
+    /// carried.
+    #[test]
+    fn agent_context_carries_the_session_cwd() {
+        let ctx = populated_ctx();
+        let agent = AgentContext::from(&ctx);
+        assert_eq!(agent.cwd, ctx.cwd, "the handler keeps its session");
+        let inner = agent.to_tool_context();
+        assert_eq!(
+            inner.cwd, ctx.cwd,
+            "a dispatched child serves the same session cwd"
         );
     }
 

@@ -692,6 +692,13 @@ impl PermissionManager {
         self.project_config.is_trusted()
     }
 
+    /// The owning session's cwd. Carried into every [`crate::tools::ToolContext`]
+    /// the session builds, so tools and attached agents resolve against their
+    /// own session (02.4 carries it, 02.5b/c own the resolution behavior).
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd.clone()
+    }
+
     /// Where an always-answer gets written, or `None` when it only holds for
     /// this session. An untrusted folder gets nothing, for a different reason
     /// on each side. An allow saved there is stripped on the next start, so it

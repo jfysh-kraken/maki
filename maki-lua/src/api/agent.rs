@@ -532,11 +532,12 @@ async fn system_prompt(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<String>> {
-    let (slots, instructions_config) = {
+    let (slots, instructions_config, session_cwd) = {
         let agent_ctx = try_pair!(dispatch_ctx(&ctx, "system_prompt"));
         (
             Arc::clone(&agent_ctx.prompt_slots),
             agent_ctx.config.instructions.clone(),
+            agent_ctx.cwd.clone(),
         )
     };
     // Nothing may hold the ctx borrow across the wait: a cancel hook firing
@@ -550,7 +551,10 @@ async fn system_prompt(
         other => return Ok(err_pair(format!("unknown prompt_id: {other}"))),
     };
 
-    let vars = maki_agent::template::env_vars();
+    // 02.4: the prompt states the owning session's directory and loads that
+    // session's project instructions, never the Maki process cwd. Later
+    // subdirectory-instruction discovery is 02.5c's.
+    let vars = maki_agent::template::env_vars_for_cwd(&session_cwd);
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
         LuaValue::Boolean(true) => {
@@ -642,7 +646,7 @@ async fn tools(
         .excluding(&disabled)
         .excluding(maki_agent::tools::capability_exclusions(model));
 
-    let vars = maki_agent::template::env_vars();
+    let vars = maki_agent::template::env_vars_for_cwd(&agent.cwd);
     let ctx_desc = DescriptionContext {
         filter: &filter,
         audience,

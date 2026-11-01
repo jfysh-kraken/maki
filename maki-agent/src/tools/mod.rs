@@ -361,6 +361,12 @@ pub struct ToolContext {
     pub model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
+    /// The owning session's cwd, fixed at session start. Carried everywhere
+    /// the context clones (nested calls, local tools, attached agents), so a
+    /// tool can always tell which project it serves. Resolution behavior is
+    /// unchanged in 02.4: making tools consult this instead of the process
+    /// cwd is 02.5b/c.
+    pub cwd: PathBuf,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
@@ -646,6 +652,10 @@ pub fn interpreter_ctx(
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
+        // One-shot default: no session owns this context, so the process cwd
+        // stands in. Session-owned constructors overwrite it with the
+        // session's own cwd below.
+        cwd: permissions.cwd(),
         session_id: None,
         background_for: BackgroundFor::None,
         task_id: None,

@@ -607,6 +607,9 @@ impl AgentSeed {
         ToolContext {
             provider: Arc::clone(&slot.provider),
             model: Arc::new(slot.model.clone()),
+            // The owning session's cwd (02.4 carries it; 02.5b/c own the
+            // resolution behavior).
+            cwd: self.permissions.cwd(),
             session_id: Some(self.session_id.clone()),
             background_for: BackgroundFor::Chat(self.session_id.id()),
             mcp: self.mcp.clone(),
@@ -1159,6 +1162,28 @@ mod tests {
         assert_eq!(
             seed.tool_context(CancelToken::none()).instruction_files,
             resolved
+        );
+    }
+
+    /// 02.4: the seed's tool context names the owning session's cwd, and an
+    /// attached-agent style clone keeps it. Resolution behavior is 02.5b/c's;
+    /// this only proves the value is carried.
+    #[test]
+    fn tool_context_carries_the_session_cwd() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let seed = mailbox.publish_seed(stub_seed(id));
+
+        let ctx = seed.tool_context(CancelToken::none());
+        assert_eq!(ctx.cwd, seed.permissions.cwd());
+        let attached = ToolContext {
+            tool_use_id: Some("toolu_attached".to_owned()),
+            ..ctx.clone()
+        };
+        assert_eq!(
+            attached.cwd,
+            seed.permissions.cwd(),
+            "an attached agent serves its parent's session cwd"
         );
     }
 

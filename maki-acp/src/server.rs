@@ -117,12 +117,17 @@ type PendingState = Arc<Mutex<Pending>>;
 /// agent task, its event pump task, and its conversation context (run handle,
 /// storage claim, pending asks, turn epoch). Nothing here is shared between
 /// sessions except the outgoing wire sender, so no global serialization and no
-/// per-session process fallback exist.
+/// per-session process fallback exists.
 struct SessionRuntime {
     handle: InteractiveHandle,
     mcp: Option<McpHandle>,
     current_mode: AgentMode,
     current_model: String,
+    /// Requested session cwd, fixed at activation (02.4). The run, its event
+    /// pump, and its permission manager all serve this directory; the Maki
+    /// process cwd is never consulted for it. Runtime tool resolution against
+    /// this value is 02.5b/c's; here it is retained, not yet consulted.
+    cwd: PathBuf,
     /// Absolute output path fixed at activation (`EXTENSION.md`): the plan
     /// artifact in plan mode, the transcript-adjacent run record in build
     /// mode. `None` for standard `session/new`/`session/load` runtimes, which
@@ -727,6 +732,16 @@ fn settle_activation(srv: &mut Server, key: String, id: RequestId, outcome: Acti
             // Every activated runtime carries the fixed output 03 reserves
             // against; standard runtimes (None) never pass through here.
             debug_assert!(runtime.output.is_some());
+            // 02.4: the runtime retains its requested session cwd. Logged so
+            // the activation record names the directory the session serves;
+            // runtime-tool resolution against it is 02.5b/c's (this field is
+            // also read by the 02.4 focused tests, not by dispatch).
+            debug!(
+                session = %key,
+                cwd = %runtime.cwd.display(),
+                model = %runtime.current_model,
+                "session activated with its own initial context"
+            );
             srv.sessions.insert(key.clone(), runtime);
             maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(key.as_str()));
             srv.respond_value(id, Ok(methods::activate_result(&key)));
@@ -1061,7 +1076,7 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
         session_ref.clone(),
         ctx.out_tx,
         Arc::clone(&pending),
-        ctx.cwd,
+        ctx.cwd.clone(),
         maki_storage::paths::home(),
         project_trusted,
         ctx.initial_cost,
@@ -1071,6 +1086,7 @@ fn spawn_runtime(ctx: SpawnCtx) -> (SessionRef, SessionRuntime) {
         mcp: ctx.mcp,
         current_mode: ctx.mode,
         current_model: ctx.model.spec(),
+        cwd: ctx.cwd.clone(),
         output: ctx.output,
         pending,
         claim: ctx.claim,
@@ -2112,6 +2128,10 @@ mod tests {
             mcp: None,
             current_mode: AgentMode::Build,
             current_model: String::new(),
+            // Single-session unit fixture: no activation named a cwd, so the
+            // placeholder stands in. Multi-session fixtures address entries by
+            // key and set this from the requested cwd instead.
+            cwd: PathBuf::from("/project"),
             output: None,
             pending: Arc::default(),
             claim,
@@ -3838,6 +3858,10 @@ mod tests {
     struct StarterHarness {
         /// `(session_key, model_spec)` in construction order.
         started: Arc<Mutex<Vec<(String, String)>>>,
+        /// What each activation was constructed with (02.4): the requested
+        /// session cwd, mode, and absolute output alongside the model spec.
+        /// Model/mode/output inputs are available before the first prompt.
+        built: Arc<Mutex<Vec<BuiltActivation>>>,
         /// Live input receivers, one per constructed stub: kept so an
         /// accepted prompt has somewhere to send.
         inputs: Arc<Mutex<Vec<flume::Receiver<AgentInput>>>>,
@@ -3851,9 +3875,19 @@ mod tests {
         fail: Arc<Mutex<Option<String>>>,
     }
 
+    /// What one activation carried into construction (02.4 initial context).
+    #[derive(Clone, Debug, PartialEq)]
+    struct BuiltActivation {
+        session: String,
+        model: String,
+        mode: String,
+        cwd: PathBuf,
+        output: PathBuf,
+    }
+
     /// Fixture slow half of activation: records the requested model, then
     /// answers with a stub runtime (or a held/failed outcome). The stub
-    /// carries the requested model/mode/output directly: no default-provider
+    /// carries the requested model/mode/cwd/output directly: no default-provider
     /// session is ever built, so there is nothing to switch.
     fn fixture_starter(harness: &StarterHarness) -> ActivationStarter {
         let harness = harness.clone();
@@ -3870,6 +3904,13 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((input.spawn.claim.id().to_string(), spec.clone()));
+                    harness.built.lock().unwrap().push(BuiltActivation {
+                        session: input.spawn.claim.id().to_string(),
+                        model: spec.clone(),
+                        mode: format!("{:?}", input.spawn.mode),
+                        cwd: input.spawn.cwd.clone(),
+                        output: input.spawn.output.clone().unwrap_or_default(),
+                    });
                     if let Some(reason) = harness.fail.lock().unwrap().clone() {
                         return Err(ActivationFailure {
                             claim: input.spawn.claim,
@@ -3890,8 +3931,11 @@ mod tests {
                         session_id: SessionRef::from(input.spawn.claim.id()),
                         permissions: Arc::new(PermissionManager::new(
                             maki_config::PermissionsConfig::default(),
-                            PathBuf::from("/project"),
-                            ProjectConfig::for_project(Path::new("/project")),
+                            // The requested session cwd, like production:
+                            // tool contexts built from this handle serve
+                            // their own project, never the process cwd.
+                            input.spawn.cwd.clone(),
+                            ProjectConfig::for_project(&input.spawn.cwd),
                             Arc::default(),
                         )),
                         task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
@@ -3902,6 +3946,9 @@ mod tests {
                         mcp: None,
                         current_mode: input.spawn.mode.clone(),
                         current_model: spec,
+                        // Retained from the activation request, like the real
+                        // `spawn_runtime` path: the runtime serves this cwd.
+                        cwd: input.spawn.cwd.clone(),
                         output: input.spawn.output.clone(),
                         pending: Arc::default(),
                         claim: input.spawn.claim,
@@ -4208,6 +4255,159 @@ mod tests {
         assert!(
             srv.activating.is_empty(),
             "settling clears the in-flight entry"
+        );
+    }
+
+    /// 02.4 initial session context: interleaved sessions in fixture projects
+    /// A/B keep their own requested cwd, model, mode, and absolute output.
+    /// Each runtime retains its own cwd; neither session inherits peer context
+    /// or the launch directory; the Maki process cwd never moves; and the
+    /// fixed setup is observable before the first prompt (mode/config changes
+    /// route to the addressed session and reject). No prompt is ever sent, so
+    /// nothing reaches a provider: no keys, no inference, no network.
+    #[tokio::test]
+    async fn interleaved_sessions_keep_their_own_initial_context() {
+        let process_cwd = std::env::current_dir().expect("the process cwd is readable");
+        let harness = StarterHarness::default();
+        let (mut srv, out_rx, completion_rx, _keepalive) = server_with_harness(&harness);
+        let state = TempDir::new().unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let project_a = TempDir::new().unwrap();
+        let project_b = TempDir::new().unwrap();
+        // Distinct project markers: a process-global read (launch dir, peer
+        // project, or a shared default) can only produce one answer, so two
+        // correct per-session answers exclude it.
+        std::fs::write(project_a.path().join("AGENTS.md"), "alpha project rules").unwrap();
+        std::fs::write(project_b.path().join("AGENTS.md"), "beta project rules").unwrap();
+        let params = acp_params(storage);
+        let cwd_a = project_a.path().to_string_lossy().into_owned();
+        let cwd_b = project_b.path().to_string_lossy().into_owned();
+        assert_ne!(cwd_a, cwd_b);
+
+        let session_a = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project_a.path(),
+            RequestId::Number(1),
+        )
+        .await;
+        let session_b = allocate_id(
+            &mut srv,
+            &out_rx,
+            &params,
+            project_b.path(),
+            RequestId::Number(2),
+        )
+        .await;
+        assert_ne!(session_a, session_b);
+
+        let output_a = project_a.path().join("plan-a.md");
+        let output_b = project_b.path().join("plan-b.md");
+        // Interleaved activation: A starts while B is still unactivated, so a
+        // shared slot would visibly leak.
+        for (n, (session, cwd, output, model, mode)) in [
+            (&session_a, &cwd_a, &output_a, "openai/gpt-5", "build"),
+            (&session_b, &cwd_b, &output_b, "openai/gpt-5.6-sol", "plan"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            handle_request(
+                &mut srv,
+                extension::ACTIVATE_METHOD,
+                RequestId::Number(n as i64 + 10),
+                &activate_request(session, model, mode, cwd, &output.to_string_lossy()),
+                &params,
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            let (key, id, outcome) = next_completion(&completion_rx).await;
+            settle_activation(&mut srv, key, id, outcome);
+            let reply = out_rx.try_recv().expect("activation settles its result");
+            assert_eq!(reply["result"]["turnEpoch"], 0);
+            let lifecycle = out_rx.try_recv().expect("activation announces active");
+            assert_eq!(lifecycle["params"]["state"], "active");
+        }
+
+        // Each runtime retains its own requested cwd, model, mode, and output.
+        let runtime_a = srv.sessions.get(&session_a).expect("A is filed");
+        let runtime_b = srv.sessions.get(&session_b).expect("B is filed");
+        assert_eq!(runtime_a.cwd, project_a.path());
+        assert_eq!(runtime_b.cwd, project_b.path());
+        assert_eq!(runtime_a.current_model, "openai/gpt-5");
+        assert_eq!(runtime_b.current_model, "openai/gpt-5.6-sol");
+        assert_eq!(runtime_a.current_mode, AgentMode::Build);
+        assert!(
+            matches!(runtime_b.current_mode, AgentMode::Plan(_)),
+            "B runs in plan mode: {:?}",
+            runtime_b.current_mode
+        );
+        assert_eq!(runtime_a.output.as_deref(), Some(output_a.as_path()));
+        assert_eq!(runtime_b.output.as_deref(), Some(output_b.as_path()));
+
+        // Construction saw the same per-session values: the very first
+        // provider connection for each session names its requested model, and
+        // the requested cwd/mode/output rode along before any prompt.
+        let mut built = harness.built.lock().unwrap().clone();
+        built.sort_by(|x, y| x.session.cmp(&y.session));
+        let mut expected = vec![
+            BuiltActivation {
+                session: session_a.clone(),
+                model: "openai/gpt-5".to_owned(),
+                mode: format!("{:?}", AgentMode::Build),
+                cwd: project_a.path().to_path_buf(),
+                output: output_a.clone(),
+            },
+            BuiltActivation {
+                session: session_b.clone(),
+                model: "openai/gpt-5.6-sol".to_owned(),
+                mode: format!("{:?}", runtime_b.current_mode),
+                cwd: project_b.path().to_path_buf(),
+                output: output_b.clone(),
+            },
+        ];
+        expected.sort_by(|x, y| x.session.cmp(&y.session));
+        assert_eq!(built, expected, "construction keeps each session's context");
+
+        // Fixed setup is observable before the first prompt: changes route to
+        // the addressed session and reject without touching the peer.
+        for (session, mode) in [(&session_a, "plan"), (&session_b, "build")] {
+            let reply = handle_set_mode(
+                &srv,
+                &serde_json::json!({
+                    "params": { "sessionId": session, "modeId": mode }
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(
+                reply.data,
+                Some(serde_json::json!({
+                    "reason": extension::FIXED_AT_ACTIVATION_REASON
+                })),
+                "{session}: the mode is fixed before the first prompt"
+            );
+        }
+        let unknown = format!("{session_a}-missing");
+        let no_prompt = handle_prompt(
+            &mut srv,
+            &prompt_request(&unknown, "hello"),
+            &RequestId::Number(7),
+        )
+        .unwrap_err();
+        assert_eq!(no_prompt.code, AcpError::resource_not_found(None).code);
+        assert_eq!(srv.sessions.len(), 2, "rejections touch no runtime");
+
+        assert_eq!(
+            std::env::current_dir().expect("the process cwd is readable"),
+            process_cwd,
+            "activation never moves the Maki process cwd"
+        );
+        assert!(
+            !process_cwd.starts_with(project_a.path())
+                && !process_cwd.starts_with(project_b.path()),
+            "neither session inherits the launch directory: {process_cwd:?}"
         );
     }
 
